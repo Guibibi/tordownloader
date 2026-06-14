@@ -71,6 +71,16 @@ func run() error {
 		return nil
 	}
 
+	// Make the configured download root authoritative over save paths persisted
+	// on a previous run, so changing download.root / TD_DOWNLOAD_ROOT actually
+	// moves where new content lands instead of being shadowed by stale DB rows.
+	if cats, tors, rerr := st.RebaseToRoot(ctx, cfg.Download.Root); rerr != nil {
+		return fmt.Errorf("rebase save paths to root: %w", rerr)
+	} else if cats > 0 || tors > 0 {
+		slog.Info("rebased save paths to download root",
+			"root", cfg.Download.Root, "categories", cats, "pending_torrents", tors)
+	}
+
 	// TorBox client + engine submitter (slot-gated createtorrent).
 	tbClient := torbox.New(cfg.TorBox.APIKey, torbox.WithBaseURL(cfg.TorBox.BaseURL))
 	eng := engine.New(st, tbClient, engine.Config{
