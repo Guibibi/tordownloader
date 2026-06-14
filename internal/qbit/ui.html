@@ -1,0 +1,153 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>tordownloader</title>
+<style>
+  :root {
+    --bg: #0f1115; --panel: #181b22; --panel2: #1f232c; --border: #2a2f3a;
+    --text: #e6e9ef; --muted: #8b93a3; --accent: #4f8cff;
+    --torbox: #b07cff; --local: #4f8cff; --done: #36c98b; --error: #ff5f6d; --queued: #6b7280;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--text);
+    font: 14px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+  }
+  header {
+    display: flex; align-items: baseline; gap: 16px; flex-wrap: wrap;
+    padding: 18px 24px; border-bottom: 1px solid var(--border); background: var(--panel);
+  }
+  header h1 { font-size: 18px; margin: 0; font-weight: 600; }
+  header .ver { color: var(--muted); font-size: 12px; }
+  header .stats { margin-left: auto; color: var(--muted); font-size: 13px; }
+  header .stats b { color: var(--text); font-weight: 600; }
+  main { padding: 16px 24px; max-width: 1100px; margin: 0 auto; }
+  .empty { color: var(--muted); text-align: center; padding: 60px 0; }
+  .card {
+    background: var(--panel); border: 1px solid var(--border); border-radius: 10px;
+    padding: 14px 16px; margin-bottom: 12px;
+  }
+  .row1 { display: flex; align-items: center; gap: 10px; }
+  .name { font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; flex: 1; }
+  .badge {
+    font-size: 11px; font-weight: 600; padding: 2px 8px; border-radius: 999px;
+    text-transform: uppercase; letter-spacing: .04em; white-space: nowrap;
+  }
+  .badge.torbox { background: rgba(176,124,255,.15); color: var(--torbox); }
+  .badge.local  { background: rgba(79,140,255,.15); color: var(--local); }
+  .badge.done   { background: rgba(54,201,139,.15); color: var(--done); }
+  .badge.error  { background: rgba(255,95,109,.15); color: var(--error); }
+  .badge.queued { background: rgba(107,114,128,.18); color: #aab2c0; }
+  .meta { display: flex; gap: 16px; flex-wrap: wrap; color: var(--muted); font-size: 12px; margin: 8px 0 10px; }
+  .meta b { color: var(--text); font-weight: 600; }
+  .bar { height: 8px; background: var(--panel2); border-radius: 6px; overflow: hidden; display: flex; }
+  .bar .seg { height: 100%; transition: width .4s ease; }
+  .bar .seg.torbox { background: var(--torbox); }
+  .bar .seg.local  { background: var(--local); }
+  .bar .seg.done   { background: var(--done); }
+  .bar .seg.error  { background: var(--error); }
+  .barlabel { display: flex; justify-content: space-between; font-size: 12px; color: var(--muted); margin-top: 6px; }
+  .barlabel .pct { color: var(--text); font-weight: 600; }
+  .errmsg { color: var(--error); font-size: 12px; margin-top: 8px; word-break: break-word; }
+  .legend { color: var(--muted); font-size: 12px; display: flex; gap: 14px; margin-top: 4px; }
+  .legend i { display: inline-block; width: 9px; height: 9px; border-radius: 2px; margin-right: 5px; vertical-align: middle; }
+  .dim { color: var(--muted); }
+</style>
+</head>
+<body>
+<header>
+  <h1>tordownloader</h1>
+  <span class="ver" id="ver"></span>
+  <div class="stats">
+    <span id="counts"></span> &nbsp;•&nbsp; <b id="speed">0 B/s</b> down
+  </div>
+</header>
+<main>
+  <div class="legend">
+    <span><i style="background:var(--torbox)"></i>TorBox caching</span>
+    <span><i style="background:var(--local)"></i>Local download</span>
+    <span><i style="background:var(--done)"></i>Complete</span>
+  </div>
+  <div id="list" style="margin-top:14px"></div>
+</main>
+
+<script>
+const fmtSize = b => {
+  if (!b || b < 0) return "0 B";
+  const u = ["B","KB","MB","GB","TB"]; let i = 0; let n = b;
+  while (n >= 1024 && i < u.length-1) { n /= 1024; i++; }
+  return n.toFixed(n < 10 && i > 0 ? 1 : 0) + " " + u[i];
+};
+const fmtSpeed = b => b > 0 ? fmtSize(b) + "/s" : "—";
+const fmtEta = s => {
+  if (s == null || s < 0) return "—";
+  if (s < 60) return s + "s";
+  if (s < 3600) return Math.floor(s/60) + "m " + (s%60) + "s";
+  const h = Math.floor(s/3600); return h + "h " + Math.floor((s%3600)/60) + "m";
+};
+const esc = s => { const d = document.createElement("div"); d.textContent = s ?? ""; return d.innerHTML; };
+
+function bar(t) {
+  // Two-phase bar: TorBox cache (first half) then local download (second half).
+  if (t.phase === "done")  return `<div class="bar"><div class="seg done" style="width:100%"></div></div>`;
+  if (t.phase === "error") {
+    const w = Math.round((0.5*t.torbox_progress + 0.5*t.local_progress)*100);
+    return `<div class="bar"><div class="seg error" style="width:${w}%"></div></div>`;
+  }
+  const tb = Math.round(t.torbox_progress*50);
+  const lo = Math.round(t.local_progress*50);
+  return `<div class="bar">
+    <div class="seg torbox" style="width:${tb}%"></div>
+    <div class="seg local" style="width:${lo}%"></div>
+  </div>`;
+}
+
+function card(t) {
+  const pct = Math.round(t.progress*100);
+  const detail = t.phase === "torbox"
+    ? `TorBox ${Math.round(t.torbox_progress*100)}%`
+    : (t.phase === "local"
+        ? `Disk ${Math.round(t.local_progress*100)}% · ${fmtSpeed(t.dlspeed)} · ETA ${fmtEta(t.eta)}`
+        : "");
+  return `<div class="card">
+    <div class="row1">
+      <span class="name" title="${esc(t.name)}">${esc(t.name)}</span>
+      <span class="badge ${t.phase}">${esc(t.state_label)}</span>
+    </div>
+    <div class="meta">
+      <span><b>${fmtSize(t.size)}</b></span>
+      ${t.category ? `<span>${esc(t.category)}</span>` : ""}
+      ${detail ? `<span class="dim">${detail}</span>` : ""}
+    </div>
+    ${bar(t)}
+    <div class="barlabel"><span>${esc(t.state_label)}</span><span class="pct">${pct}%</span></div>
+    ${t.error ? `<div class="errmsg">${esc(t.error)}</div>` : ""}
+  </div>`;
+}
+
+async function tick() {
+  try {
+    const r = await fetch("/ui/torrents", { cache: "no-store" });
+    const d = await r.json();
+    document.getElementById("ver").textContent = d.version || "";
+    document.getElementById("speed").textContent = fmtSpeed(d.dlspeed) || "0 B/s";
+    const ts = d.torrents || [];
+    const active = ts.filter(t => t.phase === "torbox" || t.phase === "local").length;
+    const done = ts.filter(t => t.phase === "done").length;
+    document.getElementById("counts").textContent =
+      `${ts.length} torrent${ts.length===1?"":"s"} · ${active} active · ${done} done`;
+    const list = document.getElementById("list");
+    list.innerHTML = ts.length
+      ? ts.map(card).join("")
+      : `<div class="empty">No torrents yet.</div>`;
+  } catch (e) {
+    document.getElementById("counts").textContent = "connection lost…";
+  }
+}
+tick();
+setInterval(tick, 2000);
+</script>
+</body>
+</html>

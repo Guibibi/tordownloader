@@ -96,6 +96,11 @@ func (h *Handler) Routes() http.Handler {
 	// Transfer.
 	mux.HandleFunc("/api/v2/transfer/info", h.transferInfo)
 
+	// Status dashboard (simple read-only UI). "/" also acts as the catch-all,
+	// so uiIndex 404s anything that isn't exactly "/".
+	mux.HandleFunc("/", h.uiIndex)
+	mux.HandleFunc("/ui/torrents", h.uiTorrents)
+
 	return mux
 }
 
