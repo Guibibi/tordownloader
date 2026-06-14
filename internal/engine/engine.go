@@ -87,6 +87,11 @@ type Engine struct {
 
 	mu             sync.Mutex
 	activeDownload *activeDownload
+
+	// slotWaitLogged remembers that we've already logged the current
+	// "all slots busy, work waiting" episode, so the message isn't repeated every
+	// submit pass. Touched only by the single submit goroutine; no lock needed.
+	slotWaitLogged bool
 }
 
 // New builds an Engine from cfg, clamping unset/invalid fields to defaults.
@@ -177,13 +182,25 @@ func (e *Engine) submitPass(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	free := e.maxSlots - active
-	if free <= 0 {
-		return nil
-	}
 	queued, err := e.store.ListByState(ctx, store.StateQueued)
 	if err != nil {
 		return err
+	}
+	free := e.maxSlots - active
+	if free <= 0 {
+		// Slots are full: surface that queued torrents are waiting (otherwise this
+		// looks like a stuck/nameless hash from the *arr side). Logged once per
+		// contention episode to avoid spamming every pass.
+		if len(queued) > 0 && !e.slotWaitLogged {
+			e.log.Info("all TorBox slots busy; queued torrents waiting for a slot",
+				"queued", len(queued), "active", active, "max_slots", e.maxSlots)
+			e.slotWaitLogged = true
+		}
+		return nil
+	}
+	if e.slotWaitLogged {
+		e.log.Info("TorBox slot freed; resuming submissions", "free", free, "queued", len(queued))
+		e.slotWaitLogged = false
 	}
 	for _, t := range queued {
 		if free <= 0 {

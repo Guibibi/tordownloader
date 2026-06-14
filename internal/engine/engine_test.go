@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"sync"
@@ -97,6 +98,23 @@ func seedQueued(t *testing.T, st *store.Store, n int) {
 	}
 }
 
+// seedQueued2 adds n more QUEUED torrents with hashes that don't collide with
+// seedQueued's (offset into a different range).
+func seedQueued2(t *testing.T, st *store.Store, n int) {
+	t.Helper()
+	for i := 0; i < n; i++ {
+		hash := fmt.Sprintf("%040x", i+1000)
+		_, _, err := st.AddTorrent(context.Background(), store.AddTorrentParams{
+			Infohash: hash,
+			Name:     fmt.Sprintf("w%d", i),
+			Magnet:   "magnet:?xt=urn:btih:" + hash,
+		})
+		if err != nil {
+			t.Fatalf("seed queued2: %v", err)
+		}
+	}
+}
+
 func countState(t *testing.T, st *store.Store, state string) int {
 	t.Helper()
 	n, err := st.CountByState(context.Background(), state)
@@ -155,6 +173,80 @@ func TestSubmitPassCountsExistingActive(t *testing.T) {
 	}
 	if got := countState(t, st, store.StateTorBoxActive); got != 3 {
 		t.Errorf("active = %d, want 3", got)
+	}
+}
+
+// countingHandler records how many log records carry a given message.
+type countingHandler struct {
+	mu   sync.Mutex
+	msgs map[string]int
+}
+
+func (h *countingHandler) Enabled(context.Context, slog.Level) bool { return true }
+func (h *countingHandler) Handle(_ context.Context, r slog.Record) error {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.msgs[r.Message]++
+	return nil
+}
+func (h *countingHandler) WithAttrs([]slog.Attr) slog.Handler { return h }
+func (h *countingHandler) WithGroup(string) slog.Handler      { return h }
+
+func (h *countingHandler) count(msg string) int {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.msgs[msg]
+}
+
+func TestSubmitPassLogsSlotWaitOnce(t *testing.T) {
+	st := newStore(t)
+	seedQueued(t, st, 2)
+	// Occupy both slots so no submission is possible.
+	q := listQueued(t, st)
+	if err := st.MarkActive(context.Background(), q[0].ID, 1); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.MarkActive(context.Background(), q[1].ID, 2); err != nil {
+		t.Fatal(err)
+	}
+	// Two more torrents waiting on a slot.
+	seedQueued2(t, st, 2)
+
+	h := &countingHandler{msgs: map[string]int{}}
+	tb := &fakeTB{fn: func(torbox.CreateTorrentRequest) (*torbox.CreateTorrentResult, error) {
+		return okResult(99)
+	}}
+	e := New(st, tb, Config{MaxSlots: 2}, slog.New(h))
+
+	const waitMsg = "all TorBox slots busy; queued torrents waiting for a slot"
+	const resumeMsg = "TorBox slot freed; resuming submissions"
+
+	// Several passes while slots stay full → logged exactly once.
+	for i := 0; i < 3; i++ {
+		if err := e.submitPass(context.Background()); err != nil {
+			t.Fatalf("submitPass: %v", err)
+		}
+	}
+	if got := h.count(waitMsg); got != 1 {
+		t.Errorf("slot-wait logged %d times, want 1", got)
+	}
+
+	// Free a slot; the next pass should resume and submit.
+	active, err := st.ListByState(context.Background(), store.StateTorBoxActive)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := st.MarkError(context.Background(), active[0].ID, "freed for test"); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.submitPass(context.Background()); err != nil {
+		t.Fatalf("submitPass: %v", err)
+	}
+	if got := h.count(resumeMsg); got != 1 {
+		t.Errorf("resume logged %d times, want 1", got)
+	}
+	if tb.calls == 0 {
+		t.Error("expected a submission after a slot freed")
 	}
 }
 
