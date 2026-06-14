@@ -51,6 +51,11 @@ type DatabaseConfig struct {
 // FailureConfig configures fail-fast behavior.
 type FailureConfig struct {
 	Timeout Duration `yaml:"timeout"`
+	// StallTimeout fails a torrent early when TorBox reports it stalled with no
+	// seeders (and nothing fetched/cached), so Sonarr/Radarr fails over to a
+	// better-seeded release instead of waiting out the full Timeout. A non-positive
+	// value disables the early fast-fail and leaves only Timeout.
+	StallTimeout Duration `yaml:"stall_timeout"`
 }
 
 // LogConfig configures structured logging.
@@ -75,7 +80,7 @@ func Default() *Config {
 			ParallelFiles:    4,
 		},
 		Database: DatabaseConfig{Path: "data/tordownloader.db"},
-		Failure:  FailureConfig{Timeout: Duration(20 * time.Minute)},
+		Failure:  FailureConfig{Timeout: Duration(20 * time.Minute), StallTimeout: Duration(5 * time.Minute)},
 		Log:      LogConfig{Level: "info", Format: "text"},
 	}
 }

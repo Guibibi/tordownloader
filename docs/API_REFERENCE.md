@@ -89,7 +89,14 @@ done/seeding → importable. So COMPLETE must report an "UP" state (`pausedUP`).
 | TORBOX_ACTIVE | TorBox fetching, no seeds | `stalledDL` | downloading |
 | LOCAL_QUEUED / LOCAL_DOWNLOAD | pulling files to disk | `downloading` | downloading |
 | COMPLETE | all files on disk | `pausedUP` | **done → import** |
-| ERROR | timeout / TorBox fail / >200GB / dl fail | `error` | **failed → blacklist & re-grab** |
+| ERROR | timeout / dead stall (no seeders) / TorBox fail / >200GB / dl fail | `error` | **failed → blacklist & re-grab** |
+
+> A TORBOX_ACTIVE torrent that TorBox reports stalled with **no seeders and no
+> progress** (not cached, nothing fetched) is failed early after
+> `failure.stall_timeout` (default 5m) instead of waiting out the full
+> `failure.timeout` (20m), so Sonarr/Radarr fails over to a better-seeded release
+> quickly. Any seed or byte of progress keeps the full window. Set
+> `stall_timeout` ≤ 0 to disable.
 
 > Never report `pausedDL` for a finished item — Sonarr treats `*DL` states as not-done.
 > Use `pausedUP` (an "UP" state) to signal completion.

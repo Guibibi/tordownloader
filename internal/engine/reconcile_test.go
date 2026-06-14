@@ -195,6 +195,67 @@ func TestReconcileNoFailBeforeTimeout(t *testing.T) {
 	}
 }
 
+func TestReconcileFastFailDeadStall(t *testing.T) {
+	st := newStore(t)
+	hash := "3333333333333333333333333333333333333333"
+	// Active 6m: past the 5m stall window but well under the 20m hard timeout.
+	seedActive(t, st, hash, 21, "/downloads/tv", 6*time.Minute)
+
+	tb := &fakeTB{list: func() ([]torbox.Torrent, error) {
+		return []torbox.Torrent{{
+			ID: 21, DownloadState: "stalled", Seeds: 0, Peers: 0,
+			Progress: 0, DownloadSpeed: 0, Cached: false, DownloadPresent: false,
+		}}, nil
+	}}
+	e := New(st, tb, Config{MaxSlots: 3, FailTimeout: 20 * time.Minute, StallTimeout: 5 * time.Minute}, nil)
+	if err := e.reconcilePass(context.Background()); err != nil {
+		t.Fatalf("reconcilePass: %v", err)
+	}
+	if tr := getTorrent(t, st, hash); tr.State != store.StateError {
+		t.Fatalf("state = %q, want ERROR (dead stall)", tr.State)
+	}
+}
+
+func TestReconcileNoFastFailWithSeeds(t *testing.T) {
+	st := newStore(t)
+	hash := "4444444444444444444444444444444444444444"
+	// Active 6m and not yet present, but TorBox found a seeder — keep the full
+	// 20m window since it may still complete.
+	seedActive(t, st, hash, 22, "/downloads/tv", 6*time.Minute)
+
+	tb := &fakeTB{list: func() ([]torbox.Torrent, error) {
+		return []torbox.Torrent{{
+			ID: 22, DownloadState: "stalled", Seeds: 1, Progress: 0, DownloadSpeed: 0,
+		}}, nil
+	}}
+	e := New(st, tb, Config{MaxSlots: 3, FailTimeout: 20 * time.Minute, StallTimeout: 5 * time.Minute}, nil)
+	if err := e.reconcilePass(context.Background()); err != nil {
+		t.Fatalf("reconcilePass: %v", err)
+	}
+	if tr := getTorrent(t, st, hash); tr.State != store.StateTorBoxActive {
+		t.Errorf("state = %q, want still TORBOX_ACTIVE (has a seeder)", tr.State)
+	}
+}
+
+func TestReconcileStallDisabled(t *testing.T) {
+	st := newStore(t)
+	hash := "5555555555555555555555555555555555555555"
+	// Dead stall at 6m, but the early fast-fail is disabled (negative) → the
+	// torrent keeps running until the 20m hard timeout.
+	seedActive(t, st, hash, 23, "/downloads/tv", 6*time.Minute)
+
+	tb := &fakeTB{list: func() ([]torbox.Torrent, error) {
+		return []torbox.Torrent{{ID: 23, DownloadState: "stalled", Seeds: 0}}, nil
+	}}
+	e := New(st, tb, Config{MaxSlots: 3, FailTimeout: 20 * time.Minute, StallTimeout: -1}, nil)
+	if err := e.reconcilePass(context.Background()); err != nil {
+		t.Fatalf("reconcilePass: %v", err)
+	}
+	if tr := getTorrent(t, st, hash); tr.State != store.StateTorBoxActive {
+		t.Errorf("state = %q, want still TORBOX_ACTIVE (stall fail disabled)", tr.State)
+	}
+}
+
 func TestReconcileVanishedErrors(t *testing.T) {
 	st := newStore(t)
 	hash := "ffffffffffffffffffffffffffffffffffffffff"

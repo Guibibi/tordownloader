@@ -87,6 +87,7 @@ func run() error {
 		MaxSlots:         cfg.TorBox.MaxActiveSlots,
 		PollInterval:     cfg.TorBox.PollInterval.Std(),
 		FailTimeout:      cfg.Failure.Timeout.Std(),
+		StallTimeout:     cfg.Failure.StallTimeout.Std(),
 		ParallelFiles:    cfg.Download.ParallelFiles,
 		IncompleteSubdir: cfg.Download.IncompleteSubdir,
 		CacheCheck:       cfg.TorBox.CacheCheck,

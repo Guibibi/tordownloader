@@ -83,10 +83,38 @@ func (e *Engine) reconcileOne(ctx context.Context, t store.Torrent, byID map[int
 		return
 	}
 
+	if t.ActiveSince == 0 {
+		return
+	}
+	activeFor := time.Since(time.Unix(t.ActiveSince, 0))
+
+	// Early fast-fail: TorBox itself reports the torrent has no seeders and has
+	// fetched nothing — a dead/unseeded release the full window won't rescue.
+	// Failing now lets Sonarr/Radarr fail over to a better-seeded release in
+	// minutes instead of 20. Torrents with any seed/progress keep the full window.
+	if e.stallAfter > 0 && activeFor > e.stallAfter && isDeadStall(tb) {
+		e.fail(ctx, t, fmt.Sprintf("stalled with no seeders for %s (download_state=%q, peers=%d)",
+			e.stallAfter, tb.DownloadState, tb.Peers))
+		return
+	}
+
 	// Fail-fast: the clock runs from active_since (set when it became active).
-	if t.ActiveSince > 0 && time.Since(time.Unix(t.ActiveSince, 0)) > e.failAfter {
+	if activeFor > e.failAfter {
 		e.fail(ctx, t, fmt.Sprintf("not available within %s of becoming active", e.failAfter))
 	}
+}
+
+// isDeadStall reports whether TorBox shows a torrent it cannot make progress on:
+// no seeders, nothing downloaded, no transfer, and not served from cache. These
+// hard signals (rather than the download_state string, whose exact wording
+// varies) keep the check robust — a torrent that finds even one seeder or moves
+// any bytes is excluded and keeps the full fail-fast window.
+func isDeadStall(tb torbox.Torrent) bool {
+	return tb.Seeds == 0 &&
+		tb.Progress == 0 &&
+		tb.DownloadSpeed == 0 &&
+		!tb.Cached &&
+		!tb.DownloadPresent
 }
 
 // toLocalQueued records the TorBox file list and moves the torrent to

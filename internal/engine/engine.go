@@ -35,6 +35,7 @@ const downloadInterval = 2 * time.Second
 const (
 	defaultPollInterval     = 10 * time.Second
 	defaultFailTimeout      = 20 * time.Minute
+	defaultStallTimeout     = 5 * time.Minute
 	defaultParallelFiles    = 4
 	defaultIncompleteSubdir = ".incomplete"
 )
@@ -56,6 +57,7 @@ type Config struct {
 	MaxSlots         int           // TorBox concurrent-slot limit (default 1)
 	PollInterval     time.Duration // reconciler cadence (default 10s)
 	FailTimeout      time.Duration // fail-fast window while TORBOX_ACTIVE (default 20m)
+	StallTimeout     time.Duration // early fail when TorBox is stalled with no seeders (default 5m; <0 disables)
 	ParallelFiles    int           // concurrent file downloads per torrent (default 4)
 	IncompleteSubdir string        // staging dir under the save path (default .incomplete)
 	CacheCheck       bool          // log TorBox cache status on submit (informational)
@@ -76,6 +78,7 @@ type Engine struct {
 	maxSlots   int
 	pollEvery  time.Duration
 	failAfter  time.Duration
+	stallAfter time.Duration
 	parallel   int
 	incomplete string
 	cacheCheck bool
@@ -100,6 +103,12 @@ func New(st *store.Store, tb TorBoxAPI, cfg Config, log *slog.Logger) *Engine {
 	if cfg.FailTimeout <= 0 {
 		cfg.FailTimeout = defaultFailTimeout
 	}
+	// Zero means "unset" → apply the default; a negative value disables the
+	// early fast-fail (only FailTimeout applies). The submitter/reconciler guards
+	// on stallAfter > 0, so a negative value is carried through as "off".
+	if cfg.StallTimeout == 0 {
+		cfg.StallTimeout = defaultStallTimeout
+	}
 	if cfg.ParallelFiles < 1 {
 		cfg.ParallelFiles = defaultParallelFiles
 	}
@@ -112,6 +121,7 @@ func New(st *store.Store, tb TorBoxAPI, cfg Config, log *slog.Logger) *Engine {
 		maxSlots:   cfg.MaxSlots,
 		pollEvery:  cfg.PollInterval,
 		failAfter:  cfg.FailTimeout,
+		stallAfter: cfg.StallTimeout,
 		parallel:   cfg.ParallelFiles,
 		incomplete: cfg.IncompleteSubdir,
 		cacheCheck: cfg.CacheCheck,

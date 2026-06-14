@@ -22,6 +22,7 @@ database:
 
 failure:
   timeout: 20m                     # ERROR if not present within this long after becoming TorBox-active
+  stall_timeout: 5m                # ERROR early when TorBox reports no seeders / no progress (fail over faster). <=0 disables
 
 log:
   level: "info"                    # debug | info | warn | error
