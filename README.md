@@ -43,24 +43,36 @@ Single Docker container on an Unraid host, alongside Sonarr/Radarr/Prowlarr, sha
 
 ## Running with Docker
 
-### Quick start (docker compose)
+Pre-built images are published to **GitHub Container Registry** on every push to `main`.
 
-```bash
-# Clone and start
-git clone https://github.com/guibibi/tordownloader.git
-cd tordownloader
-TORBOX_API_KEY=your-api-key docker compose up -d
+```
+ghcr.io/guibibi/tordownloader:latest
 ```
 
-Then add `http://your-host:6500` as a qBittorrent client in Sonarr/Radarr.
+### Unraid quick start
 
-### Build the image manually
+In the Unraid Docker UI (**Docker → Add Container**):
+
+| Field | Value |
+|---|---|
+| Repository | `ghcr.io/guibibi/tordownloader:latest` |
+| Port | `6500` → `6500` |
+| Volume `/data` | `/mnt/user/appdata/tordownloader/` |
+| Volume `/downloads` | `/mnt/user/downloads/` |
+| Variable `TORBOX_API_KEY` | `your-torbox-api-key` |
+| Variable `PUID` | `99` |
+| Variable `PGID` | `100` |
+
+Click **Apply**, then add `http://<unraid-ip>:6500` as a qBittorrent client in Sonarr/Radarr.
+
+### docker compose
 
 ```bash
-docker build -t tordownloader .
+# Create a compose file (see docker-compose.yml in the repo)
+TORBOX_API_KEY=your-key docker compose up -d
 ```
 
-### Run the container
+### Run manually
 
 ```bash
 docker run -d \
@@ -72,15 +84,21 @@ docker run -d \
   -v /mnt/user/downloads:/downloads \
   -p 6500:6500 \
   --restart unless-stopped \
-  tordownloader
+  ghcr.io/guibibi/tordownloader:latest
 ```
 
-### Unraid setup
+### Sonarr/Radarr client setup
 
-1. **Volumes**: map `/mnt/user/downloads` → `/downloads` (use the same path your Sonarr/Radarr containers see) and a persistent appdata path → `/data`.
-2. **Environment**: set `TORBOX_API_KEY` to your TorBox API key. Set `PUID` and `PGID` to match your Unraid user (typically 99/100).
-3. **Port**: map 6500 (or a custom host port) to 6500.
-4. **In Sonarr/Radarr**: add a qBittorrent download client at `http://<unraid-ip>:6500`.
+In Sonarr/Radarr: **Settings → Download Clients → + → qBittorrent**
+
+| Field | Value |
+|---|---|
+| Host | Your Unraid IP (e.g. `192.168.1.50`) |
+| Port | `6500` |
+| Username / Password | anything (auth is stubbed) |
+| Category | `tv-sonarr` (Sonarr) or `radarr` (Radarr) |
+
+**Important**: the `/downloads` volume must be mapped identically across tordownloader, Sonarr, and Radarr. Linuxserver.io containers default to `/downloads` which matches our default. If you use binhex or hotio, set `TD_DOWNLOAD_ROOT` to match.
 
 ### Configuration
 

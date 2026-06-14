@@ -8,10 +8,10 @@
 
 services:
   tordownloader:
-    # Build from the repo root, or use a published image.
-    build:
-      context: .
-    # image: ghcr.io/guibibi/tordownloader:latest
+    image: ghcr.io/guibibi/tordownloader:latest
+    # To build locally instead, comment the image line and uncomment:
+    # build:
+    #   context: .
     container_name: tordownloader
     restart: unless-stopped
 

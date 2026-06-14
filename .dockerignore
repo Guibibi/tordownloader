@@ -14,9 +14,8 @@
 # Docs (not needed at runtime)
 /docs/
 
-# Agent skills
-.claude/
-.agents/
+# CI
+.github/
 
 # Config leaks
 config.yaml
