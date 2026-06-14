@@ -47,5 +47,5 @@ headless, download-to-disk. Runs as one Docker container on the user's **Unraid*
   against the live API in M1** before depending on them.
 
 ## Environment
-- Go 1.26 available locally. Not yet a git repo. CWD: `/home/guibibi/projects/tordownloader`.
+- Go 1.26 available locally. Git repo, `main` branch. CWD: `/home/guibibi/projects/tordownloader`.
 - TorBox API key required to run/test the TorBox client (M1+). Keep it out of git.
