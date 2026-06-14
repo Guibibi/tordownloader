@@ -71,13 +71,18 @@ func (e *Engine) reconcileOne(ctx context.Context, t store.Torrent, byID map[int
 		return
 	}
 
-	// Still fetching: refresh live stats so Sonarr sees progress move.
+	// Still fetching: refresh live stats so Sonarr sees progress move. A torrent
+	// is "advancing" when its progress climbs or TorBox is actively moving bytes;
+	// that resets the stall clock so a slow-but-live download is never failed for
+	// being slow.
+	advancing := tb.Progress > t.TorBoxProgress || tb.DownloadSpeed > 0
 	if err := e.store.UpdateTorBoxStatus(ctx, t.ID, store.TorBoxStatus{
-		State:    tb.DownloadState,
-		Progress: clamp01(tb.Progress),
-		DLSpeed:  tb.DownloadSpeed,
-		Size:     tb.Size,
-		Name:     firstNonEmpty(t.Name, tb.Name),
+		State:     tb.DownloadState,
+		Progress:  clamp01(tb.Progress),
+		DLSpeed:   tb.DownloadSpeed,
+		Size:      tb.Size,
+		Name:      firstNonEmpty(t.Name, tb.Name),
+		Advancing: advancing,
 	}); err != nil {
 		e.log.Error("update torbox status", "infohash", t.Infohash, "err", err)
 		return
@@ -86,35 +91,31 @@ func (e *Engine) reconcileOne(ctx context.Context, t store.Torrent, byID map[int
 	if t.ActiveSince == 0 {
 		return
 	}
-	activeFor := time.Since(time.Unix(t.ActiveSince, 0))
+	now := time.Now()
 
-	// Early fast-fail: TorBox itself reports the torrent has no seeders and has
-	// fetched nothing — a dead/unseeded release the full window won't rescue.
-	// Failing now lets Sonarr/Radarr fail over to a better-seeded release in
-	// minutes instead of 20. Torrents with any seed/progress keep the full window.
-	if e.stallAfter > 0 && activeFor > e.stallAfter && isDeadStall(tb) {
-		e.fail(ctx, t, fmt.Sprintf("stalled with no seeders for %s (download_state=%q, peers=%d)",
-			e.stallAfter, tb.DownloadState, tb.Peers))
-		return
+	// Stall fail: the torrent is making no headway — no new bytes and progress
+	// isn't climbing. If it's been stuck this long it's a dead/unseeded release
+	// the wait won't rescue, so fail it: that reports an error to Sonarr/Radarr
+	// which blacklists the release and grabs another. A slow but moving download
+	// keeps resetting progress_at (via Advancing) and is never failed for speed.
+	if e.stallAfter > 0 && !advancing {
+		stalledSince := t.ProgressAt
+		if stalledSince == 0 {
+			stalledSince = t.ActiveSince
+		}
+		if now.Sub(time.Unix(stalledSince, 0)) > e.stallAfter {
+			e.fail(ctx, t, fmt.Sprintf("no download progress for %s (download_state=%q, seeds=%d, peers=%d)",
+				e.stallAfter, tb.DownloadState, tb.Seeds, tb.Peers))
+			return
+		}
 	}
 
-	// Fail-fast: the clock runs from active_since (set when it became active).
-	if activeFor > e.failAfter {
+	// Optional absolute cap from active_since. Disabled by default
+	// (failure.timeout = 0); set it to bound how long a perpetually-slow torrent
+	// may hold a scarce TorBox slot.
+	if e.failAfter > 0 && now.Sub(time.Unix(t.ActiveSince, 0)) > e.failAfter {
 		e.fail(ctx, t, fmt.Sprintf("not available within %s of becoming active", e.failAfter))
 	}
-}
-
-// isDeadStall reports whether TorBox shows a torrent it cannot make progress on:
-// no seeders, nothing downloaded, no transfer, and not served from cache. These
-// hard signals (rather than the download_state string, whose exact wording
-// varies) keep the check robust — a torrent that finds even one seeder or moves
-// any bytes is excluded and keeps the full fail-fast window.
-func isDeadStall(tb torbox.Torrent) bool {
-	return tb.Seeds == 0 &&
-		tb.Progress == 0 &&
-		tb.DownloadSpeed == 0 &&
-		!tb.Cached &&
-		!tb.DownloadPresent
 }
 
 // toLocalQueued records the TorBox file list and moves the torrent to

@@ -34,8 +34,7 @@ const downloadInterval = 2 * time.Second
 // Defaults applied when Config leaves a field unset.
 const (
 	defaultPollInterval     = 10 * time.Second
-	defaultFailTimeout      = 20 * time.Minute
-	defaultStallTimeout     = 5 * time.Minute
+	defaultStallTimeout     = 10 * time.Minute
 	defaultParallelFiles    = 4
 	defaultIncompleteSubdir = ".incomplete"
 )
@@ -56,8 +55,8 @@ type TorBoxAPI interface {
 type Config struct {
 	MaxSlots         int           // TorBox concurrent-slot limit (default 1)
 	PollInterval     time.Duration // reconciler cadence (default 10s)
-	FailTimeout      time.Duration // fail-fast window while TORBOX_ACTIVE (default 20m)
-	StallTimeout     time.Duration // early fail when TorBox is stalled with no seeders (default 5m; <0 disables)
+	FailTimeout      time.Duration // optional absolute cap from active_since (0 = disabled, the default)
+	StallTimeout     time.Duration // fail after this long with no forward progress (default 10m; <0 disables)
 	ParallelFiles    int           // concurrent file downloads per torrent (default 4)
 	IncompleteSubdir string        // staging dir under the save path (default .incomplete)
 	CacheCheck       bool          // log TorBox cache status on submit (informational)
@@ -105,12 +104,13 @@ func New(st *store.Store, tb TorBoxAPI, cfg Config, log *slog.Logger) *Engine {
 	if cfg.PollInterval <= 0 {
 		cfg.PollInterval = defaultPollInterval
 	}
-	if cfg.FailTimeout <= 0 {
-		cfg.FailTimeout = defaultFailTimeout
+	// The absolute cap is opt-in: a non-positive value disables it, leaving the
+	// stall detector as the only failure path.
+	if cfg.FailTimeout < 0 {
+		cfg.FailTimeout = 0
 	}
-	// Zero means "unset" → apply the default; a negative value disables the
-	// early fast-fail (only FailTimeout applies). The submitter/reconciler guards
-	// on stallAfter > 0, so a negative value is carried through as "off".
+	// Zero means "unset" → apply the default; a negative value disables stall
+	// detection. The reconciler guards on stallAfter > 0, so negative is "off".
 	if cfg.StallTimeout == 0 {
 		cfg.StallTimeout = defaultStallTimeout
 	}
@@ -141,8 +141,8 @@ func New(st *store.Store, tb TorBoxAPI, cfg Config, log *slog.Logger) *Engine {
 // ctx is cancelled.
 func (e *Engine) Run(ctx context.Context) {
 	e.log.Info("engine started",
-		"max_active_slots", e.maxSlots, "poll_interval", e.pollEvery, "fail_timeout", e.failAfter,
-		"parallel_files", e.parallel)
+		"max_active_slots", e.maxSlots, "poll_interval", e.pollEvery,
+		"stall_timeout", e.stallAfter, "fail_timeout", e.failAfter, "parallel_files", e.parallel)
 
 	// Rebuild in-memory state from SQLite + TorBox: re-sync active torrents
 	// and recover any content already finalized on disk.
@@ -242,8 +242,8 @@ func (e *Engine) submit(ctx context.Context, t store.Torrent) bool {
 
 	// Informational cache check: log whether TorBox already has the content so a
 	// long fetch isn't mistaken for a stall. Never gates submission — uncached
-	// releases are still valid and the fail-fast clock (failAfter) covers ones
-	// TorBox can't fetch in time.
+	// releases are still valid and the stall detector covers ones TorBox can't
+	// make progress on.
 	if e.cacheCheck {
 		e.logCacheStatus(ctx, t.Infohash)
 	}
@@ -293,8 +293,8 @@ func (e *Engine) logCacheStatus(ctx context.Context, infohash string) {
 	if len(cached) > 0 {
 		e.log.Info("cached on TorBox; content should be available shortly", "infohash", infohash)
 	} else {
-		e.log.Info("not cached on TorBox; will fetch server-side within the fail-fast window",
-			"infohash", infohash, "fail_timeout", e.failAfter)
+		e.log.Info("not cached on TorBox; will fetch server-side (failed only if it stalls)",
+			"infohash", infohash, "stall_timeout", e.stallAfter)
 	}
 }
 

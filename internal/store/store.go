@@ -33,7 +33,8 @@ CREATE TABLE IF NOT EXISTS torrents (
   dlspeed         INTEGER NOT NULL DEFAULT 0,
   error           TEXT    NOT NULL DEFAULT '',
   added_on        INTEGER NOT NULL DEFAULT 0,
-  active_since    INTEGER NOT NULL DEFAULT 0,   -- when it entered TORBOX_ACTIVE (fail-fast clock)
+  active_since    INTEGER NOT NULL DEFAULT 0,   -- when it entered TORBOX_ACTIVE
+  progress_at     INTEGER NOT NULL DEFAULT 0,   -- last time TorBox progress advanced (stall clock)
   completed_on    INTEGER NOT NULL DEFAULT 0,
   created_at      INTEGER NOT NULL DEFAULT 0,
   updated_at      INTEGER NOT NULL DEFAULT 0
@@ -107,6 +108,7 @@ func (s *Store) migrate(ctx context.Context) error {
 	cols := []struct{ table, column, ddl string }{
 		{"torrents", "magnet", "TEXT NOT NULL DEFAULT ''"},
 		{"torrents", "source_blob", "BLOB"},
+		{"torrents", "progress_at", "INTEGER NOT NULL DEFAULT 0"},
 	}
 	for _, c := range cols {
 		if err := s.ensureColumn(ctx, c.table, c.column, c.ddl); err != nil {

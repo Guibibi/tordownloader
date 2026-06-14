@@ -54,7 +54,7 @@ from it (see API_REFERENCE.md §3 for the exact mapping).
         │ QUEUED  │ ───────────────────────────────────▶ │ TORBOX_ACTIVE│
         └─────────┘                                       └──────────────┘
              │ (waiting for 1 of 3 slots)                   │        │
-             │                                              │        │ 20-min fail-fast
+             │                                              │        │ stall (no progress)
              │                              download_present│        ▼ / TorBox error / >200GB
              │                                              ▼     ┌────────┐
              │                                       ┌─────────────┐│ ERROR │
@@ -73,9 +73,10 @@ from it (see API_REFERENCE.md §3 for the exact mapping).
 ```
 
 - **QUEUED**: accepted from Sonarr, waiting for a TorBox slot. Reported as in-progress
-  (e.g. `stalledDL`/`metaDL`). The fail-fast timer is **not** running here.
-- **TORBOX_ACTIVE**: submitted via `createtorrent`; TorBox is fetching/caching. Fail-fast
-  timer runs. Progress = TorBox progress mapped to the first half of the bar.
+  (e.g. `stalledDL`/`metaDL`). The stall clock is **not** running here.
+- **TORBOX_ACTIVE**: submitted via `createtorrent`; TorBox is fetching/caching. The stall
+  detector runs (fail only when no progress for `stall_timeout`, never for slowness).
+  Progress = TorBox progress mapped to the first half of the bar.
 - **LOCAL_QUEUED / LOCAL_DOWNLOAD**: TorBox has the files; we are downloading them to disk.
   Progress = second half of the bar.
 - **COMPLETE**: all files on disk; reported as `pausedUP` with a valid `content_path`.
@@ -88,7 +89,8 @@ from it (see API_REFERENCE.md §3 for the exact mapping).
   (don't fail). On TorBox rejection (e.g. `DOWNLOAD_TOO_LARGE`), → ERROR.
 - **Reconciler**: every `poll_interval` (default ~10s), calls TorBox `mylist` and updates each
   tracked torrent's `torbox_state`, `progress`, `download_present`, file list. Drives
-  TORBOX_ACTIVE → LOCAL_QUEUED and applies the fail-fast timeout.
+  TORBOX_ACTIVE → LOCAL_QUEUED and fails torrents that stall (no forward progress for
+  `stall_timeout`) or exceed the optional absolute `timeout` cap.
 - **Downloader**: pulls LOCAL_QUEUED torrents, enumerates files, requests `requestdl` per file,
   downloads with bounded concurrency into an incomplete dir, atomically moves into the save
   path, then → COMPLETE. Re-requests expired links; resumes partial files via Range on restart.
@@ -116,7 +118,8 @@ torrents(
   dlspeed       INTEGER,
   error         TEXT,
   added_on      INTEGER,                -- unix
-  active_since  INTEGER,                -- when it entered TORBOX_ACTIVE (fail-fast clock)
+  active_since  INTEGER,                -- when it entered TORBOX_ACTIVE
+  progress_at   INTEGER,                -- last time TorBox progress advanced (stall clock)
   completed_on  INTEGER,
   created_at    INTEGER,
   updated_at    INTEGER
@@ -179,7 +182,8 @@ categories(
 
 | Situation | Behavior |
 |---|---|
-| Not cached & not present within 20 min (active) | → ERROR (Sonarr blacklists, re-grabs). |
+| Stalled while active (no progress for `stall_timeout`, default 10m) | → ERROR (Sonarr blacklists, re-grabs). Slow-but-moving fetches are not failed. |
+| Exceeds optional absolute `timeout` cap (disabled by default) | → ERROR. |
 | TorBox rejects >200GB | → ERROR immediately. |
 | `createtorrent` rate-limited (429) | Back off, stay QUEUED, retry. |
 | `requestdl` link expired mid-download | Re-request and resume. |

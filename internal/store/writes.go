@@ -89,12 +89,13 @@ func (s *Store) ListByState(ctx context.Context, state string) ([]Torrent, error
 }
 
 // MarkActive records a successful createtorrent: it stores the TorBox id and
-// transitions the torrent to TORBOX_ACTIVE, starting the fail-fast clock.
+// transitions the torrent to TORBOX_ACTIVE, seeding both the active_since and
+// progress_at (stall) clocks.
 func (s *Store) MarkActive(ctx context.Context, id int64, torboxID int) error {
 	now := time.Now().Unix()
 	_, err := s.db.ExecContext(ctx, `
-		UPDATE torrents SET torbox_id = ?, state = ?, active_since = ?, updated_at = ?
-		WHERE id = ?`, torboxID, StateTorBoxActive, now, now, id)
+		UPDATE torrents SET torbox_id = ?, state = ?, active_since = ?, progress_at = ?, updated_at = ?
+		WHERE id = ?`, torboxID, StateTorBoxActive, now, now, now, id)
 	if err != nil {
 		return fmt.Errorf("mark active %d: %w", id, err)
 	}
@@ -104,19 +105,26 @@ func (s *Store) MarkActive(ctx context.Context, id int64, torboxID int) error {
 // TorBoxStatus carries the reconciler's view of a TORBOX_ACTIVE torrent's
 // TorBox-side state, applied by UpdateTorBoxStatus.
 type TorBoxStatus struct {
-	State    string  // TorBox download_state (e.g. downloading, cached)
-	Progress float64 // 0..1
-	DLSpeed  int64   // bytes/s
-	Size     int64   // 0 = leave the stored size unchanged
-	Name     string  // "" = leave the stored name unchanged
+	State     string  // TorBox download_state (e.g. downloading, cached)
+	Progress  float64 // 0..1
+	DLSpeed   int64   // bytes/s
+	Size      int64   // 0 = leave the stored size unchanged
+	Name      string  // "" = leave the stored name unchanged
+	Advancing bool    // true when the torrent made headway this tick; bumps the stall clock
 }
 
 // UpdateTorBoxStatus refreshes the TorBox-side fields of a torrent while it is
 // fetching. It only touches rows still in TORBOX_ACTIVE, so a concurrent delete
 // or transition is never clobbered. Size and Name are only overwritten when set,
-// so a later, richer mylist reading can't blank out earlier data.
+// so a later, richer mylist reading can't blank out earlier data. progress_at
+// advances only when Advancing, so the reconciler can measure how long a torrent
+// has been stuck.
 func (s *Store) UpdateTorBoxStatus(ctx context.Context, id int64, st TorBoxStatus) error {
 	now := time.Now().Unix()
+	advancing := int64(0)
+	if st.Advancing {
+		advancing = 1
+	}
 	_, err := s.db.ExecContext(ctx, `
 		UPDATE torrents SET
 			torbox_state    = ?,
@@ -124,11 +132,13 @@ func (s *Store) UpdateTorBoxStatus(ctx context.Context, id int64, st TorBoxStatu
 			dlspeed         = ?,
 			size            = CASE WHEN ? > 0  THEN ? ELSE size END,
 			name            = CASE WHEN ? <> '' THEN ? ELSE name END,
+			progress_at     = CASE WHEN ? = 1 THEN ? ELSE progress_at END,
 			updated_at      = ?
 		WHERE id = ? AND state = ?`,
 		st.State, st.Progress, st.DLSpeed,
 		st.Size, st.Size,
 		st.Name, st.Name,
+		advancing, now,
 		now, id, StateTorBoxActive)
 	if err != nil {
 		return fmt.Errorf("update torbox status %d: %w", id, err)

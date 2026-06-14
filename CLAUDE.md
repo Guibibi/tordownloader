@@ -26,7 +26,9 @@ headless, download-to-disk. Runs as one Docker container on the user's **Unraid*
 - Per-file downloads via `requestdl`, preserve folder structure (no zip/extract).
 - On Sonarr delete: remove from TorBox **and** local.
 - Headless: YAML/env config, SQLite state, logs (no Web UI in v1).
-- Fail-fast: cache check on add; ERROR if not present within **20 min** of becoming active.
+- Fail on *stall* (not on slowness): cache check on add (informational); ERROR only when a
+  fetching torrent makes no progress for `failure.stall_timeout` (default 10m). Optional
+  absolute `failure.timeout` cap, disabled by default. See Gotchas.
 - No auth on the qBittorrent API (LAN trust).
 - Pure-Go stack (no cgo) for easy Unraid Docker builds: `modernc.org/sqlite`,
   `anacrolix/torrent/metainfo` for infohash, stdlib `net/http`+`slog`.
@@ -41,7 +43,12 @@ headless, download-to-disk. Runs as one Docker container on the user's **Unraid*
 ## Gotchas
 - COMPLETE must be reported as `pausedUP` (an "UP" state). Never `pausedDL` — Sonarr treats
   `*DL` as not-done.
-- The fail-fast 20-min clock runs only while TORBOX_ACTIVE, not while waiting in our own queue.
+- A fetching torrent is failed (→ ERROR, so Sonarr blacklists the release) only when it
+  *stalls*: no bytes moving and progress not climbing for `failure.stall_timeout` (default
+  10m). It is never failed just for being slow — a download still moving bytes keeps resetting
+  the stall clock (tracked via `torrents.progress_at`). `failure.timeout` is an optional
+  absolute cap from active_since, disabled by default. Both clocks run only while
+  TORBOX_ACTIVE, not while waiting in our own queue.
 - Download into an incomplete dir, then atomic move, so Sonarr never imports partial files.
 - Some TorBox JSON field names in API_REFERENCE.md come from secondary sources — **verify
   against the live API in M1** before depending on them.

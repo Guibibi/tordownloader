@@ -48,13 +48,18 @@ type DatabaseConfig struct {
 	Path string `yaml:"path"`
 }
 
-// FailureConfig configures fail-fast behavior.
+// FailureConfig configures when a fetching torrent is abandoned with an error
+// (which makes Sonarr/Radarr blacklist the release and try another).
 type FailureConfig struct {
+	// Timeout is an optional absolute cap measured from when a torrent becomes
+	// TorBox-active. 0 (the default) disables it, leaving StallTimeout as the only
+	// failure path; set it to bound how long a perpetually-slow torrent may hold a
+	// scarce TorBox slot.
 	Timeout Duration `yaml:"timeout"`
-	// StallTimeout fails a torrent early when TorBox reports it stalled with no
-	// seeders (and nothing fetched/cached), so Sonarr/Radarr fails over to a
-	// better-seeded release instead of waiting out the full Timeout. A non-positive
-	// value disables the early fast-fail and leaves only Timeout.
+	// StallTimeout fails a torrent that makes no forward progress (no bytes moving
+	// and progress not climbing) for this long — a dead or unseeded release. A
+	// slow but advancing download keeps resetting the clock and is never failed for
+	// being slow. A non-positive value disables stall detection.
 	StallTimeout Duration `yaml:"stall_timeout"`
 }
 
@@ -80,7 +85,7 @@ func Default() *Config {
 			ParallelFiles:    4,
 		},
 		Database: DatabaseConfig{Path: "data/tordownloader.db"},
-		Failure:  FailureConfig{Timeout: Duration(20 * time.Minute), StallTimeout: Duration(5 * time.Minute)},
+		Failure:  FailureConfig{Timeout: 0, StallTimeout: Duration(10 * time.Minute)},
 		Log:      LogConfig{Level: "info", Format: "text"},
 	}
 }
@@ -154,9 +159,6 @@ func (c *Config) Validate() error {
 	}
 	if c.TorBox.PollInterval.Std() <= 0 {
 		return errors.New("torbox.poll_interval must be > 0")
-	}
-	if c.Failure.Timeout.Std() <= 0 {
-		return errors.New("failure.timeout must be > 0")
 	}
 	switch strings.ToLower(c.Log.Level) {
 	case "debug", "info", "warn", "error":

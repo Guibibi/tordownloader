@@ -21,8 +21,10 @@ database:
   path: "data/tordownloader.db"    # SQLite state file
 
 failure:
-  timeout: 20m                     # ERROR if not present within this long after becoming TorBox-active
-  stall_timeout: 5m                # ERROR early when TorBox reports no seeders / no progress (fail over faster). <=0 disables
+  # A torrent is abandoned with an error (so Sonarr/Radarr blacklists the release
+  # and grabs another) only when it makes no headway — never just for being slow.
+  stall_timeout: 10m               # ERROR after this long with no progress (no bytes moving, progress not climbing). <=0 disables
+  timeout: 0                       # optional absolute cap from when it becomes TorBox-active; 0 disables (bounds slow torrents holding a slot)
 
 log:
   level: "info"                    # debug | info | warn | error

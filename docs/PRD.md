@@ -57,7 +57,7 @@ completed files on local disk.
 | FR3 | Extract the v1 infohash from the magnet (`xt=urn:btih:`) or by bencode-hashing the `.torrent` info dict; normalise to lowercase 40-char hex. All tracking is keyed on this hash so it matches what Sonarr tracks. |
 | FR4 | Forward the release to TorBox `createtorrent`; store mapping infohash↔torbox_id↔category. |
 | FR5 | Limit concurrent active TorBox downloads to a configurable max (default 3). Extra releases wait in a local queue and report an in-progress state to Sonarr. |
-| FR6 | On add, optionally check TorBox cached availability. If a torrent is not cached and not present within the configurable fail-fast timeout (**default 20 min**, measured from when it became active on TorBox — not while waiting in our local queue), report qBittorrent state `error`. |
+| FR6 | On add, optionally check TorBox cached availability (informational). Report qBittorrent state `error` only when a fetching torrent **stalls** — no bytes moving and progress not climbing for `failure.stall_timeout` (**default 10m**, measured while TorBox-active, not while waiting in our local queue). A slow but still-progressing fetch is never failed for being slow. An optional absolute `failure.timeout` cap (disabled by default) bounds how long a perpetually-slow torrent may hold a slot. |
 | FR7 | Poll TorBox `mylist` to update each tracked torrent's state and progress. |
 | FR8 | Map TorBox state + local download progress to a qBittorrent state and a blended progress value (TorBox half + local-download half). Report `error` on failures (including TorBox rejecting >200GB downloads). |
 | FR9 | When TorBox reports the torrent present/finished, download each file via `requestdl` (per-file, preserve folder tree) into the category save path, using a temp/incomplete dir and atomic move so Sonarr never sees partial files. |
@@ -65,7 +65,7 @@ completed files on local disk.
 | FR11 | On `torrents/delete`, cancel any in-flight download, delete the torrent from TorBox (`controltorrent` delete), and remove the local source files. |
 | FR12 | Persist torrents, files, and categories in SQLite. On restart, reconcile against TorBox and resume incomplete file downloads (HTTP Range). |
 | FR13 | Re-request `requestdl` links if they expire (~3h validity) mid-download. |
-| FR14 | Configurable via YAML/env: TorBox API key, listen address, download root, parallelism, slot limit, fail-fast timeout, poll interval, log level. |
+| FR14 | Configurable via YAML/env: TorBox API key, listen address, download root, parallelism, slot limit, stall timeout, optional absolute timeout, poll interval, log level. |
 
 ## 6. Non-functional requirements
 
@@ -95,6 +95,6 @@ completed files on local disk.
 - Adding a show in Sonarr results in the season pack being grabbed, sent to TorBox,
   downloaded to `/downloads/<category>/...`, imported by Sonarr, then cleaned up — with no
   manual intervention.
-- A dead/uncached release fails within ~20 minutes and Sonarr automatically grabs an
-  alternative.
+- A dead/unseeded release that makes no progress fails after the stall window (~10m) and
+  Sonarr automatically grabs an alternative; a slow-but-progressing fetch is left to finish.
 - The service recovers cleanly from a container restart mid-download.
