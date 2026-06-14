@@ -84,7 +84,7 @@ func run() error {
 
 	srv := &http.Server{
 		Addr:    cfg.Server.ListenAddr,
-		Handler: qbit.New(st, cfg.Download.Root, slog.Default()).Routes(),
+		Handler: qbit.New(st, cfg.Download.Root, eng.DeleteTorrent, slog.Default()).Routes(),
 	}
 
 	serveErr := make(chan error, 1)

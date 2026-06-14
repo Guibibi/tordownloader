@@ -9,7 +9,9 @@ import (
 	"io"
 	"mime/multipart"
 	"net/http"
+	"net/http/httptest"
 	"net/url"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -157,5 +159,98 @@ func TestDeleteRemovesRows(t *testing.T) {
 
 	if _, ok, _ := st.GetTorrent(context.Background(), testHash); ok {
 		t.Error("torrent still present after delete")
+	}
+}
+
+func TestDeleteWithEngineDeleteFn(t *testing.T) {
+	st, err := store.Open(context.Background(), filepath.Join(t.TempDir(), "test.db"))
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	t.Cleanup(func() { _ = st.Close() })
+
+	var deleteCalled bool
+	var gotHash string
+	var gotDeleteFiles bool
+	deleteFn := func(_ context.Context, hash string, deleteFiles bool) error {
+		deleteCalled = true
+		gotHash = hash
+		gotDeleteFiles = deleteFiles
+		return nil
+	}
+
+	// Seed a torrent first so the handler can find it for "all" delete.
+	magnet := "magnet:?xt=urn:btih:" + testHash
+	_, _, err = st.AddTorrent(context.Background(), store.AddTorrentParams{
+		Infohash: testHash, Name: "show", SavePath: "/downloads/tv",
+		Magnet: magnet,
+	})
+	if err != nil {
+		t.Fatalf("add: %v", err)
+	}
+
+	h := New(st, "/downloads", deleteFn, nil)
+	srv := httptest.NewServer(h.Routes())
+	t.Cleanup(srv.Close)
+
+	// Delete with deleteFiles=true.
+	_, _ = postForm(t, srv.URL+"/api/v2/torrents/delete", url.Values{
+		"hashes":      {testHash},
+		"deleteFiles": {"true"},
+	})
+
+	if !deleteCalled {
+		t.Fatal("delete function was not called")
+	}
+	if gotHash != testHash {
+		t.Errorf("infohash = %q, want %q", gotHash, testHash)
+	}
+	if !gotDeleteFiles {
+		t.Error("deleteFiles should be true")
+	}
+}
+
+func TestDeleteWithEngineDeleteFnAll(t *testing.T) {
+	st, err := store.Open(context.Background(), filepath.Join(t.TempDir(), "test.db"))
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	t.Cleanup(func() { _ = st.Close() })
+
+	// Seed two torrents.
+	for _, hash := range []string{testHash, "9999999999999999999999999999999999999999"} {
+		magnet := "magnet:?xt=urn:btih:" + hash
+		_, _, err := st.AddTorrent(context.Background(), store.AddTorrentParams{
+			Infohash: hash, Name: "s", SavePath: "/downloads/tv",
+			Magnet: magnet,
+		})
+		if err != nil {
+			t.Fatalf("add %s: %v", hash, err)
+		}
+	}
+
+	deleted := map[string]bool{}
+	deleteFn := func(_ context.Context, hash string, _ bool) error {
+		deleted[hash] = true
+		return nil
+	}
+
+	h := New(st, "/downloads", deleteFn, nil)
+	srv := httptest.NewServer(h.Routes())
+	t.Cleanup(srv.Close)
+
+	_, _ = postForm(t, srv.URL+"/api/v2/torrents/delete", url.Values{
+		"hashes":      {"all"},
+		"deleteFiles": {"false"},
+	})
+
+	if len(deleted) != 2 {
+		t.Errorf("deleted %d torrents, want 2", len(deleted))
+	}
+	if !deleted[testHash] {
+		t.Error("hash 1 not deleted")
+	}
+	if !deleted["9999999999999999999999999999999999999999"] {
+		t.Error("hash 2 not deleted")
 	}
 }

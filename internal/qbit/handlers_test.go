@@ -24,7 +24,7 @@ func newTestServer(t *testing.T) (*httptest.Server, *store.Store) {
 	}
 	t.Cleanup(func() { _ = st.Close() })
 
-	srv := httptest.NewServer(New(st, "/downloads", nil).Routes())
+	srv := httptest.NewServer(New(st, "/downloads", nil, nil).Routes())
 	t.Cleanup(srv.Close)
 	return srv, st
 }

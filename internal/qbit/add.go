@@ -176,29 +176,64 @@ func (h *Handler) savePathFor(ctx context.Context, category string) (string, err
 	return savePath, nil
 }
 
-// torrentsDelete removes torrents by `hashes` (pipe-separated, or "all"). M3
-// drops local DB rows only; TorBox-side deletion and local file removal land in
-// M6 (see docs/ROADMAP.md).
+// torrentsDelete removes torrents by `hashes` (pipe-separated, or "all").
+// When deleteFiles is true, local content is also removed. Each torrent is
+// deleted end-to-end via the engine: cancel any in-flight download, tell
+// TorBox to delete, remove local files, and drop the DB row.
 func (h *Handler) torrentsDelete(w http.ResponseWriter, r *http.Request) {
 	if err := parseForm(r); err != nil {
 		http.Error(w, "bad form", http.StatusBadRequest)
 		return
 	}
 	hashes := r.FormValue("hashes")
-	var (
-		n   int64
-		err error
-	)
+	deleteFiles := r.FormValue("deleteFiles") == "true"
+
+	// Resolve actual hashes to delete.
+	var toDelete []string
 	if hashes == "all" {
-		n, err = h.store.DeleteAll(r.Context())
+		// Enumerate every tracked torrent.
+		all, err := h.store.ListTorrents(r.Context(), store.TorrentFilter{})
+		if err != nil {
+			h.serverError(w, r, err)
+			return
+		}
+		for _, t := range all {
+			toDelete = append(toDelete, t.Infohash)
+		}
 	} else {
-		n, err = h.store.DeleteByHashes(r.Context(), splitHashes(hashes))
+		toDelete = splitHashes(hashes)
 	}
-	if err != nil {
-		h.serverError(w, r, err)
-		return
+
+	if h.deleteFn != nil {
+		// Engine-driven: full lifecycle cleanup (TorBox + local files + DB).
+		var failed int
+		for _, hh := range toDelete {
+			if err := h.deleteFn(r.Context(), hh, deleteFiles); err != nil {
+				h.log.Error("delete torrent", "infohash", hh, "err", err)
+				failed++
+			}
+		}
+		if failed > 0 && failed == len(toDelete) && len(toDelete) > 0 {
+			h.serverError(w, r, fmt.Errorf("all %d deletes failed", failed))
+			return
+		}
+	} else {
+		// Fallback: DB-only removal (used in tests that don't wire the engine).
+		var (
+			n   int64
+			err error
+		)
+		if hashes == "all" {
+			n, err = h.store.DeleteAll(r.Context())
+		} else {
+			n, err = h.store.DeleteByHashes(r.Context(), toDelete)
+		}
+		if err != nil {
+			h.serverError(w, r, err)
+			return
+		}
+		h.log.Info("torrents deleted", "count", n)
 	}
-	h.log.Info("torrents deleted", "count", n)
 	w.WriteHeader(http.StatusOK)
 }
 

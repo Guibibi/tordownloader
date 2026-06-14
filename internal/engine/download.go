@@ -34,8 +34,23 @@ func (e *Engine) downloadPass(ctx context.Context) error {
 
 // downloadOne fetches all of a torrent's files into a staging tree, atomically
 // moves the content into place, and marks the torrent COMPLETE. Any hard failure
-// moves it to ERROR; a shutdown (ctx cancelled) leaves it for a later resume.
+// moves it to ERROR; a shutdown (ctx cancelled) or per-torrent cancellation
+// (via Engine.DeleteTorrent) leaves it for a later resume.
 func (e *Engine) downloadOne(ctx context.Context, t store.Torrent) {
+	// Create a cancellable sub-context so a concurrent delete can cancel just
+	// this download without tearing down the rest of the engine.
+	dlCtx, cancel := context.WithCancel(ctx)
+	e.mu.Lock()
+	e.activeDownload = &activeDownload{cancel: cancel, infohash: t.Infohash, torrentID: t.ID}
+	e.mu.Unlock()
+	defer func() {
+		cancel()
+		e.mu.Lock()
+		if e.activeDownload != nil && e.activeDownload.infohash == t.Infohash {
+			e.activeDownload = nil
+		}
+		e.mu.Unlock()
+	}()
 	if !t.TorBoxID.Valid {
 		e.fail(ctx, t, "no TorBox id for download")
 		return
@@ -107,15 +122,20 @@ func (e *Engine) downloadOne(ctx context.Context, t store.Torrent) {
 	}
 
 	e.log.Info("downloading", "infohash", t.Infohash, "name", t.Name, "files", len(files), "size", totalSize)
-	err = downloader.Download(ctx, jobs, link, downloader.Options{
+	err = downloader.Download(dlCtx, jobs, link, downloader.Options{
 		Parallel:   e.parallel,
 		HTTPClient: e.httpClient,
 		Progress:   progress,
 		FileDone:   fileDone,
 	})
 	if err != nil {
-		if ctx.Err() != nil {
-			return // shutting down: keep state for resume
+		if dlCtx.Err() != nil && ctx.Err() == nil {
+			// Per-torrent cancellation (e.g. delete while downloading): keep
+			// state for potential resume — the deleter will drop the row.
+			return
+		}
+		if dlCtx.Err() != nil {
+			return // engine shutting down
 		}
 		e.fail(ctx, t, "download: "+err.Error())
 		return

@@ -13,6 +13,7 @@ import (
 	"net/http"
 	"time"
 
+	"github.com/guibibi/tordownloader/internal/engine"
 	"github.com/guibibi/tordownloader/internal/store"
 )
 
@@ -30,17 +31,25 @@ type Handler struct {
 	root       string // download root; the qBittorrent "save_path" and default category base
 	httpClient *http.Client
 	log        *slog.Logger
+
+	// deleteFn is called to remove a torrent end-to-end: TorBox deletion,
+	// local file cleanup, and DB drop. When nil, the handler falls back to
+	// store.DeleteByHashes (DB-only removal, for testing).
+	deleteFn engine.DeleteFunc
 }
 
 // New builds a Handler. root is the download root reported in app/preferences
-// and used as the base for category save paths.
-func New(st *store.Store, root string, log *slog.Logger) *Handler {
+// and used as the base for category save paths. deleteFn is the engine's delete
+// function; when nil the handler falls back to store-level DB-only deletion
+// (useful in tests).
+func New(st *store.Store, root string, deleteFn engine.DeleteFunc, log *slog.Logger) *Handler {
 	if log == nil {
 		log = slog.Default()
 	}
 	return &Handler{
 		store:      st,
 		root:       root,
+		deleteFn:   deleteFn,
 		httpClient: &http.Client{Timeout: 30 * time.Second},
 		log:        log,
 	}

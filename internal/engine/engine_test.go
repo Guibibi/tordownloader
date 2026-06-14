@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
 	"path/filepath"
 	"sync"
 	"testing"
@@ -19,6 +20,7 @@ type fakeTB struct {
 	fn    func(req torbox.CreateTorrentRequest) (*torbox.CreateTorrentResult, error)
 	list  func() ([]torbox.Torrent, error)
 	dl    func(p torbox.RequestDLParams) (string, error)
+	ctl   func(torrentID int, op torbox.Operation) error
 }
 
 func (f *fakeTB) CreateTorrent(_ context.Context, r torbox.CreateTorrentRequest) (*torbox.CreateTorrentResult, error) {
@@ -44,6 +46,15 @@ func (f *fakeTB) RequestDL(_ context.Context, p torbox.RequestDLParams) (string,
 		return "", nil
 	}
 	return f.dl(p)
+}
+
+func (f *fakeTB) ControlTorrent(_ context.Context, torrentID int, op torbox.Operation) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.ctl == nil {
+		return nil
+	}
+	return f.ctl(torrentID, op)
 }
 
 func okResult(id int) (*torbox.CreateTorrentResult, error) {
@@ -209,4 +220,231 @@ func listQueued(t *testing.T, st *store.Store) []store.Torrent {
 		t.Fatalf("list queued: %v", err)
 	}
 	return ts
+}
+
+// seedTorrentFull inserts a torrent with full state for DeleteTorrent tests.
+func seedTorrentFull(t *testing.T, st *store.Store, hash, state, contentPath, savePath string, torboxID int) {
+	t.Helper()
+	ctx := context.Background()
+	tr, _, err := st.AddTorrent(ctx, store.AddTorrentParams{
+		Infohash: hash, Name: "show", SavePath: savePath,
+		Magnet: "magnet:?xt=urn:btih:" + hash,
+	})
+	if err != nil {
+		t.Fatalf("add: %v", err)
+	}
+	if torboxID > 0 {
+		if err := st.MarkActive(ctx, tr.ID, torboxID); err != nil {
+			t.Fatalf("mark active: %v", err)
+		}
+	}
+	if state == store.StateComplete {
+		if err := st.MarkComplete(ctx, tr.ID, contentPath, 100); err != nil {
+			t.Fatalf("mark complete: %v", err)
+		}
+	} else if state == store.StateError {
+		if err := st.MarkError(ctx, tr.ID, "test error"); err != nil {
+			t.Fatalf("mark error: %v", err)
+		}
+	}
+}
+
+// touchFile creates a file with some content and returns its path.
+// name may include path separators; intermediate directories are created.
+func touchFile(t *testing.T, dir, name string) string {
+	t.Helper()
+	p := filepath.Join(dir, name)
+	if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+		t.Fatalf("mkdir %s: %v", filepath.Dir(p), err)
+	}
+	if err := os.WriteFile(p, []byte("data"), 0o644); err != nil {
+		t.Fatalf("write %s: %v", p, err)
+	}
+	return p
+}
+
+func TestDeleteTorrentRemovesAll(t *testing.T) {
+	st := newStore(t)
+	tmp := t.TempDir()
+	savePath := filepath.Join(tmp, "tv")
+	contentPath := filepath.Join(savePath, "show")
+	hash := "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+
+	// Put a local file on disk so we can verify it is removed.
+	f := touchFile(t, contentPath, "e01.mkv")
+
+	seedTorrentFull(t, st, hash, store.StateComplete, contentPath, savePath, 42)
+
+	var ctlCalled int
+	var ctlOp torbox.Operation
+	tb := &fakeTB{ctl: func(_ int, op torbox.Operation) error {
+		ctlCalled++
+		ctlOp = op
+		return nil
+	}}
+	e := New(st, tb, Config{MaxSlots: 1}, nil)
+
+	if err := e.DeleteTorrent(context.Background(), hash, true); err != nil {
+		t.Fatalf("DeleteTorrent: %v", err)
+	}
+
+	// TorBox delete was called.
+	if ctlCalled != 1 {
+		t.Errorf("ControlTorrent called %d times, want 1", ctlCalled)
+	}
+	if ctlOp != torbox.OpDelete {
+		t.Errorf("operation = %q, want delete", ctlOp)
+	}
+
+	// DB row is gone.
+	if _, ok, _ := st.GetTorrent(context.Background(), hash); ok {
+		t.Error("torrent still in DB after delete")
+	}
+
+	// Local file is gone.
+	if _, err := os.Stat(f); !os.IsNotExist(err) {
+		t.Error("local file not removed")
+	}
+}
+
+func TestDeleteTorrentKeepsFilesWhenFalse(t *testing.T) {
+	st := newStore(t)
+	tmp := t.TempDir()
+	savePath := filepath.Join(tmp, "tv")
+	contentPath := filepath.Join(savePath, "show")
+	hash := "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+
+	f := touchFile(t, contentPath, "e01.mkv")
+	seedTorrentFull(t, st, hash, store.StateComplete, contentPath, savePath, 42)
+
+	e := New(st, &fakeTB{}, Config{MaxSlots: 1}, nil)
+	if err := e.DeleteTorrent(context.Background(), hash, false); err != nil {
+		t.Fatalf("DeleteTorrent: %v", err)
+	}
+
+	// DB row is gone.
+	if _, ok, _ := st.GetTorrent(context.Background(), hash); ok {
+		t.Error("torrent still in DB after delete")
+	}
+
+	// Local file is kept.
+	if _, err := os.Stat(f); err != nil {
+		t.Errorf("local file should be kept: %v", err)
+	}
+}
+
+func TestDeleteTorrentNoTorBoxID(t *testing.T) {
+	// Torrent that never got a torbox_id (still QUEUED).
+	st := newStore(t)
+	hash := "cccccccccccccccccccccccccccccccccccccccc"
+	seedTorrentFull(t, st, hash, store.StateQueued, "", "/downloads/tv", 0)
+
+	var ctlCalled int
+	tb := &fakeTB{ctl: func(_ int, _ torbox.Operation) error {
+		ctlCalled++
+		return nil
+	}}
+	e := New(st, tb, Config{MaxSlots: 1}, nil)
+
+	if err := e.DeleteTorrent(context.Background(), hash, true); err != nil {
+		t.Fatalf("DeleteTorrent: %v", err)
+	}
+
+	// TorBox was never called (no torbox_id to delete).
+	if ctlCalled != 0 {
+		t.Errorf("ControlTorrent called %d times, want 0 (no torbox_id)", ctlCalled)
+	}
+
+	// DB row is gone.
+	if _, ok, _ := st.GetTorrent(context.Background(), hash); ok {
+		t.Error("torrent still in DB after delete")
+	}
+}
+
+func TestDeleteTorrentNonExistent(t *testing.T) {
+	st := newStore(t)
+	e := New(st, &fakeTB{}, Config{MaxSlots: 1}, nil)
+
+	if err := e.DeleteTorrent(context.Background(), "doesnotexist", true); err != nil {
+		t.Fatalf("DeleteTorrent: %v", err)
+	}
+	// Should be a silent no-op.
+}
+
+func TestDeleteTorrentTorBoxErrorStillCleansUp(t *testing.T) {
+	st := newStore(t)
+	hash := "dddddddddddddddddddddddddddddddddddddddd"
+	savePath := filepath.Join(t.TempDir(), "tv")
+	contentPath := filepath.Join(savePath, "show")
+	f := touchFile(t, contentPath, "e01.mkv")
+	seedTorrentFull(t, st, hash, store.StateComplete, contentPath, savePath, 99)
+
+	tb := &fakeTB{ctl: func(_ int, _ torbox.Operation) error {
+		return errors.New("torbox unreachable")
+	}}
+	e := New(st, tb, Config{MaxSlots: 1}, nil)
+
+	if err := e.DeleteTorrent(context.Background(), hash, true); err != nil {
+		t.Fatalf("DeleteTorrent: %v", err)
+	}
+
+	// DB row is still gone (local cleanup is not gated on TorBox).
+	if _, ok, _ := st.GetTorrent(context.Background(), hash); ok {
+		t.Error("torrent still in DB after delete (should clean up despite TorBox error)")
+	}
+
+	// Local file is gone.
+	if _, err := os.Stat(f); !os.IsNotExist(err) {
+		t.Error("local file not removed")
+	}
+}
+
+func TestDeleteTorrentRemovesStagingDir(t *testing.T) {
+	st := newStore(t)
+	tmp := t.TempDir()
+	savePath := filepath.Join(tmp, "tv")
+	hash := "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+
+	// Create a staging tree as if the downloader had been running.
+	stagingDir := filepath.Join(savePath, ".incomplete", hash)
+	stagingFile := touchFile(t, stagingDir, "show/e01.mkv.part")
+
+	seedTorrentFull(t, st, hash, store.StateLocalDload, filepath.Join(savePath, "show"), savePath, 42)
+
+	e := New(st, &fakeTB{}, Config{MaxSlots: 1, IncompleteSubdir: ".incomplete"}, nil)
+	if err := e.DeleteTorrent(context.Background(), hash, true); err != nil {
+		t.Fatalf("DeleteTorrent: %v", err)
+	}
+
+	if _, err := os.Stat(stagingFile); !os.IsNotExist(err) {
+		t.Error("staging file not removed")
+	}
+}
+
+func TestDeleteTorrentCancelsActiveDownload(t *testing.T) {
+	// Set up the engine with the torrent's download registered as active,
+	// as downloadOne would do. The cancel should be called by DeleteTorrent.
+	st := newStore(t)
+	hash := "ffffffffffffffffffffffffffffffffffffffff"
+	savePath := filepath.Join(t.TempDir(), "tv")
+	seedTorrentFull(t, st, hash, store.StateLocalDload, filepath.Join(savePath, "show"), savePath, 42)
+
+	var canceled bool
+	e := New(st, &fakeTB{}, Config{MaxSlots: 1}, nil)
+	e.mu.Lock()
+	_, cancel := context.WithCancel(context.Background())
+	e.activeDownload = &activeDownload{
+		cancel:    func() { canceled = true; cancel() },
+		infohash:  hash,
+		torrentID: 1,
+	}
+	e.mu.Unlock()
+
+	if err := e.DeleteTorrent(context.Background(), hash, true); err != nil {
+		t.Fatalf("DeleteTorrent: %v", err)
+	}
+
+	if !canceled {
+		t.Error("active download was not cancelled by delete")
+	}
 }

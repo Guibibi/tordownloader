@@ -13,6 +13,8 @@ import (
 	"errors"
 	"log/slog"
 	"net/http"
+	"os"
+	"path/filepath"
 	"sync"
 	"time"
 
@@ -38,13 +40,14 @@ const (
 )
 
 // TorBoxAPI is the slice of the TorBox client the engine needs: submitting
-// releases (submitter), polling account state (reconciler), and requesting CDN
-// links (downloader). The concrete *torbox.Client satisfies it; tests
-// substitute a fake.
+// releases (submitter), polling account state (reconciler), requesting CDN
+// links (downloader), and deleting torrents (cleanup). The concrete
+// *torbox.Client satisfies it; tests substitute a fake.
 type TorBoxAPI interface {
 	CreateTorrent(ctx context.Context, r torbox.CreateTorrentRequest) (*torbox.CreateTorrentResult, error)
 	MyList(ctx context.Context, bypassCache bool) ([]torbox.Torrent, error)
 	RequestDL(ctx context.Context, p torbox.RequestDLParams) (string, error)
+	ControlTorrent(ctx context.Context, torrentID int, op torbox.Operation) error
 }
 
 // Config tunes the engine's background workers.
@@ -54,6 +57,14 @@ type Config struct {
 	FailTimeout      time.Duration // fail-fast window while TORBOX_ACTIVE (default 20m)
 	ParallelFiles    int           // concurrent file downloads per torrent (default 4)
 	IncompleteSubdir string        // staging dir under the save path (default .incomplete)
+}
+
+// activeDownload tracks the currently in-flight download so a delete can
+// cancel it before cleaning up local files.
+type activeDownload struct {
+	cancel   context.CancelFunc
+	infohash string
+	torrentID int64
 }
 
 // Engine runs the background workers.
@@ -67,6 +78,9 @@ type Engine struct {
 	incomplete string
 	httpClient *http.Client
 	log        *slog.Logger
+
+	mu              sync.Mutex
+	activeDownload  *activeDownload
 }
 
 // New builds an Engine from cfg, clamping unset/invalid fields to defaults.
@@ -239,4 +253,70 @@ func torboxID(res *torbox.CreateTorrentResult) int {
 	default:
 		return 0
 	}
+}
+
+// DeleteFunc is the signature the qbit layer calls to remove a torrent:
+// cancels any in-flight download, tells TorBox to delete, removes local files,
+// and drops the database row.
+type DeleteFunc func(ctx context.Context, infohash string, deleteFiles bool) error
+
+// DeleteTorrent removes a torrent end-to-end: cancels a running local download,
+// calls controltorrent delete on TorBox (best-effort), removes local files when
+// deleteFiles is true, and drops the database row.
+func (e *Engine) DeleteTorrent(ctx context.Context, infohash string, deleteFiles bool) error {
+	// 1. Cancel the in-flight download if this torrent is currently being pulled.
+	e.mu.Lock()
+	if e.activeDownload != nil && e.activeDownload.infohash == infohash {
+		e.activeDownload.cancel()
+	}
+	e.mu.Unlock()
+
+	// 2. Fetch the row to know the TorBox id and local paths.
+	t, ok, err := e.store.GetTorrent(ctx, infohash)
+	if err != nil {
+		return err
+	}
+	if !ok {
+		return nil // already gone (or never tracked)
+	}
+
+	// 3. Delete from TorBox (best-effort: if the call fails we still clean up
+	//    locally — the torrent will naturally expire on TorBox).
+	if t.TorBoxID.Valid {
+		if err := e.torbox.ControlTorrent(ctx, int(t.TorBoxID.Int64), torbox.OpDelete); err != nil {
+			e.log.Warn("TorBox delete failed (continuing with local cleanup)",
+				"infohash", infohash, "torbox_id", t.TorBoxID.Int64, "err", err)
+		}
+	}
+
+	// 4. Remove local files when the caller requested it (Sonarr passes
+	//    deleteFiles=true after importing, keeping /downloads clean).
+	if deleteFiles {
+		// Staging tree: <save_path>/.incomplete/<infohash>/...
+		if t.SavePath != "" {
+			staging := filepath.Join(t.SavePath, e.incomplete, t.Infohash)
+			if err := os.RemoveAll(staging); err != nil && !os.IsNotExist(err) {
+				e.log.Warn("remove staging", "path", staging, "err", err)
+			}
+		}
+
+		// Downloaded content: the content_path (folder or single file).
+		if t.ContentPath != "" && t.ContentPath != t.SavePath {
+			if err := os.RemoveAll(t.ContentPath); err != nil && !os.IsNotExist(err) {
+				e.log.Warn("remove content", "path", t.ContentPath, "err", err)
+			}
+		}
+
+		// Also remove the incomplete parent dir if now empty (best-effort).
+		if t.SavePath != "" {
+			_ = os.Remove(filepath.Join(t.SavePath, e.incomplete)) // succeeds only if empty
+		}
+	}
+
+	// 5. Drop the database row (files cascade via FK).
+	if _, err := e.store.DeleteByHashes(ctx, []string{infohash}); err != nil {
+		return err
+	}
+	e.log.Info("torrent deleted", "infohash", infohash, "delete_files", deleteFiles)
+	return nil
 }
