@@ -142,12 +142,17 @@ categories(
 ## 6. Path construction
 
 - `save_path` = category's save path, default `<download_root>/<category>`.
-- Multi-file torrent: `content_path = <save_path>/<torrent_name>/`; files written at
-  `<save_path>/<torrent_name>/<rel_path>` (TorBox file `name` is the full path within the
-  torrent; `short_name` is just the basename — use `name` to preserve structure).
-- Single-file torrent: `content_path = <save_path>/<filename>`.
-- Download into `<save_path>/<incomplete_subdir>/...` first, then atomic rename into place when
-  every file is complete, so Sonarr never imports partial content.
+- Each file is written at `<save_path>/<rel_path>`, where `rel_path` is the TorBox file `name`
+  (the full path **within** the torrent, including its top folder — verified in API_REFERENCE §5;
+  `short_name` is just the basename). So a season pack lands at `<save_path>/<Show.S01>/<ep>.mkv`.
+- `content_path` is what Sonarr imports: the single top-level entry under `save_path` — the
+  torrent's folder for a multi-file release, or the file itself for a single-file release. It is
+  computed from the actual content after download (`downloader.Finalize`), not guessed from the
+  name; the reconciler sets a best-effort value earlier for display.
+- Download into a per-torrent staging tree `<save_path>/<incomplete_subdir>/<infohash>/...` first,
+  then atomically rename each top-level entry into `save_path` once every file is complete and
+  size-verified, so Sonarr never imports partial content. Staging lives under `save_path` to keep
+  the rename on one filesystem (atomic).
 
 ## 7. TorBox client notes
 

@@ -12,6 +12,7 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"net/http"
 	"sync"
 	"time"
 
@@ -24,35 +25,48 @@ import (
 // short cadence just lowers add-to-submit latency without risking the rate limit.
 const submitInterval = 2 * time.Second
 
+// downloadInterval is how often the downloader looks for torrents whose content
+// is present on TorBox and ready to pull to disk.
+const downloadInterval = 2 * time.Second
+
 // Defaults applied when Config leaves a field unset.
 const (
-	defaultPollInterval = 10 * time.Second
-	defaultFailTimeout  = 20 * time.Minute
+	defaultPollInterval     = 10 * time.Second
+	defaultFailTimeout      = 20 * time.Minute
+	defaultParallelFiles    = 4
+	defaultIncompleteSubdir = ".incomplete"
 )
 
 // TorBoxAPI is the slice of the TorBox client the engine needs: submitting
-// releases (submitter) and polling account state (reconciler). The concrete
-// *torbox.Client satisfies it; tests substitute a fake.
+// releases (submitter), polling account state (reconciler), and requesting CDN
+// links (downloader). The concrete *torbox.Client satisfies it; tests
+// substitute a fake.
 type TorBoxAPI interface {
 	CreateTorrent(ctx context.Context, r torbox.CreateTorrentRequest) (*torbox.CreateTorrentResult, error)
 	MyList(ctx context.Context, bypassCache bool) ([]torbox.Torrent, error)
+	RequestDL(ctx context.Context, p torbox.RequestDLParams) (string, error)
 }
 
 // Config tunes the engine's background workers.
 type Config struct {
-	MaxSlots     int           // TorBox concurrent-slot limit (default 1)
-	PollInterval time.Duration // reconciler cadence (default 10s)
-	FailTimeout  time.Duration // fail-fast window while TORBOX_ACTIVE (default 20m)
+	MaxSlots         int           // TorBox concurrent-slot limit (default 1)
+	PollInterval     time.Duration // reconciler cadence (default 10s)
+	FailTimeout      time.Duration // fail-fast window while TORBOX_ACTIVE (default 20m)
+	ParallelFiles    int           // concurrent file downloads per torrent (default 4)
+	IncompleteSubdir string        // staging dir under the save path (default .incomplete)
 }
 
 // Engine runs the background workers.
 type Engine struct {
-	store     *store.Store
-	torbox    TorBoxAPI
-	maxSlots  int
-	pollEvery time.Duration
-	failAfter time.Duration
-	log       *slog.Logger
+	store      *store.Store
+	torbox     TorBoxAPI
+	maxSlots   int
+	pollEvery  time.Duration
+	failAfter  time.Duration
+	parallel   int
+	incomplete string
+	httpClient *http.Client
+	log        *slog.Logger
 }
 
 // New builds an Engine from cfg, clamping unset/invalid fields to defaults.
@@ -69,24 +83,36 @@ func New(st *store.Store, tb TorBoxAPI, cfg Config, log *slog.Logger) *Engine {
 	if cfg.FailTimeout <= 0 {
 		cfg.FailTimeout = defaultFailTimeout
 	}
+	if cfg.ParallelFiles < 1 {
+		cfg.ParallelFiles = defaultParallelFiles
+	}
+	if cfg.IncompleteSubdir == "" {
+		cfg.IncompleteSubdir = defaultIncompleteSubdir
+	}
 	return &Engine{
-		store:     st,
-		torbox:    tb,
-		maxSlots:  cfg.MaxSlots,
-		pollEvery: cfg.PollInterval,
-		failAfter: cfg.FailTimeout,
-		log:       log,
+		store:      st,
+		torbox:     tb,
+		maxSlots:   cfg.MaxSlots,
+		pollEvery:  cfg.PollInterval,
+		failAfter:  cfg.FailTimeout,
+		parallel:   cfg.ParallelFiles,
+		incomplete: cfg.IncompleteSubdir,
+		// No client timeout: downloads can be long; cancellation is via ctx.
+		httpClient: &http.Client{},
+		log:        log,
 	}
 }
 
-// Run drives the submitter and reconciler until ctx is cancelled.
+// Run drives the submitter, reconciler, and downloader until ctx is cancelled.
 func (e *Engine) Run(ctx context.Context) {
 	e.log.Info("engine started",
-		"max_active_slots", e.maxSlots, "poll_interval", e.pollEvery, "fail_timeout", e.failAfter)
+		"max_active_slots", e.maxSlots, "poll_interval", e.pollEvery, "fail_timeout", e.failAfter,
+		"parallel_files", e.parallel)
 	var wg sync.WaitGroup
-	wg.Add(2)
+	wg.Add(3)
 	go func() { defer wg.Done(); e.loop(ctx, "submit", submitInterval, e.submitPass) }()
 	go func() { defer wg.Done(); e.loop(ctx, "reconcile", e.pollEvery, e.reconcilePass) }()
+	go func() { defer wg.Done(); e.loop(ctx, "download", downloadInterval, e.downloadPass) }()
 	wg.Wait()
 	e.log.Info("engine stopped")
 }

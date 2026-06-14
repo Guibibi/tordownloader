@@ -18,6 +18,7 @@ type fakeTB struct {
 	calls int
 	fn    func(req torbox.CreateTorrentRequest) (*torbox.CreateTorrentResult, error)
 	list  func() ([]torbox.Torrent, error)
+	dl    func(p torbox.RequestDLParams) (string, error)
 }
 
 func (f *fakeTB) CreateTorrent(_ context.Context, r torbox.CreateTorrentRequest) (*torbox.CreateTorrentResult, error) {
@@ -34,6 +35,15 @@ func (f *fakeTB) MyList(_ context.Context, _ bool) ([]torbox.Torrent, error) {
 		return nil, nil
 	}
 	return f.list()
+}
+
+func (f *fakeTB) RequestDL(_ context.Context, p torbox.RequestDLParams) (string, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.dl == nil {
+		return "", nil
+	}
+	return f.dl(p)
 }
 
 func okResult(id int) (*torbox.CreateTorrentResult, error) {

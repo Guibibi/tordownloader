@@ -193,6 +193,68 @@ func (s *Store) MarkLocalQueued(ctx context.Context, id int64, contentPath strin
 	return nil
 }
 
+// MarkLocalDownloading moves a torrent from LOCAL_QUEUED to LOCAL_DOWNLOAD as
+// the downloader begins pulling its files. The state guard makes it a no-op if
+// the torrent already advanced (e.g. a resume where it is already downloading).
+func (s *Store) MarkLocalDownloading(ctx context.Context, id int64) error {
+	now := time.Now().Unix()
+	_, err := s.db.ExecContext(ctx, `
+		UPDATE torrents SET state = ?, updated_at = ? WHERE id = ? AND state = ?`,
+		StateLocalDload, now, id, StateLocalQueued)
+	if err != nil {
+		return fmt.Errorf("mark local downloading %d: %w", id, err)
+	}
+	return nil
+}
+
+// UpdateLocalProgress records download progress (0..1) and the current local
+// download speed. It only touches LOCAL_DOWNLOAD rows so a late progress tick
+// can't overwrite a torrent that already completed or was deleted.
+func (s *Store) UpdateLocalProgress(ctx context.Context, id int64, progress float64, dlspeed int64) error {
+	now := time.Now().Unix()
+	_, err := s.db.ExecContext(ctx, `
+		UPDATE torrents SET local_progress = ?, dlspeed = ?, updated_at = ?
+		WHERE id = ? AND state = ?`,
+		progress, dlspeed, now, id, StateLocalDload)
+	if err != nil {
+		return fmt.Errorf("update local progress %d: %w", id, err)
+	}
+	return nil
+}
+
+// MarkFileDone records that a single file finished downloading and verifying.
+func (s *Store) MarkFileDone(ctx context.Context, fileID int64, size int64) error {
+	_, err := s.db.ExecContext(ctx, `
+		UPDATE files SET downloaded = ?, done = 1 WHERE id = ?`, size, fileID)
+	if err != nil {
+		return fmt.Errorf("mark file done %d: %w", fileID, err)
+	}
+	return nil
+}
+
+// MarkComplete moves a torrent to COMPLETE once every file is on disk: it pins
+// local_progress to 1, clears the speed, records the final content_path (and
+// size, when known) and the completion time. COMPLETE renders as pausedUP so
+// Sonarr imports (docs/API_REFERENCE.md §3).
+func (s *Store) MarkComplete(ctx context.Context, id int64, contentPath string, size int64) error {
+	now := time.Now().Unix()
+	_, err := s.db.ExecContext(ctx, `
+		UPDATE torrents SET
+			state          = ?,
+			local_progress = 1,
+			dlspeed        = 0,
+			content_path   = ?,
+			size           = CASE WHEN ? > 0 THEN ? ELSE size END,
+			completed_on   = ?,
+			updated_at     = ?
+		WHERE id = ?`,
+		StateComplete, contentPath, size, size, now, now, id)
+	if err != nil {
+		return fmt.Errorf("mark complete %d: %w", id, err)
+	}
+	return nil
+}
+
 // MarkError moves a torrent to ERROR with a human-readable reason.
 func (s *Store) MarkError(ctx context.Context, id int64, reason string) error {
 	now := time.Now().Unix()
