@@ -95,14 +95,21 @@ func (e *Engine) downloadOne(ctx context.Context, t store.Torrent) {
 
 	prevBytes := int64(0)
 	prevTime := time.Now()
+	// The first progress sample carries the bytes already on disk (seeded by the
+	// downloader on resume). Measuring speed against a zero baseline would report
+	// a huge one-tick spike, so the first sample only sets the baseline.
+	firstSample := true
 	progress := func(downloaded int64) {
 		now := time.Now()
 		var speed int64
-		if dt := now.Sub(prevTime).Seconds(); dt > 0 {
-			if s := int64(float64(downloaded-prevBytes) / dt); s > 0 {
-				speed = s
+		if !firstSample {
+			if dt := now.Sub(prevTime).Seconds(); dt > 0 {
+				if s := int64(float64(downloaded-prevBytes) / dt); s > 0 {
+					speed = s
+				}
 			}
 		}
+		firstSample = false
 		prevBytes, prevTime = downloaded, now
 		var p float64
 		if totalSize > 0 {

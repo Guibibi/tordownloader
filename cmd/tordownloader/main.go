@@ -79,12 +79,17 @@ func run() error {
 		FailTimeout:      cfg.Failure.Timeout.Std(),
 		ParallelFiles:    cfg.Download.ParallelFiles,
 		IncompleteSubdir: cfg.Download.IncompleteSubdir,
+		CacheCheck:       cfg.TorBox.CacheCheck,
 	}, slog.Default())
 	go eng.Run(ctx)
 
 	srv := &http.Server{
 		Addr:    cfg.Server.ListenAddr,
 		Handler: qbit.New(st, cfg.Download.Root, eng.DeleteTorrent, slog.Default()).Routes(),
+		// Bound the header-read phase so a slow/stalled client can't pin a
+		// connection open indefinitely (Slowloris). Handlers themselves are
+		// quick, so no ReadTimeout/WriteTimeout that could truncate a response.
+		ReadHeaderTimeout: 10 * time.Second,
 	}
 
 	serveErr := make(chan error, 1)

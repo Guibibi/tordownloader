@@ -48,6 +48,7 @@ type TorBoxAPI interface {
 	MyList(ctx context.Context, bypassCache bool) ([]torbox.Torrent, error)
 	RequestDL(ctx context.Context, p torbox.RequestDLParams) (string, error)
 	ControlTorrent(ctx context.Context, torrentID int, op torbox.Operation) error
+	CheckCached(ctx context.Context, hashes []string, listFiles bool) (map[string]torbox.CachedInfo, error)
 }
 
 // Config tunes the engine's background workers.
@@ -57,13 +58,14 @@ type Config struct {
 	FailTimeout      time.Duration // fail-fast window while TORBOX_ACTIVE (default 20m)
 	ParallelFiles    int           // concurrent file downloads per torrent (default 4)
 	IncompleteSubdir string        // staging dir under the save path (default .incomplete)
+	CacheCheck       bool          // log TorBox cache status on submit (informational)
 }
 
 // activeDownload tracks the currently in-flight download so a delete can
 // cancel it before cleaning up local files.
 type activeDownload struct {
-	cancel   context.CancelFunc
-	infohash string
+	cancel    context.CancelFunc
+	infohash  string
 	torrentID int64
 }
 
@@ -76,11 +78,12 @@ type Engine struct {
 	failAfter  time.Duration
 	parallel   int
 	incomplete string
+	cacheCheck bool
 	httpClient *http.Client
 	log        *slog.Logger
 
-	mu              sync.Mutex
-	activeDownload  *activeDownload
+	mu             sync.Mutex
+	activeDownload *activeDownload
 }
 
 // New builds an Engine from cfg, clamping unset/invalid fields to defaults.
@@ -111,6 +114,7 @@ func New(st *store.Store, tb TorBoxAPI, cfg Config, log *slog.Logger) *Engine {
 		failAfter:  cfg.FailTimeout,
 		parallel:   cfg.ParallelFiles,
 		incomplete: cfg.IncompleteSubdir,
+		cacheCheck: cfg.CacheCheck,
 		// No client timeout: downloads can be long; cancellation is via ctx.
 		httpClient: &http.Client{},
 		log:        log,
@@ -209,6 +213,14 @@ func (e *Engine) submit(ctx context.Context, t store.Torrent) bool {
 		return true
 	}
 
+	// Informational cache check: log whether TorBox already has the content so a
+	// long fetch isn't mistaken for a stall. Never gates submission — uncached
+	// releases are still valid and the fail-fast clock (failAfter) covers ones
+	// TorBox can't fetch in time.
+	if e.cacheCheck {
+		e.logCacheStatus(ctx, t.Infohash)
+	}
+
 	res, err := e.torbox.CreateTorrent(ctx, req)
 	if err != nil {
 		var apiErr *torbox.APIError
@@ -239,6 +251,24 @@ func (e *Engine) submit(ctx context.Context, t store.Torrent) bool {
 	}
 	e.log.Info("submitted to TorBox", "infohash", t.Infohash, "torbox_id", id, "name", t.Name)
 	return true
+}
+
+// logCacheStatus reports whether TorBox already has the content for infohash. It
+// is purely informational (errors are swallowed) and never affects submission.
+func (e *Engine) logCacheStatus(ctx context.Context, infohash string) {
+	cached, err := e.torbox.CheckCached(ctx, []string{infohash}, false)
+	if err != nil {
+		e.log.Debug("cache check failed (continuing)", "infohash", infohash, "err", err)
+		return
+	}
+	// Exactly one hash was queried, so any returned entry means it's cached
+	// (avoids depending on the response's key casing).
+	if len(cached) > 0 {
+		e.log.Info("cached on TorBox; content should be available shortly", "infohash", infohash)
+	} else {
+		e.log.Info("not cached on TorBox; will fetch server-side within the fail-fast window",
+			"infohash", infohash, "fail_timeout", e.failAfter)
+	}
 }
 
 // fail moves a torrent to ERROR, logging if the store update itself fails.

@@ -21,6 +21,7 @@ type fakeTB struct {
 	list  func() ([]torbox.Torrent, error)
 	dl    func(p torbox.RequestDLParams) (string, error)
 	ctl   func(torrentID int, op torbox.Operation) error
+	cache func(hashes []string) (map[string]torbox.CachedInfo, error)
 }
 
 func (f *fakeTB) CreateTorrent(_ context.Context, r torbox.CreateTorrentRequest) (*torbox.CreateTorrentResult, error) {
@@ -55,6 +56,15 @@ func (f *fakeTB) ControlTorrent(_ context.Context, torrentID int, op torbox.Oper
 		return nil
 	}
 	return f.ctl(torrentID, op)
+}
+
+func (f *fakeTB) CheckCached(_ context.Context, hashes []string, _ bool) (map[string]torbox.CachedInfo, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.cache == nil {
+		return map[string]torbox.CachedInfo{}, nil
+	}
+	return f.cache(hashes)
 }
 
 func okResult(id int) (*torbox.CreateTorrentResult, error) {
@@ -210,6 +220,57 @@ func TestSubmitPassesMagnet(t *testing.T) {
 	}
 	if gotMagnet == "" {
 		t.Error("expected magnet passed to createtorrent")
+	}
+}
+
+func TestSubmitCacheCheckIsInformationalOnly(t *testing.T) {
+	// With cache_check enabled and the release reported as NOT cached, submission
+	// must still proceed — the cache check only logs, it never gates.
+	st := newStore(t)
+	seedQueued(t, st, 1)
+
+	var cacheCalls int
+	tb := &fakeTB{
+		fn: func(torbox.CreateTorrentRequest) (*torbox.CreateTorrentResult, error) {
+			return okResult(1)
+		},
+		cache: func([]string) (map[string]torbox.CachedInfo, error) {
+			cacheCalls++
+			return map[string]torbox.CachedInfo{}, nil // not cached
+		},
+	}
+	e := New(st, tb, Config{MaxSlots: 3, CacheCheck: true}, nil)
+	if err := e.submitPass(context.Background()); err != nil {
+		t.Fatalf("submitPass: %v", err)
+	}
+	if cacheCalls != 1 {
+		t.Errorf("CheckCached calls = %d, want 1", cacheCalls)
+	}
+	if got := countState(t, st, store.StateTorBoxActive); got != 1 {
+		t.Errorf("active = %d, want 1 (uncached release still submitted)", got)
+	}
+}
+
+func TestSubmitNoCacheCheckWhenDisabled(t *testing.T) {
+	st := newStore(t)
+	seedQueued(t, st, 1)
+
+	var cacheCalls int
+	tb := &fakeTB{
+		fn: func(torbox.CreateTorrentRequest) (*torbox.CreateTorrentResult, error) {
+			return okResult(1)
+		},
+		cache: func([]string) (map[string]torbox.CachedInfo, error) {
+			cacheCalls++
+			return nil, nil
+		},
+	}
+	e := New(st, tb, Config{MaxSlots: 3, CacheCheck: false}, nil)
+	if err := e.submitPass(context.Background()); err != nil {
+		t.Fatalf("submitPass: %v", err)
+	}
+	if cacheCalls != 0 {
+		t.Errorf("CheckCached calls = %d, want 0 (cache_check disabled)", cacheCalls)
 	}
 }
 
