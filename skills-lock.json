@@ -1,0 +1,269 @@
+{
+  "version": 1,
+  "skills": {
+    "grill-with-docs": {
+      "source": "mattpocock/skills",
+      "sourceType": "github",
+      "skillPath": "skills/engineering/grill-with-docs/SKILL.md",
+      "computedHash": "eb0e91e84277283dc2b23ed544399e53afd6b5287e5b6929f25fe8aa608e164b"
+    },
+    "improve-codebase-architecture": {
+      "source": "mattpocock/skills",
+      "sourceType": "github",
+      "skillPath": "skills/engineering/improve-codebase-architecture/SKILL.md",
+      "computedHash": "ef32aea0a8fab9b365ff9e08a95f8d353e20ca21ea46ec2e73587c86dd341351"
+    },
+    "linear-attachments": {
+      "source": "Finesssee/linear-cli",
+      "sourceType": "github",
+      "skillPath": "skills/linear-attachments/SKILL.md",
+      "computedHash": "88c870198bfeae2f7a9b0464d14e3703d6898454e9310d106431eed6de48586f"
+    },
+    "linear-bulk": {
+      "source": "Finesssee/linear-cli",
+      "sourceType": "github",
+      "skillPath": "skills/linear-bulk/SKILL.md",
+      "computedHash": "5cd28932ea3830c2781ce8b835b2c727420fdadf95276e23793578bb70c52e66"
+    },
+    "linear-comments": {
+      "source": "Finesssee/linear-cli",
+      "sourceType": "github",
+      "skillPath": "skills/linear-comments/SKILL.md",
+      "computedHash": "4b481df0b78f92344afeeb1ce9f465484a4a6d271394306385c933572c71fc1b"
+    },
+    "linear-config": {
+      "source": "Finesssee/linear-cli",
+      "sourceType": "github",
+      "skillPath": "skills/linear-config/SKILL.md",
+      "computedHash": "79e1a9016d9de101256b71e8c896fe5e9fa80f55fde05eab611c10572e0cbd71"
+    },
+    "linear-create": {
+      "source": "Finesssee/linear-cli",
+      "sourceType": "github",
+      "skillPath": "skills/linear-create/SKILL.md",
+      "computedHash": "82a31b1bea122070daa3ad89339805fe84e8c0aef06777d405cb45dd0a650445"
+    },
+    "linear-cycles": {
+      "source": "Finesssee/linear-cli",
+      "sourceType": "github",
+      "skillPath": "skills/linear-cycles/SKILL.md",
+      "computedHash": "184b31dad62aed20c1bdefa81acdc1d91c63fe19fd0558bb953df602ba50d09e"
+    },
+    "linear-documents": {
+      "source": "Finesssee/linear-cli",
+      "sourceType": "github",
+      "skillPath": "skills/linear-documents/SKILL.md",
+      "computedHash": "fc9cb73f4dc8a94b8e21a091b91afe20e78e52e1b3e01fda1aadd9c1941bef95"
+    },
+    "linear-done": {
+      "source": "Finesssee/linear-cli",
+      "sourceType": "github",
+      "skillPath": "skills/linear-done/SKILL.md",
+      "computedHash": "9d365450ed68ce38acbd60568b41426e992d046670031b0070a1b35647d76707"
+    },
+    "linear-export": {
+      "source": "Finesssee/linear-cli",
+      "sourceType": "github",
+      "skillPath": "skills/linear-export/SKILL.md",
+      "computedHash": "63d15574750b97e31e38a2e89b3a18f735bd18d3602321bd49babda3fae2a510"
+    },
+    "linear-favorites": {
+      "source": "Finesssee/linear-cli",
+      "sourceType": "github",
+      "skillPath": "skills/linear-favorites/SKILL.md",
+      "computedHash": "8ac01ac6b8d2655356a99d54806575d485edb724381123ef5534b3422b5f6ad0"
+    },
+    "linear-git": {
+      "source": "Finesssee/linear-cli",
+      "sourceType": "github",
+      "skillPath": "skills/linear-git/SKILL.md",
+      "computedHash": "494483d13907deeaab5db8af2bb96171fb75325d3c190caaa3159ed8742b3157"
+    },
+    "linear-history": {
+      "source": "Finesssee/linear-cli",
+      "sourceType": "github",
+      "skillPath": "skills/linear-history/SKILL.md",
+      "computedHash": "dc3a4c304cc9868145357ee85fc7df26eadee5310ebb452ef7fb0e5281162c01"
+    },
+    "linear-import": {
+      "source": "Finesssee/linear-cli",
+      "sourceType": "github",
+      "skillPath": "skills/linear-import/SKILL.md",
+      "computedHash": "874c50246419f395e1cd79f0fc8fc497657819b8cc7aa5c6fa2a66f7e4e21d88"
+    },
+    "linear-initiatives": {
+      "source": "Finesssee/linear-cli",
+      "sourceType": "github",
+      "skillPath": "skills/linear-initiatives/SKILL.md",
+      "computedHash": "eb66105da0c2eaa134a03f563e45cdca1560bb593b27ec2d88dff721870417e4"
+    },
+    "linear-labels": {
+      "source": "Finesssee/linear-cli",
+      "sourceType": "github",
+      "skillPath": "skills/linear-labels/SKILL.md",
+      "computedHash": "3f87b6768f3bf1104c4d2e28490dbdaca8c8353e344a3b329db599f4c0438b9f"
+    },
+    "linear-list": {
+      "source": "Finesssee/linear-cli",
+      "sourceType": "github",
+      "skillPath": "skills/linear-list/SKILL.md",
+      "computedHash": "2a2ac6acfcefe4abbaf6f914ac47ceb22b207feb6266e61f7655c970097147c6"
+    },
+    "linear-metrics": {
+      "source": "Finesssee/linear-cli",
+      "sourceType": "github",
+      "skillPath": "skills/linear-metrics/SKILL.md",
+      "computedHash": "5bc4c7f3e580b0a4575328569cae26a37811cd7ed50f5c4e4da8156e53492ed7"
+    },
+    "linear-milestones": {
+      "source": "Finesssee/linear-cli",
+      "sourceType": "github",
+      "skillPath": "skills/linear-milestones/SKILL.md",
+      "computedHash": "c1057b1ffd10018d19843a9fa68982c593acc65d83d45905829f16d6dfe901ae"
+    },
+    "linear-notifications": {
+      "source": "Finesssee/linear-cli",
+      "sourceType": "github",
+      "skillPath": "skills/linear-notifications/SKILL.md",
+      "computedHash": "1f44a301acfb2ae181676cfdced9cef5e94e240f0eb1eb0c4d468a15bfc47205"
+    },
+    "linear-pr": {
+      "source": "Finesssee/linear-cli",
+      "sourceType": "github",
+      "skillPath": "skills/linear-pr/SKILL.md",
+      "computedHash": "83389b8c007acadc4b44c5cc648ebc84061705da78ea3d3b6fc4eae7b1300d85"
+    },
+    "linear-project-updates": {
+      "source": "Finesssee/linear-cli",
+      "sourceType": "github",
+      "skillPath": "skills/linear-project-updates/SKILL.md",
+      "computedHash": "5f33991f689ab40525e4f869618000f5a59cdc0285ec46970cf578e6f1ee67e6"
+    },
+    "linear-projects": {
+      "source": "Finesssee/linear-cli",
+      "sourceType": "github",
+      "skillPath": "skills/linear-projects/SKILL.md",
+      "computedHash": "8f5178dd82119878e1a5a9507a1a5de0854f9323385bd6c58bf920d76d57609c"
+    },
+    "linear-relations": {
+      "source": "Finesssee/linear-cli",
+      "sourceType": "github",
+      "skillPath": "skills/linear-relations/SKILL.md",
+      "computedHash": "d135dd616fd8c40d3426ea98f029c1c587bf6311761ad6e9600c0fab08687080"
+    },
+    "linear-roadmaps": {
+      "source": "Finesssee/linear-cli",
+      "sourceType": "github",
+      "skillPath": "skills/linear-roadmaps/SKILL.md",
+      "computedHash": "f0f2745ef3f8b19f412293f452d2d5062ff553088b3aa0eaf3fcf5cfb4430eb1"
+    },
+    "linear-search": {
+      "source": "Finesssee/linear-cli",
+      "sourceType": "github",
+      "skillPath": "skills/linear-search/SKILL.md",
+      "computedHash": "4bb085fbd8fc7234cbb4e6658597c35592e8d3e2166b66ac7aea14ff867c8696"
+    },
+    "linear-sprint": {
+      "source": "Finesssee/linear-cli",
+      "sourceType": "github",
+      "skillPath": "skills/linear-sprint/SKILL.md",
+      "computedHash": "da740e039cfc828cf5f35ea267050ec50815e6abbbedf0cb74bc97d10cd62a52"
+    },
+    "linear-statuses": {
+      "source": "Finesssee/linear-cli",
+      "sourceType": "github",
+      "skillPath": "skills/linear-statuses/SKILL.md",
+      "computedHash": "a3575de52abbf81ef8f21cb6ffd81799af3b515b6a5d797c3b79cdab7d0b6f67"
+    },
+    "linear-teams": {
+      "source": "Finesssee/linear-cli",
+      "sourceType": "github",
+      "skillPath": "skills/linear-teams/SKILL.md",
+      "computedHash": "a6208d9b8b670bb0764a80061f1d7570d7a002a5914d3f8cf693795db1a6c786"
+    },
+    "linear-templates": {
+      "source": "Finesssee/linear-cli",
+      "sourceType": "github",
+      "skillPath": "skills/linear-templates/SKILL.md",
+      "computedHash": "c8557269c2d02ca30121fa04db67c7adfc1dd05ce3f2a3cfc89c8027e64f32d0"
+    },
+    "linear-time": {
+      "source": "Finesssee/linear-cli",
+      "sourceType": "github",
+      "skillPath": "skills/linear-time/SKILL.md",
+      "computedHash": "d0600ec65ddbc967ecb059b025439e845956cb5641cc15bd3c7f92a79a5c58a7"
+    },
+    "linear-triage": {
+      "source": "Finesssee/linear-cli",
+      "sourceType": "github",
+      "skillPath": "skills/linear-triage/SKILL.md",
+      "computedHash": "9129e6d37cd88a3e04849951cc6a6c290282eaa2fec70d8b49eeefd33b23c720"
+    },
+    "linear-update": {
+      "source": "Finesssee/linear-cli",
+      "sourceType": "github",
+      "skillPath": "skills/linear-update/SKILL.md",
+      "computedHash": "59b8c5dd00bbd2d23c5b63dff6deb5b45d3d5c57281c98dc2b1abdd3e5ae419e"
+    },
+    "linear-uploads": {
+      "source": "Finesssee/linear-cli",
+      "sourceType": "github",
+      "skillPath": "skills/linear-uploads/SKILL.md",
+      "computedHash": "f6da3cffd26e0075d3f95b8e8bfa3396e4e5a256925b6f77253c33dfb08320a5"
+    },
+    "linear-views": {
+      "source": "Finesssee/linear-cli",
+      "sourceType": "github",
+      "skillPath": "skills/linear-views/SKILL.md",
+      "computedHash": "fd5b2eb57505a14c4e3df5ecfbf99806ec5531c3926d2439e3db746fb57eb99d"
+    },
+    "linear-watch": {
+      "source": "Finesssee/linear-cli",
+      "sourceType": "github",
+      "skillPath": "skills/linear-watch/SKILL.md",
+      "computedHash": "30c1f0d2ebcc23d4f23ccbf3a74ec86cf377d5214cd7a43af8f2884c64010b07"
+    },
+    "linear-webhooks": {
+      "source": "Finesssee/linear-cli",
+      "sourceType": "github",
+      "skillPath": "skills/linear-webhooks/SKILL.md",
+      "computedHash": "58c169639aed22c812c2f11f40695885f70313f2eea0340512336ffaf1903b43"
+    },
+    "linear-workflow": {
+      "source": "Finesssee/linear-cli",
+      "sourceType": "github",
+      "skillPath": "skills/linear-workflow/SKILL.md",
+      "computedHash": "b1041daf4ac44638a815ebe57f91297056e6a0ef0ba0fa45d875ec75d3d3daaf"
+    },
+    "setup-matt-pocock-skills": {
+      "source": "mattpocock/skills",
+      "sourceType": "github",
+      "skillPath": "skills/engineering/setup-matt-pocock-skills/SKILL.md",
+      "computedHash": "0164a8b1ef998abca426056c6ed8a7716a9d4692fc6daa5378f68381a6dafd24"
+    },
+    "tdd": {
+      "source": "mattpocock/skills",
+      "sourceType": "github",
+      "skillPath": "skills/engineering/tdd/SKILL.md",
+      "computedHash": "15a7b5e36383ebadb2dec5e586679e55e9663d292da418926b8da6fc0ef27d84"
+    },
+    "to-issues": {
+      "source": "mattpocock/skills",
+      "sourceType": "github",
+      "skillPath": "skills/engineering/to-issues/SKILL.md",
+      "computedHash": "47f648f3414848ccfc62cb41d2828b7e575fb5e7cbd6c4bdf630c063b5dc5e82"
+    },
+    "to-prd": {
+      "source": "mattpocock/skills",
+      "sourceType": "github",
+      "skillPath": "skills/engineering/to-prd/SKILL.md",
+      "computedHash": "a6d6d475f1d01c201937fa0c306e55b7056b02023ad615bc92f57514e831dd31"
+    },
+    "triage": {
+      "source": "mattpocock/skills",
+      "sourceType": "github",
+      "skillPath": "skills/engineering/triage/SKILL.md",
+      "computedHash": "2b6efb6da12d92551772fcc04acf331f4e0e6f7bd9d4cb23ce0b301e0b128feb"
+    }
+  }
+}

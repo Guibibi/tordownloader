@@ -1,0 +1,19 @@
+# Local config may contain the TorBox API key — keep it out of git.
+config.yaml
+
+# SQLite state
+/data/
+*.db
+*.db-wal
+*.db-shm
+
+# Build output
+/tordownloader
+/dist/
+
+# Local agent skill caches (restorable from skills-lock.json)
+/.claude/
+/.agents/
+
+# OS cruft
+.DS_Store

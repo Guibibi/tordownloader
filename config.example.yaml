@@ -1,0 +1,28 @@
+# tordownloader configuration.
+# All values shown are the built-in defaults; copy to config.yaml and override as needed.
+# Provide the TorBox API key via the TORBOX_API_KEY env var (keep it out of git).
+
+server:
+  listen_addr: "0.0.0.0:6500"      # bind address for the qBittorrent-emulation API
+
+torbox:
+  # api_key: ""                    # prefer the TORBOX_API_KEY env var instead of putting it here
+  base_url: "https://api.torbox.app"
+  max_active_slots: 3              # Essential plan = 3 concurrent download slots
+  cache_check: true                # check cached availability on add (fail-fast)
+  poll_interval: 10s               # how often to poll TorBox /mylist
+
+download:
+  root: "/downloads"               # shared with Sonarr/Radarr, mapped identically across containers
+  incomplete_subdir: ".incomplete" # partial downloads land here, then atomic-move into place
+  parallel_files: 4                # concurrent file downloads to disk
+
+database:
+  path: "data/tordownloader.db"    # SQLite state file
+
+failure:
+  timeout: 20m                     # ERROR if not present within this long after becoming TorBox-active
+
+log:
+  level: "info"                    # debug | info | warn | error
+  format: "text"                   # text | json

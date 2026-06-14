@@ -1,0 +1,130 @@
+// Command tordownloader emulates the qBittorrent WebUI API for Sonarr/Radarr,
+// proxies releases to TorBox, and downloads finished files to local disk.
+//
+// M0 scaffold: load config, set up logging, open/migrate the SQLite store, and
+// run until a shutdown signal. Pass --check to validate config + DB and exit.
+package main
+
+import (
+	"context"
+	"errors"
+	"flag"
+	"fmt"
+	"log/slog"
+	"net/http"
+	"os"
+	"os/signal"
+	"strings"
+	"syscall"
+	"time"
+
+	"github.com/guibibi/tordownloader/internal/config"
+	"github.com/guibibi/tordownloader/internal/engine"
+	"github.com/guibibi/tordownloader/internal/qbit"
+	"github.com/guibibi/tordownloader/internal/store"
+	"github.com/guibibi/tordownloader/internal/torbox"
+)
+
+// version is overridable at build time via -ldflags "-X main.version=...".
+var version = "dev"
+
+func main() {
+	if err := run(); err != nil {
+		slog.Error("fatal", "err", err)
+		os.Exit(1)
+	}
+}
+
+func run() error {
+	cfgPath := flag.String("config", "config.yaml", "path to config file")
+	checkOnly := flag.Bool("check", false, "validate config and migrate the database, then exit")
+	flag.Parse()
+
+	cfg, err := config.Load(*cfgPath)
+	if err != nil {
+		return fmt.Errorf("load config: %w", err)
+	}
+
+	slog.SetDefault(newLogger(cfg.Log))
+
+	slog.Info("starting tordownloader", "version", version, "listen", cfg.Server.ListenAddr)
+	if cfg.TorBox.APIKey == "" {
+		slog.Warn("TorBox API key not set; TorBox features will fail until provided (set TORBOX_API_KEY)")
+	}
+
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+
+	st, err := store.Open(ctx, cfg.Database.Path)
+	if err != nil {
+		return fmt.Errorf("open store: %w", err)
+	}
+	defer func() {
+		if cerr := st.Close(); cerr != nil {
+			slog.Error("closing store", "err", cerr)
+		}
+	}()
+	slog.Info("database ready", "path", cfg.Database.Path)
+
+	if *checkOnly {
+		slog.Info("check mode: configuration and database OK")
+		return nil
+	}
+
+	// TorBox client + engine submitter (slot-gated createtorrent).
+	tbClient := torbox.New(cfg.TorBox.APIKey, torbox.WithBaseURL(cfg.TorBox.BaseURL))
+	eng := engine.New(st, tbClient, cfg.TorBox.MaxActiveSlots, slog.Default())
+	go eng.Run(ctx)
+
+	srv := &http.Server{
+		Addr:    cfg.Server.ListenAddr,
+		Handler: qbit.New(st, cfg.Download.Root, slog.Default()).Routes(),
+	}
+
+	serveErr := make(chan error, 1)
+	go func() {
+		slog.Info("qBittorrent API listening", "addr", cfg.Server.ListenAddr)
+		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			serveErr <- err
+			return
+		}
+		serveErr <- nil
+	}()
+
+	slog.Info("startup complete; waiting for shutdown signal")
+	select {
+	case err := <-serveErr:
+		if err != nil {
+			return fmt.Errorf("http server: %w", err)
+		}
+	case <-ctx.Done():
+		slog.Info("shutdown signal received; stopping")
+	}
+
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if err := srv.Shutdown(shutdownCtx); err != nil {
+		slog.Error("http server shutdown", "err", err)
+	}
+	return nil
+}
+
+func newLogger(c config.LogConfig) *slog.Logger {
+	var level slog.Level
+	switch strings.ToLower(c.Level) {
+	case "debug":
+		level = slog.LevelDebug
+	case "warn":
+		level = slog.LevelWarn
+	case "error":
+		level = slog.LevelError
+	default:
+		level = slog.LevelInfo
+	}
+
+	opts := &slog.HandlerOptions{Level: level}
+	if strings.ToLower(c.Format) == "json" {
+		return slog.New(slog.NewJSONHandler(os.Stdout, opts))
+	}
+	return slog.New(slog.NewTextHandler(os.Stdout, opts))
+}
