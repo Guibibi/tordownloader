@@ -2,6 +2,8 @@
 
 Milestones are ordered so each one is independently testable. "DoD" = definition of done.
 
+**Status: M0–M8 all complete.** The project is feature-complete. Items below are backlog / future enhancements.
+
 ## M0 — Project scaffold
 - `go mod init`, package layout per ARCHITECTURE.md §2.
 - Config loader (YAML + env) with defaults; `config.example.yaml`.

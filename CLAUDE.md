@@ -19,7 +19,7 @@ headless, download-to-disk. Runs as one Docker container on the user's **Unraid*
   - mark it done: `linear-cli i update GUI-NN -s Done`
   - add a short summary comment with the commit hash + what shipped:
     `linear-cli cm create GUI-NN -b "Done (commit <sha>). <summary>"`
-- Status as of M5: GUI-22…GUI-27 (M0–M5) **Done**; GUI-28 (M6) is the next open milestone.
+- Status: GUI-22…GUI-30 (M0–M8) all **Done**. Project is feature-complete through M8.
 
 ## Locked decisions (don't re-litigate)
 - Torrents only (no Usenet — user's plan has none).

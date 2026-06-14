@@ -27,7 +27,7 @@ Prowlarr ──> Sonarr/Radarr ──(qBittorrent API)──> tordownloader ─�
 
 ## Status
 
-Pre-implementation. Requirements and design are documented; no code written yet.
+Feature-complete (M0–M8). The service builds, runs in Docker on Unraid, and is published to GitHub Container Registry. CI/CD via GitHub Actions.
 
 ## Docs
 
