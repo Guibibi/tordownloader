@@ -12,6 +12,7 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"sync"
 	"time"
 
 	"github.com/guibibi/tordownloader/internal/store"
@@ -23,44 +24,85 @@ import (
 // short cadence just lowers add-to-submit latency without risking the rate limit.
 const submitInterval = 2 * time.Second
 
-// Submitter is the slice of the TorBox client the engine needs. The concrete
+// Defaults applied when Config leaves a field unset.
+const (
+	defaultPollInterval = 10 * time.Second
+	defaultFailTimeout  = 20 * time.Minute
+)
+
+// TorBoxAPI is the slice of the TorBox client the engine needs: submitting
+// releases (submitter) and polling account state (reconciler). The concrete
 // *torbox.Client satisfies it; tests substitute a fake.
-type Submitter interface {
+type TorBoxAPI interface {
 	CreateTorrent(ctx context.Context, r torbox.CreateTorrentRequest) (*torbox.CreateTorrentResult, error)
+	MyList(ctx context.Context, bypassCache bool) ([]torbox.Torrent, error)
+}
+
+// Config tunes the engine's background workers.
+type Config struct {
+	MaxSlots     int           // TorBox concurrent-slot limit (default 1)
+	PollInterval time.Duration // reconciler cadence (default 10s)
+	FailTimeout  time.Duration // fail-fast window while TORBOX_ACTIVE (default 20m)
 }
 
 // Engine runs the background workers.
 type Engine struct {
-	store    *store.Store
-	torbox   Submitter
-	maxSlots int
-	log      *slog.Logger
+	store     *store.Store
+	torbox    TorBoxAPI
+	maxSlots  int
+	pollEvery time.Duration
+	failAfter time.Duration
+	log       *slog.Logger
 }
 
-// New builds an Engine. maxSlots is the TorBox concurrent-slot limit.
-func New(st *store.Store, tb Submitter, maxSlots int, log *slog.Logger) *Engine {
+// New builds an Engine from cfg, clamping unset/invalid fields to defaults.
+func New(st *store.Store, tb TorBoxAPI, cfg Config, log *slog.Logger) *Engine {
 	if log == nil {
 		log = slog.Default()
 	}
-	if maxSlots < 1 {
-		maxSlots = 1
+	if cfg.MaxSlots < 1 {
+		cfg.MaxSlots = 1
 	}
-	return &Engine{store: st, torbox: tb, maxSlots: maxSlots, log: log}
+	if cfg.PollInterval <= 0 {
+		cfg.PollInterval = defaultPollInterval
+	}
+	if cfg.FailTimeout <= 0 {
+		cfg.FailTimeout = defaultFailTimeout
+	}
+	return &Engine{
+		store:     st,
+		torbox:    tb,
+		maxSlots:  cfg.MaxSlots,
+		pollEvery: cfg.PollInterval,
+		failAfter: cfg.FailTimeout,
+		log:       log,
+	}
 }
 
-// Run drives the submitter until ctx is cancelled.
+// Run drives the submitter and reconciler until ctx is cancelled.
 func (e *Engine) Run(ctx context.Context) {
-	t := time.NewTicker(submitInterval)
+	e.log.Info("engine started",
+		"max_active_slots", e.maxSlots, "poll_interval", e.pollEvery, "fail_timeout", e.failAfter)
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() { defer wg.Done(); e.loop(ctx, "submit", submitInterval, e.submitPass) }()
+	go func() { defer wg.Done(); e.loop(ctx, "reconcile", e.pollEvery, e.reconcilePass) }()
+	wg.Wait()
+	e.log.Info("engine stopped")
+}
+
+// loop runs pass on a ticker until ctx is cancelled, logging non-cancellation
+// errors under name.
+func (e *Engine) loop(ctx context.Context, name string, every time.Duration, pass func(context.Context) error) {
+	t := time.NewTicker(every)
 	defer t.Stop()
-	e.log.Info("engine started", "max_active_slots", e.maxSlots)
 	for {
 		select {
 		case <-ctx.Done():
-			e.log.Info("engine stopped")
 			return
 		case <-t.C:
-			if err := e.submitPass(ctx); err != nil && ctx.Err() == nil {
-				e.log.Error("submit pass", "err", err)
+			if err := pass(ctx); err != nil && ctx.Err() == nil {
+				e.log.Error(name+" pass", "err", err)
 			}
 		}
 	}

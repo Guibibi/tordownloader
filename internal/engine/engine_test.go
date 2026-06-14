@@ -12,11 +12,12 @@ import (
 	"github.com/guibibi/tordownloader/internal/torbox"
 )
 
-// fakeTB is a scriptable Submitter.
+// fakeTB is a scriptable TorBoxAPI.
 type fakeTB struct {
 	mu    sync.Mutex
 	calls int
 	fn    func(req torbox.CreateTorrentRequest) (*torbox.CreateTorrentResult, error)
+	list  func() ([]torbox.Torrent, error)
 }
 
 func (f *fakeTB) CreateTorrent(_ context.Context, r torbox.CreateTorrentRequest) (*torbox.CreateTorrentResult, error) {
@@ -24,6 +25,15 @@ func (f *fakeTB) CreateTorrent(_ context.Context, r torbox.CreateTorrentRequest)
 	defer f.mu.Unlock()
 	f.calls++
 	return f.fn(r)
+}
+
+func (f *fakeTB) MyList(_ context.Context, _ bool) ([]torbox.Torrent, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.list == nil {
+		return nil, nil
+	}
+	return f.list()
 }
 
 func okResult(id int) (*torbox.CreateTorrentResult, error) {
@@ -74,7 +84,7 @@ func TestSubmitPassRespectsSlotLimit(t *testing.T) {
 		id++
 		return okResult(id)
 	}}
-	e := New(st, tb, 3, nil)
+	e := New(st, tb, Config{MaxSlots: 3}, nil)
 
 	if err := e.submitPass(context.Background()); err != nil {
 		t.Fatalf("submitPass: %v", err)
@@ -105,7 +115,7 @@ func TestSubmitPassCountsExistingActive(t *testing.T) {
 	tb := &fakeTB{fn: func(torbox.CreateTorrentRequest) (*torbox.CreateTorrentResult, error) {
 		return okResult(200)
 	}}
-	e := New(st, tb, 3, nil)
+	e := New(st, tb, Config{MaxSlots: 3}, nil)
 	if err := e.submitPass(context.Background()); err != nil {
 		t.Fatalf("submitPass: %v", err)
 	}
@@ -123,7 +133,7 @@ func TestSubmitTooLargeErrors(t *testing.T) {
 	tb := &fakeTB{fn: func(torbox.CreateTorrentRequest) (*torbox.CreateTorrentResult, error) {
 		return nil, &torbox.APIError{StatusCode: 400, Code: "DOWNLOAD_TOO_LARGE", Detail: "too big"}
 	}}
-	e := New(st, tb, 3, nil)
+	e := New(st, tb, Config{MaxSlots: 3}, nil)
 	if err := e.submitPass(context.Background()); err != nil {
 		t.Fatalf("submitPass: %v", err)
 	}
@@ -138,7 +148,7 @@ func TestSubmitRateLimitStaysQueued(t *testing.T) {
 	tb := &fakeTB{fn: func(torbox.CreateTorrentRequest) (*torbox.CreateTorrentResult, error) {
 		return nil, &torbox.APIError{StatusCode: 429, Detail: "slow down"}
 	}}
-	e := New(st, tb, 3, nil)
+	e := New(st, tb, Config{MaxSlots: 3}, nil)
 	if err := e.submitPass(context.Background()); err != nil {
 		t.Fatalf("submitPass: %v", err)
 	}
@@ -156,7 +166,7 @@ func TestSubmitTransientStaysQueued(t *testing.T) {
 	tb := &fakeTB{fn: func(torbox.CreateTorrentRequest) (*torbox.CreateTorrentResult, error) {
 		return nil, errors.New("connection refused")
 	}}
-	e := New(st, tb, 3, nil)
+	e := New(st, tb, Config{MaxSlots: 3}, nil)
 	if err := e.submitPass(context.Background()); err != nil {
 		t.Fatalf("submitPass: %v", err)
 	}
@@ -173,7 +183,7 @@ func TestSubmitPassesMagnet(t *testing.T) {
 		gotMagnet = r.Magnet
 		return okResult(1)
 	}}
-	e := New(st, tb, 3, nil)
+	e := New(st, tb, Config{MaxSlots: 3}, nil)
 	if err := e.submitPass(context.Background()); err != nil {
 		t.Fatalf("submitPass: %v", err)
 	}

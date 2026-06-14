@@ -73,7 +73,11 @@ func run() error {
 
 	// TorBox client + engine submitter (slot-gated createtorrent).
 	tbClient := torbox.New(cfg.TorBox.APIKey, torbox.WithBaseURL(cfg.TorBox.BaseURL))
-	eng := engine.New(st, tbClient, cfg.TorBox.MaxActiveSlots, slog.Default())
+	eng := engine.New(st, tbClient, engine.Config{
+		MaxSlots:     cfg.TorBox.MaxActiveSlots,
+		PollInterval: cfg.TorBox.PollInterval.Std(),
+		FailTimeout:  cfg.Failure.Timeout.Std(),
+	}, slog.Default())
 	go eng.Run(ctx)
 
 	srv := &http.Server{

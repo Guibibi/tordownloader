@@ -101,6 +101,98 @@ func (s *Store) MarkActive(ctx context.Context, id int64, torboxID int) error {
 	return nil
 }
 
+// TorBoxStatus carries the reconciler's view of a TORBOX_ACTIVE torrent's
+// TorBox-side state, applied by UpdateTorBoxStatus.
+type TorBoxStatus struct {
+	State    string  // TorBox download_state (e.g. downloading, cached)
+	Progress float64 // 0..1
+	DLSpeed  int64   // bytes/s
+	Size     int64   // 0 = leave the stored size unchanged
+	Name     string  // "" = leave the stored name unchanged
+}
+
+// UpdateTorBoxStatus refreshes the TorBox-side fields of a torrent while it is
+// fetching. It only touches rows still in TORBOX_ACTIVE, so a concurrent delete
+// or transition is never clobbered. Size and Name are only overwritten when set,
+// so a later, richer mylist reading can't blank out earlier data.
+func (s *Store) UpdateTorBoxStatus(ctx context.Context, id int64, st TorBoxStatus) error {
+	now := time.Now().Unix()
+	_, err := s.db.ExecContext(ctx, `
+		UPDATE torrents SET
+			torbox_state    = ?,
+			torbox_progress = ?,
+			dlspeed         = ?,
+			size            = CASE WHEN ? > 0  THEN ? ELSE size END,
+			name            = CASE WHEN ? <> '' THEN ? ELSE name END,
+			updated_at      = ?
+		WHERE id = ? AND state = ?`,
+		st.State, st.Progress, st.DLSpeed,
+		st.Size, st.Size,
+		st.Name, st.Name,
+		now, id, StateTorBoxActive)
+	if err != nil {
+		return fmt.Errorf("update torbox status %d: %w", id, err)
+	}
+	return nil
+}
+
+// FileInput is one file to record when a torrent's content becomes available on
+// TorBox (see MarkLocalQueued). RelPath is the full path within the torrent
+// (TorBox file `name`), which preserves folder structure on disk.
+type FileInput struct {
+	TorBoxFileID int
+	RelPath      string
+	ShortName    string
+	Size         int64
+}
+
+// MarkLocalQueued records that TorBox has the content and moves the torrent from
+// TORBOX_ACTIVE to LOCAL_QUEUED: it replaces the file rows, sets content_path,
+// marks torbox_progress complete, and refreshes size when known. The whole
+// transition is one transaction and is a no-op if the torrent already left
+// TORBOX_ACTIVE (e.g. deleted concurrently), so no orphan file rows are left.
+func (s *Store) MarkLocalQueued(ctx context.Context, id int64, contentPath string, size int64, files []FileInput) error {
+	now := time.Now().Unix()
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("mark local queued %d: begin: %w", id, err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	res, err := tx.ExecContext(ctx, `
+		UPDATE torrents SET
+			state           = ?,
+			torbox_progress = 1,
+			content_path    = ?,
+			size            = CASE WHEN ? > 0 THEN ? ELSE size END,
+			updated_at      = ?
+		WHERE id = ? AND state = ?`,
+		StateLocalQueued, contentPath, size, size, now, id, StateTorBoxActive)
+	if err != nil {
+		return fmt.Errorf("mark local queued %d: update torrent: %w", id, err)
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		// Torrent is no longer TORBOX_ACTIVE; leave it (and its files) untouched.
+		return nil
+	}
+
+	if _, err := tx.ExecContext(ctx, `DELETE FROM files WHERE torrent_id = ?`, id); err != nil {
+		return fmt.Errorf("mark local queued %d: clear files: %w", id, err)
+	}
+	for _, f := range files {
+		if _, err := tx.ExecContext(ctx, `
+			INSERT INTO files (torrent_id, torbox_file_id, rel_path, short_name, size)
+			VALUES (?,?,?,?,?)`,
+			id, f.TorBoxFileID, f.RelPath, f.ShortName, f.Size); err != nil {
+			return fmt.Errorf("mark local queued %d: insert file: %w", id, err)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("mark local queued %d: commit: %w", id, err)
+	}
+	return nil
+}
+
 // MarkError moves a torrent to ERROR with a human-readable reason.
 func (s *Store) MarkError(ctx context.Context, id int64, reason string) error {
 	now := time.Now().Unix()
