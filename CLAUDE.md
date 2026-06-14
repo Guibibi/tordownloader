@@ -13,6 +13,14 @@ headless, download-to-disk. Runs as one Docker container on the user's **Unraid*
 - `docs/API_REFERENCE.md` — qBit endpoints emulated + TorBox endpoints used + **state mapping**
 - `docs/ROADMAP.md` — milestones (M0–M8); start at the lowest incomplete one
 
+## Project tracking (Linear)
+- Milestones map 1:1 to Linear issues in team **GUI** (Guibibi): M0–M8 = **GUI-22 … GUI-30**.
+- When a milestone is finished, update Linear with `linear-cli`:
+  - mark it done: `linear-cli i update GUI-NN -s Done`
+  - add a short summary comment with the commit hash + what shipped:
+    `linear-cli cm create GUI-NN -b "Done (commit <sha>). <summary>"`
+- Status as of M5: GUI-22…GUI-27 (M0–M5) **Done**; GUI-28 (M6) is the next open milestone.
+
 ## Locked decisions (don't re-litigate)
 - Torrents only (no Usenet — user's plan has none).
 - Per-file downloads via `requestdl`, preserve folder structure (no zip/extract).
