@@ -117,11 +117,20 @@ func New(st *store.Store, tb TorBoxAPI, cfg Config, log *slog.Logger) *Engine {
 	}
 }
 
-// Run drives the submitter, reconciler, and downloader until ctx is cancelled.
+// Run executes a one-time startup reconciliation to recover state from a
+// previous crash, then drives the submitter, reconciler, and downloader until
+// ctx is cancelled.
 func (e *Engine) Run(ctx context.Context) {
 	e.log.Info("engine started",
 		"max_active_slots", e.maxSlots, "poll_interval", e.pollEvery, "fail_timeout", e.failAfter,
 		"parallel_files", e.parallel)
+
+	// Rebuild in-memory state from SQLite + TorBox: re-sync active torrents
+	// and recover any content already finalized on disk.
+	if err := e.startupReconcile(ctx); err != nil {
+		e.log.Error("startup reconciliation failed", "err", err)
+	}
+
 	var wg sync.WaitGroup
 	wg.Add(3)
 	go func() { defer wg.Done(); e.loop(ctx, "submit", submitInterval, e.submitPass) }()
