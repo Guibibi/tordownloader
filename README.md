@@ -40,3 +40,66 @@ Pre-implementation. Requirements and design are documented; no code written yet.
 
 Single Docker container on an Unraid host, alongside Sonarr/Radarr/Prowlarr, sharing the
 `/downloads` volume. Headless: configured via YAML/env, state in SQLite, observed via logs.
+
+## Running with Docker
+
+### Quick start (docker compose)
+
+```bash
+# Clone and start
+git clone https://github.com/guibibi/tordownloader.git
+cd tordownloader
+TORBOX_API_KEY=your-api-key docker compose up -d
+```
+
+Then add `http://your-host:6500` as a qBittorrent client in Sonarr/Radarr.
+
+### Build the image manually
+
+```bash
+docker build -t tordownloader .
+```
+
+### Run the container
+
+```bash
+docker run -d \
+  --name tordownloader \
+  -e TORBOX_API_KEY=your-api-key \
+  -e PUID=99 \
+  -e PGID=100 \
+  -v /path/to/data:/data \
+  -v /mnt/user/downloads:/downloads \
+  -p 6500:6500 \
+  --restart unless-stopped \
+  tordownloader
+```
+
+### Unraid setup
+
+1. **Volumes**: map `/mnt/user/downloads` → `/downloads` (use the same path your Sonarr/Radarr containers see) and a persistent appdata path → `/data`.
+2. **Environment**: set `TORBOX_API_KEY` to your TorBox API key. Set `PUID` and `PGID` to match your Unraid user (typically 99/100).
+3. **Port**: map 6500 (or a custom host port) to 6500.
+4. **In Sonarr/Radarr**: add a qBittorrent download client at `http://<unraid-ip>:6500`.
+
+### Configuration
+
+All settings have defaults suitable for most setups (see [config.example.yaml](config.example.yaml)).
+Override them via environment variables or mount a `config.yaml`:
+
+| Env var | Default | Description |
+|---|---|---|
+| `TORBOX_API_KEY` | *(required)* | TorBox API key |
+| `PUID` | `99` | User ID for downloaded file ownership |
+| `PGID` | `100` | Group ID for downloaded file ownership |
+| `TD_LISTEN_ADDR` | `0.0.0.0:6500` | qBittorrent API listen address |
+| `TD_DOWNLOAD_ROOT` | `/downloads` | Downloads save path |
+| `TD_DB_PATH` | `/data/tordownloader.db` | SQLite database path |
+| `TD_LOG_LEVEL` | `info` | `debug` \| `info` \| `warn` \| `error` |
+| `TD_LOG_FORMAT` | `text` | `text` \| `json` |
+
+Build the image at a specific version tag:
+
+```bash
+docker build --build-arg VERSION=v1.0.0 -t tordownloader:v1.0.0 .
+```

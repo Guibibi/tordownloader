@@ -1,0 +1,33 @@
+# Build & CI artifacts
+/tordownloader
+/dist/
+/data/
+
+# Git & editor
+.git/
+.gitignore
+.gitattributes
+.idea/
+.vscode/
+.DS_Store
+
+# Docs (not needed at runtime)
+/docs/
+
+# Agent skills
+.claude/
+.agents/
+
+# Config leaks
+config.yaml
+
+# Test & coverage artifacts
+*.test
+*.out
+*.prof
+coverage.*
+
+# Docker
+Dockerfile
+.dockerignore
+docker-compose.yml

@@ -1,0 +1,55 @@
+# ── tordownloader ────────────────────────────────────────────────────────
+# Example Docker Compose stack. Drop this next to your Sonarr/Radarr compose
+# and they'll share /downloads. Adjust paths and PUID/PGID to match your host.
+#
+# Quick start:
+#   TORBOX_API_KEY=your-key docker compose up -d
+#   # Then add http://tordownloader:6500 as a qBittorrent client in Sonarr/Radarr.
+
+services:
+  tordownloader:
+    # Build from the repo root, or use a published image.
+    build:
+      context: .
+    # image: ghcr.io/guibibi/tordownloader:latest
+    container_name: tordownloader
+    restart: unless-stopped
+
+    environment:
+      # Required — your TorBox API key (Essential plan recommended).
+      - TORBOX_API_KEY=${TORBOX_API_KEY:?TORBOX_API_KEY must be set}
+
+      # File ownership (Unraid convention; defaults shown).
+      - PUID=99
+      - PGID=100
+
+      # Optional overrides (defaults are fine for most setups).
+      # - TD_LISTEN_ADDR=0.0.0.0:6500
+      # - TD_DOWNLOAD_ROOT=/downloads
+      # - TD_DB_PATH=/data/tordownloader.db
+      # - TD_LOG_LEVEL=info
+      # - TD_LOG_FORMAT=text
+
+    volumes:
+      # Persistent state (SQLite DB). Host path; keep it safe.
+      - ./data:/data
+
+      # Shared downloads — must be the same path that Sonarr/Radarr see.
+      # On Unraid this is usually /mnt/user/downloads.
+      - /mnt/user/downloads:/downloads
+
+      # Optional: mount a custom config.yaml to override defaults.
+      # - ./config.yaml:/config.yaml
+
+    # Override CMD if using a custom config file path.
+    # command: tordownloader --config /config.yaml
+
+    ports:
+      - "6500:6500"
+
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- --timeout=2 http://localhost:6500/api/v2/app/version"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
