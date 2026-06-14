@@ -185,8 +185,9 @@ categories(
 | Stalled while active (no progress for `stall_timeout`, default 10m) | → ERROR (Sonarr blacklists, re-grabs). Slow-but-moving fetches are not failed. Any failure of a submitted torrent also best-effort deletes it from TorBox so failed grabs don't pile up. |
 | Exceeds optional absolute `timeout` cap (disabled by default) | → ERROR. |
 | TorBox rejects >200GB | → ERROR immediately. |
-| `createtorrent` rate-limited (429) | Back off, stay QUEUED, retry. |
+| `createtorrent` rate-limited (429) | Pause submissions for a cooldown (hourly quota), stay QUEUED. |
+| TorBox queues the submission (queued id) | Mark torbox_state=`queued`; reconciler waits for it to activate (re-matched by infohash, new id adopted) instead of failing it. |
 | `requestdl` link expired mid-download | Re-request and resume. |
 | Container restart | Reconcile from SQLite + `mylist`; resume partial files via Range. |
-| Torrent vanished on TorBox | → ERROR. |
+| Torrent vanished on TorBox | → ERROR, but only after a grace window and a direct id lookup confirms it's really gone (so a lagging/paged mylist doesn't kill a live torrent). |
 | Sonarr deletes mid-download | Cancel, TorBox delete, remove local files. |

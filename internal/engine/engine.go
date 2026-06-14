@@ -39,6 +39,11 @@ const (
 	defaultIncompleteSubdir = ".incomplete"
 )
 
+// createRateLimitCooldown is how long to pause createtorrent submissions after a
+// 429. TorBox's createtorrent quota is hourly, so a short retry loop just spams a
+// quota that won't recover for a while; this backs off without stalling forever.
+const createRateLimitCooldown = 2 * time.Minute
+
 // TorBoxAPI is the slice of the TorBox client the engine needs: submitting
 // releases (submitter), polling account state (reconciler), requesting CDN
 // links (downloader), and deleting torrents (cleanup). The concrete
@@ -46,6 +51,7 @@ const (
 type TorBoxAPI interface {
 	CreateTorrent(ctx context.Context, r torbox.CreateTorrentRequest) (*torbox.CreateTorrentResult, error)
 	MyList(ctx context.Context, bypassCache bool) ([]torbox.Torrent, error)
+	GetTorrent(ctx context.Context, id int, bypassCache bool) (*torbox.Torrent, error)
 	RequestDL(ctx context.Context, p torbox.RequestDLParams) (string, error)
 	ControlTorrent(ctx context.Context, torrentID int, op torbox.Operation) error
 	CheckCached(ctx context.Context, hashes []string, listFiles bool) (map[string]torbox.CachedInfo, error)
@@ -91,6 +97,11 @@ type Engine struct {
 	// "all slots busy, work waiting" episode, so the message isn't repeated every
 	// submit pass. Touched only by the single submit goroutine; no lock needed.
 	slotWaitLogged bool
+
+	// createCooldownUntil pauses createtorrent submissions after TorBox returns a
+	// 429: the createtorrent quota is hourly, so retrying every pass is pointless.
+	// Touched only by the single submit goroutine; no lock needed.
+	createCooldownUntil time.Time
 }
 
 // New builds an Engine from cfg, clamping unset/invalid fields to defaults.
@@ -178,6 +189,10 @@ func (e *Engine) loop(ctx context.Context, name string, every time.Duration, pas
 
 // submitPass submits as many QUEUED torrents as there are free TorBox slots.
 func (e *Engine) submitPass(ctx context.Context) error {
+	if rem := time.Until(e.createCooldownUntil); rem > 0 {
+		// In createtorrent rate-limit cooldown; skip quietly until it elapses.
+		return nil
+	}
 	active, err := e.store.CountByState(ctx, store.StateTorBoxActive)
 	if err != nil {
 		return err
@@ -204,6 +219,10 @@ func (e *Engine) submitPass(ctx context.Context) error {
 	}
 	for _, t := range queued {
 		if free <= 0 {
+			break
+		}
+		if time.Now().Before(e.createCooldownUntil) {
+			// A 429 earlier in this pass triggered the cooldown; stop submitting.
 			break
 		}
 		if ctx.Err() != nil {
@@ -253,9 +272,12 @@ func (e *Engine) submit(ctx context.Context, t store.Torrent) bool {
 		var apiErr *torbox.APIError
 		if errors.As(err, &apiErr) {
 			if apiErr.StatusCode == 429 {
-				// Rate limited even after the client's own backoff: keep it
-				// QUEUED and try again next pass.
-				e.log.Warn("createtorrent rate limited; staying queued", "infohash", t.Infohash)
+				// Rate limited even after the client's own backoff. The createtorrent
+				// quota is hourly, so pause submissions for a cooldown instead of
+				// hammering it every pass. Stays QUEUED.
+				e.createCooldownUntil = time.Now().Add(createRateLimitCooldown)
+				e.log.Warn("createtorrent rate limited; pausing submissions",
+					"infohash", t.Infohash, "cooldown", createRateLimitCooldown)
 				return false
 			}
 			// Any other TorBox rejection (too large, bad magnet, ...) is terminal.
@@ -267,6 +289,9 @@ func (e *Engine) submit(ctx context.Context, t store.Torrent) bool {
 		return false
 	}
 
+	// A successful create means the quota has room again; clear any cooldown.
+	e.createCooldownUntil = time.Time{}
+
 	id := torboxID(res)
 	if id == 0 {
 		e.fail(ctx, t, "createtorrent returned no torrent id")
@@ -275,6 +300,20 @@ func (e *Engine) submit(ctx context.Context, t store.Torrent) bool {
 	if err := e.store.MarkActive(ctx, t.ID, id); err != nil {
 		e.log.Error("mark active", "infohash", t.Infohash, "err", err)
 		return false
+	}
+	// TorBox may queue the submission (returns a queued id, no torrent id) when the
+	// account's active-download slots are full. Such a torrent isn't in mylist yet;
+	// mark it queued so the reconciler waits for it to activate (matched by hash)
+	// instead of treating its absence as "vanished".
+	if res.TorrentID == nil && res.QueuedID != nil {
+		if err := e.store.UpdateTorBoxStatus(ctx, t.ID, store.TorBoxStatus{
+			State: torboxQueued, Advancing: true,
+		}); err != nil {
+			e.log.Error("mark torbox-queued", "infohash", t.Infohash, "err", err)
+		}
+		e.log.Info("queued on TorBox; waiting for an active slot",
+			"infohash", t.Infohash, "queued_id", id, "name", t.Name)
+		return true
 	}
 	e.log.Info("submitted to TorBox", "infohash", t.Infohash, "torbox_id", id, "name", t.Name)
 	return true

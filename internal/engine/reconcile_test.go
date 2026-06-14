@@ -210,7 +210,7 @@ func TestReconcileStallFail(t *testing.T) {
 
 	tb := &fakeTB{list: func() ([]torbox.Torrent, error) {
 		return []torbox.Torrent{{
-			ID: 21, DownloadState: "stalled", Seeds: 0, Peers: 0,
+			ID: 21, DownloadState: "stalled", Active: true, Seeds: 0, Peers: 0,
 			Progress: 0, DownloadSpeed: 0, Cached: false, DownloadPresent: false,
 		}}, nil
 	}}
@@ -233,7 +233,7 @@ func TestReconcileStallFailDeletesFromTorBox(t *testing.T) {
 	calls := 0
 	tb := &fakeTB{
 		list: func() ([]torbox.Torrent, error) {
-			return []torbox.Torrent{{ID: 31, DownloadState: "stalled", Seeds: 0, Progress: 0, DownloadSpeed: 0}}, nil
+			return []torbox.Torrent{{ID: 31, DownloadState: "stalled", Active: true, Seeds: 0, Progress: 0, DownloadSpeed: 0}}, nil
 		},
 		ctl: func(id int, op torbox.Operation) error {
 			calls++
@@ -262,7 +262,7 @@ func TestReconcileStallFailEvenWithSeeds(t *testing.T) {
 
 	tb := &fakeTB{list: func() ([]torbox.Torrent, error) {
 		return []torbox.Torrent{{
-			ID: 22, DownloadState: "stalled", Seeds: 1, Progress: 0, DownloadSpeed: 0,
+			ID: 22, DownloadState: "stalled", Active: true, Seeds: 1, Progress: 0, DownloadSpeed: 0,
 		}}, nil
 	}}
 	e := New(st, tb, Config{MaxSlots: 3, StallTimeout: 5 * time.Minute}, nil)
@@ -327,7 +327,7 @@ func TestReconcileStallDisabled(t *testing.T) {
 	seedActive(t, st, hash, 23, "/downloads/tv", 6*time.Minute)
 
 	tb := &fakeTB{list: func() ([]torbox.Torrent, error) {
-		return []torbox.Torrent{{ID: 23, DownloadState: "stalled", Seeds: 0}}, nil
+		return []torbox.Torrent{{ID: 23, DownloadState: "stalled", Active: true, Seeds: 0}}, nil
 	}}
 	e := New(st, tb, Config{MaxSlots: 3, FailTimeout: 0, StallTimeout: -1}, nil)
 	if err := e.reconcilePass(context.Background()); err != nil {
@@ -341,7 +341,9 @@ func TestReconcileStallDisabled(t *testing.T) {
 func TestReconcileVanishedErrors(t *testing.T) {
 	st := newStore(t)
 	hash := "ffffffffffffffffffffffffffffffffffffffff"
-	seedActive(t, st, hash, 99, "/downloads/tv", time.Minute)
+	// Past the vanish grace, absent from mylist, and a direct lookup (default fake:
+	// nil) confirms it's gone → fail.
+	seedActive(t, st, hash, 99, "/downloads/tv", 3*time.Minute)
 
 	tb := &fakeTB{list: func() ([]torbox.Torrent, error) {
 		return []torbox.Torrent{}, nil // not on the account anymore
@@ -352,6 +354,93 @@ func TestReconcileVanishedErrors(t *testing.T) {
 	}
 	if tr := getTorrent(t, st, hash); tr.State != store.StateError {
 		t.Errorf("state = %q, want ERROR (vanished)", tr.State)
+	}
+}
+
+func TestReconcileConfirmAvoidsVanish(t *testing.T) {
+	st := newStore(t)
+	hash := "abababababababababababababababababababab"
+	// Absent from mylist and past grace, but a direct lookup still finds it (mylist
+	// was just lagging/paging) → must not be failed.
+	seedActive(t, st, hash, 42, "/downloads/tv", 3*time.Minute)
+
+	tb := &fakeTB{
+		list: func() ([]torbox.Torrent, error) { return []torbox.Torrent{}, nil },
+		get:  func(id int) (*torbox.Torrent, error) { return &torbox.Torrent{ID: id}, nil },
+	}
+	e := New(st, tb, Config{MaxSlots: 3}, nil)
+	if err := e.reconcilePass(context.Background()); err != nil {
+		t.Fatalf("reconcilePass: %v", err)
+	}
+	if tr := getTorrent(t, st, hash); tr.State != store.StateTorBoxActive {
+		t.Errorf("state = %q, want still TORBOX_ACTIVE (confirm found it)", tr.State)
+	}
+}
+
+func TestReconcileAdoptsChangedID(t *testing.T) {
+	st := newStore(t)
+	hash := "cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd"
+	seedActive(t, st, hash, 500, "/downloads/tv", time.Minute)
+
+	// mylist returns the torrent under a new id but the same hash (promoted from
+	// the queue): we should adopt the new id and keep going.
+	tb := &fakeTB{list: func() ([]torbox.Torrent, error) {
+		return []torbox.Torrent{{ID: 777, Hash: hash, Active: true, DownloadState: "downloading", Progress: 0.2}}, nil
+	}}
+	e := New(st, tb, Config{MaxSlots: 3}, nil)
+	if err := e.reconcilePass(context.Background()); err != nil {
+		t.Fatalf("reconcilePass: %v", err)
+	}
+	tr := getTorrent(t, st, hash)
+	if tr.State != store.StateTorBoxActive {
+		t.Fatalf("state = %q, want still TORBOX_ACTIVE", tr.State)
+	}
+	if !tr.TorBoxID.Valid || tr.TorBoxID.Int64 != 777 {
+		t.Errorf("torbox_id = %v, want 777 (adopted)", tr.TorBoxID)
+	}
+}
+
+func TestReconcileQueuedNotStalled(t *testing.T) {
+	st := newStore(t)
+	hash := "dededededededededededededededededededede"
+	// Sitting in TorBox's queue (Active=false, no progress) well past the stall
+	// window — must not be failed; it hasn't started yet.
+	seedActive(t, st, hash, 88, "/downloads/tv", 30*time.Minute)
+
+	tb := &fakeTB{list: func() ([]torbox.Torrent, error) {
+		return []torbox.Torrent{{ID: 88, Hash: hash, Active: false, Progress: 0, DownloadSpeed: 0}}, nil
+	}}
+	e := New(st, tb, Config{MaxSlots: 3, StallTimeout: 5 * time.Minute}, nil)
+	if err := e.reconcilePass(context.Background()); err != nil {
+		t.Fatalf("reconcilePass: %v", err)
+	}
+	tr := getTorrent(t, st, hash)
+	if tr.State != store.StateTorBoxActive {
+		t.Fatalf("state = %q, want still TORBOX_ACTIVE (queued)", tr.State)
+	}
+	if tr.TorBoxState != "queued" {
+		t.Errorf("torbox_state = %q, want queued", tr.TorBoxState)
+	}
+}
+
+func TestReconcileQueuedAbsentNotVanished(t *testing.T) {
+	st := newStore(t)
+	hash := "efefefefefefefefefefefefefefefefefefefef"
+	// Marked queued at submit and not yet in mylist, past the vanish grace: a
+	// queued torrent must not be declared vanished while waiting to activate.
+	tr := seedActive(t, st, hash, 91, "/downloads/tv", 5*time.Minute)
+	if _, err := st.DB().ExecContext(context.Background(),
+		`UPDATE torrents SET torbox_state = 'queued' WHERE id = ?`, tr.ID); err != nil {
+		t.Fatalf("mark queued: %v", err)
+	}
+
+	tb := &fakeTB{list: func() ([]torbox.Torrent, error) { return []torbox.Torrent{}, nil }}
+	e := New(st, tb, Config{MaxSlots: 3}, nil)
+	if err := e.reconcilePass(context.Background()); err != nil {
+		t.Fatalf("reconcilePass: %v", err)
+	}
+	if tr := getTorrent(t, st, hash); tr.State != store.StateTorBoxActive {
+		t.Errorf("state = %q, want still TORBOX_ACTIVE (queued, not vanished)", tr.State)
 	}
 }
 

@@ -49,6 +49,12 @@ headless, download-to-disk. Runs as one Docker container on the user's **Unraid*
   the stall clock (tracked via `torrents.progress_at`). `failure.timeout` is an optional
   absolute cap from active_since, disabled by default. Both clocks run only while
   TORBOX_ACTIVE, not while waiting in our own queue.
+- TorBox may **queue** a `createtorrent` (returns a queued id, not a torrent id) when the
+  account's active slots are full — common when bulk-adding past the **60/hour** createtorrent
+  cap. Such a torrent isn't in `mylist` until it activates (under a *new* id). The reconciler
+  marks it `torbox_state=queued`, matches it back by infohash when it activates, and never
+  treats queued/absent as "vanished". Absence is only failed after a grace window **and** a
+  direct id lookup confirms it. On 429 the submitter pauses for a cooldown (hourly quota).
 - Download into an incomplete dir, then atomic move, so Sonarr never imports partial files.
 - Some TorBox JSON field names in API_REFERENCE.md come from secondary sources — **verify
   against the live API in M1** before depending on them.

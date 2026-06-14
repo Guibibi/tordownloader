@@ -102,6 +102,21 @@ func (s *Store) MarkActive(ctx context.Context, id int64, torboxID int) error {
 	return nil
 }
 
+// UpdateTorBoxID changes the operational TorBox id for a torrent without
+// touching its state or clocks. Used when a torrent is re-matched by infohash
+// under a new id (e.g. promoted from TorBox's queue). Only touches TORBOX_ACTIVE
+// rows so a concurrent transition isn't clobbered.
+func (s *Store) UpdateTorBoxID(ctx context.Context, id int64, torboxID int) error {
+	now := time.Now().Unix()
+	_, err := s.db.ExecContext(ctx, `
+		UPDATE torrents SET torbox_id = ?, updated_at = ? WHERE id = ? AND state = ?`,
+		torboxID, now, id, StateTorBoxActive)
+	if err != nil {
+		return fmt.Errorf("update torbox id %d: %w", id, err)
+	}
+	return nil
+}
+
 // TorBoxStatus carries the reconciler's view of a TORBOX_ACTIVE torrent's
 // TorBox-side state, applied by UpdateTorBoxStatus.
 type TorBoxStatus struct {

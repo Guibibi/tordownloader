@@ -117,10 +117,14 @@ func uiStateLabel(t store.Torrent) string {
 	case store.StateQueued:
 		return "Queued for TorBox slot"
 	case store.StateTorBoxActive:
-		if t.TorBoxProgress > 0 {
+		switch {
+		case t.TorBoxState == "queued":
+			return "Queued on TorBox"
+		case t.TorBoxProgress > 0:
 			return "TorBox caching"
+		default:
+			return "Waiting on TorBox"
 		}
-		return "Waiting on TorBox"
 	case store.StateLocalQueued:
 		return "Ready, waiting to download"
 	case store.StateLocalDload:

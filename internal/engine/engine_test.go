@@ -20,6 +20,7 @@ type fakeTB struct {
 	calls int
 	fn    func(req torbox.CreateTorrentRequest) (*torbox.CreateTorrentResult, error)
 	list  func() ([]torbox.Torrent, error)
+	get   func(id int) (*torbox.Torrent, error)
 	dl    func(p torbox.RequestDLParams) (string, error)
 	ctl   func(torrentID int, op torbox.Operation) error
 	cache func(hashes []string) (map[string]torbox.CachedInfo, error)
@@ -39,6 +40,15 @@ func (f *fakeTB) MyList(_ context.Context, _ bool) ([]torbox.Torrent, error) {
 		return nil, nil
 	}
 	return f.list()
+}
+
+func (f *fakeTB) GetTorrent(_ context.Context, id int, _ bool) (*torbox.Torrent, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.get == nil {
+		return nil, nil
+	}
+	return f.get(id)
 }
 
 func (f *fakeTB) RequestDL(_ context.Context, p torbox.RequestDLParams) (string, error) {
@@ -280,6 +290,62 @@ func TestSubmitRateLimitStaysQueued(t *testing.T) {
 	}
 	if got := countState(t, st, store.StateError); got != 0 {
 		t.Errorf("error = %d, want 0", got)
+	}
+}
+
+func TestSubmitRateLimitCooldown(t *testing.T) {
+	st := newStore(t)
+	seedQueued(t, st, 2)
+	tb := &fakeTB{fn: func(torbox.CreateTorrentRequest) (*torbox.CreateTorrentResult, error) {
+		return nil, &torbox.APIError{StatusCode: 429, Detail: "slow down"}
+	}}
+	e := New(st, tb, Config{MaxSlots: 3}, nil)
+
+	// First pass hits 429 on the first torrent and enters cooldown; it must not try
+	// the second torrent in the same pass.
+	if err := e.submitPass(context.Background()); err != nil {
+		t.Fatalf("submitPass: %v", err)
+	}
+	if tb.calls != 1 {
+		t.Fatalf("calls after first pass = %d, want 1 (cooldown stops further tries)", tb.calls)
+	}
+	// A subsequent pass during cooldown makes no createtorrent calls at all.
+	if err := e.submitPass(context.Background()); err != nil {
+		t.Fatalf("submitPass: %v", err)
+	}
+	if tb.calls != 1 {
+		t.Errorf("calls after second pass = %d, want still 1 (in cooldown)", tb.calls)
+	}
+	if got := countState(t, st, store.StateQueued); got != 2 {
+		t.Errorf("queued = %d, want 2 (both stay queued)", got)
+	}
+}
+
+func TestSubmitQueuedResultMarksQueued(t *testing.T) {
+	st := newStore(t)
+	seedQueued(t, st, 1)
+	qid := 555
+	tb := &fakeTB{fn: func(torbox.CreateTorrentRequest) (*torbox.CreateTorrentResult, error) {
+		// TorBox queued it: queued_id only, no torrent_id.
+		return &torbox.CreateTorrentResult{QueuedID: &qid}, nil
+	}}
+	e := New(st, tb, Config{MaxSlots: 3}, nil)
+	if err := e.submitPass(context.Background()); err != nil {
+		t.Fatalf("submitPass: %v", err)
+	}
+	active, err := st.ListByState(context.Background(), store.StateTorBoxActive)
+	if err != nil || len(active) != 1 {
+		t.Fatalf("list active: err=%v n=%d", err, len(active))
+	}
+	tr := active[0]
+	if tr.State != store.StateTorBoxActive {
+		t.Errorf("state = %q, want TORBOX_ACTIVE", tr.State)
+	}
+	if tr.TorBoxState != "queued" {
+		t.Errorf("torbox_state = %q, want queued", tr.TorBoxState)
+	}
+	if !tr.TorBoxID.Valid || tr.TorBoxID.Int64 != int64(qid) {
+		t.Errorf("torbox_id = %v, want %d", tr.TorBoxID, qid)
 	}
 }
 
