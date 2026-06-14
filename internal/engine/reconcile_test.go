@@ -223,6 +223,36 @@ func TestReconcileStallFail(t *testing.T) {
 	}
 }
 
+func TestReconcileStallFailDeletesFromTorBox(t *testing.T) {
+	st := newStore(t)
+	hash := "8888888888888888888888888888888888888888"
+	seedActive(t, st, hash, 31, "/downloads/tv", 6*time.Minute)
+
+	var gotID int
+	var gotOp torbox.Operation
+	calls := 0
+	tb := &fakeTB{
+		list: func() ([]torbox.Torrent, error) {
+			return []torbox.Torrent{{ID: 31, DownloadState: "stalled", Seeds: 0, Progress: 0, DownloadSpeed: 0}}, nil
+		},
+		ctl: func(id int, op torbox.Operation) error {
+			calls++
+			gotID, gotOp = id, op
+			return nil
+		},
+	}
+	e := New(st, tb, Config{MaxSlots: 3, StallTimeout: 5 * time.Minute}, nil)
+	if err := e.reconcilePass(context.Background()); err != nil {
+		t.Fatalf("reconcilePass: %v", err)
+	}
+	if tr := getTorrent(t, st, hash); tr.State != store.StateError {
+		t.Fatalf("state = %q, want ERROR", tr.State)
+	}
+	if calls != 1 || gotID != 31 || gotOp != torbox.OpDelete {
+		t.Errorf("ControlTorrent calls=%d id=%d op=%q, want 1 delete on id 31", calls, gotID, gotOp)
+	}
+}
+
 func TestReconcileStallFailEvenWithSeeds(t *testing.T) {
 	st := newStore(t)
 	hash := "4444444444444444444444444444444444444444"

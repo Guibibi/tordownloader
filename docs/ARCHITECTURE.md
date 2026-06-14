@@ -182,7 +182,7 @@ categories(
 
 | Situation | Behavior |
 |---|---|
-| Stalled while active (no progress for `stall_timeout`, default 10m) | → ERROR (Sonarr blacklists, re-grabs). Slow-but-moving fetches are not failed. |
+| Stalled while active (no progress for `stall_timeout`, default 10m) | → ERROR (Sonarr blacklists, re-grabs). Slow-but-moving fetches are not failed. Any failure of a submitted torrent also best-effort deletes it from TorBox so failed grabs don't pile up. |
 | Exceeds optional absolute `timeout` cap (disabled by default) | → ERROR. |
 | TorBox rejects >200GB | → ERROR immediately. |
 | `createtorrent` rate-limited (429) | Back off, stay QUEUED, retry. |

@@ -301,6 +301,21 @@ func (e *Engine) logCacheStatus(ctx context.Context, infohash string) {
 // fail moves a torrent to ERROR, logging if the store update itself fails.
 func (e *Engine) fail(ctx context.Context, t store.Torrent, reason string) {
 	e.log.Warn("torrent failed", "infohash", t.Infohash, "reason", reason)
+
+	// Best-effort: remove the abandoned torrent from TorBox so failed grabs don't
+	// pile up in the library. Only when we actually created it (have a TorBox id);
+	// a pre-submit failure never created anything, and a vanished torrent is
+	// already gone (the delete just no-ops). Bounded and detached from the pass
+	// context so the cleanup still runs if the engine is shutting down.
+	if t.TorBoxID.Valid {
+		delCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
+		if err := e.torbox.ControlTorrent(delCtx, int(t.TorBoxID.Int64), torbox.OpDelete); err != nil {
+			e.log.Warn("TorBox delete after failure (continuing)",
+				"infohash", t.Infohash, "torbox_id", t.TorBoxID.Int64, "err", err)
+		}
+		cancel()
+	}
+
 	if err := e.store.MarkError(ctx, t.ID, reason); err != nil {
 		e.log.Error("mark error", "infohash", t.Infohash, "err", err)
 	}
