@@ -310,6 +310,15 @@ func (e *Engine) DeleteTorrent(ctx context.Context, infohash string, deleteFiles
 	}
 	e.mu.Unlock()
 
+	// Detach the cleanup from the caller's request context. Once Sonarr asks to
+	// delete, the TorBox removal, local file cleanup, and DB drop must all run to
+	// completion even if the HTTP request is cancelled mid-flight — otherwise we
+	// could remove the files (os.RemoveAll ignores ctx) but leave the row, which
+	// would still show in torrents/info. Bound it so a hung TorBox call can't
+	// block forever.
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
+	defer cancel()
+
 	// 2. Fetch the row to know the TorBox id and local paths.
 	t, ok, err := e.store.GetTorrent(ctx, infohash)
 	if err != nil {
