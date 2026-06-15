@@ -102,6 +102,23 @@ func (s *Store) MarkActive(ctx context.Context, id int64, torboxID int) error {
 	return nil
 }
 
+// SetTorBoxCached records whether TorBox already had the content when we
+// submitted it (an instant cache hit vs a server-side fetch). It is a
+// submit-time fact, written once; the per-pass status update never touches it.
+func (s *Store) SetTorBoxCached(ctx context.Context, id int64, cached bool) error {
+	v := 0
+	if cached {
+		v = 1
+	}
+	_, err := s.db.ExecContext(ctx, `
+		UPDATE torrents SET cached = ?, updated_at = ? WHERE id = ?`,
+		v, time.Now().Unix(), id)
+	if err != nil {
+		return fmt.Errorf("set cached %d: %w", id, err)
+	}
+	return nil
+}
+
 // UpdateTorBoxID changes the operational TorBox id for a torrent without
 // touching its state or clocks. Used when a torrent is re-matched by infohash
 // under a new id (e.g. promoted from TorBox's queue). Only touches TORBOX_ACTIVE
@@ -123,6 +140,9 @@ type TorBoxStatus struct {
 	State     string  // TorBox download_state (e.g. downloading, cached)
 	Progress  float64 // 0..1
 	DLSpeed   int64   // bytes/s
+	Seeds     int     // TorBox-reported seeders
+	Peers     int     // TorBox-reported leechers
+	ETA       int64   // TorBox-side seconds remaining (-1/0 = unknown)
 	Size      int64   // 0 = leave the stored size unchanged
 	Name      string  // "" = leave the stored name unchanged
 	Advancing bool    // true when the torrent made headway this tick; bumps the stall clock
@@ -145,12 +165,16 @@ func (s *Store) UpdateTorBoxStatus(ctx context.Context, id int64, st TorBoxStatu
 			torbox_state    = ?,
 			torbox_progress = ?,
 			dlspeed         = ?,
+			seeds           = ?,
+			peers           = ?,
+			eta             = ?,
 			size            = CASE WHEN ? > 0  THEN ? ELSE size END,
 			name            = CASE WHEN ? <> '' THEN ? ELSE name END,
 			progress_at     = CASE WHEN ? = 1 THEN ? ELSE progress_at END,
 			updated_at      = ?
 		WHERE id = ? AND state = ?`,
 		st.State, st.Progress, st.DLSpeed,
+		st.Seeds, st.Peers, st.ETA,
 		st.Size, st.Size,
 		st.Name, st.Name,
 		advancing, now,

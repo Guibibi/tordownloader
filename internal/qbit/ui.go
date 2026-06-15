@@ -28,6 +28,9 @@ type uiTorrent struct {
 	Progress       float64 `json:"progress"`
 	DLSpeed        int64   `json:"dlspeed"`
 	ETA            int64   `json:"eta"`
+	Seeds          int     `json:"seeds"`
+	Peers          int     `json:"peers"`
+	Cached         bool    `json:"cached"`
 	Error          string  `json:"error"`
 	Category       string  `json:"category"`
 	AddedOn        int64   `json:"added_on"`
@@ -63,13 +66,24 @@ func (h *Handler) uiTorrents(w http.ResponseWriter, r *http.Request) {
 	for _, t := range torrents {
 		totalDL += t.DLSpeed
 
-		completed := int64(t.LocalProgress * float64(t.Size))
-		if completed > t.Size {
-			completed = t.Size
-		}
+		phase := uiPhase(t.State)
+
+		// ETA is phase-specific: while TorBox is fetching, use its server-side
+		// estimate; while downloading to disk, derive it from the remaining bytes
+		// and the current local speed. -1 means unknown.
 		eta := int64(-1)
-		if t.DLSpeed > 0 && t.Size > completed {
-			eta = (t.Size - completed) / t.DLSpeed
+		if phase == "torbox" {
+			if t.ETA > 0 {
+				eta = t.ETA
+			}
+		} else {
+			completed := int64(t.LocalProgress * float64(t.Size))
+			if completed > t.Size {
+				completed = t.Size
+			}
+			if t.DLSpeed > 0 && t.Size > completed {
+				eta = (t.Size - completed) / t.DLSpeed
+			}
 		}
 
 		out = append(out, uiTorrent{
@@ -78,12 +92,15 @@ func (h *Handler) uiTorrents(w http.ResponseWriter, r *http.Request) {
 			Size:           t.Size,
 			State:          t.State,
 			StateLabel:     uiStateLabel(t),
-			Phase:          uiPhase(t.State),
+			Phase:          phase,
 			TorBoxProgress: clamp01(t.TorBoxProgress),
 			LocalProgress:  clamp01(t.LocalProgress),
 			Progress:       blendedProgress(t),
 			DLSpeed:        t.DLSpeed,
 			ETA:            eta,
+			Seeds:          t.Seeds,
+			Peers:          t.Peers,
+			Cached:         t.Cached,
 			Error:          t.Error,
 			Category:       t.Category,
 			AddedOn:        t.AddedOn,

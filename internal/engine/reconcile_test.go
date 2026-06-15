@@ -134,6 +134,9 @@ func TestReconcileUpdatesProgress(t *testing.T) {
 			DownloadState: "downloading",
 			Progress:      0.42,
 			DownloadSpeed: 5000,
+			Seeds:         14,
+			Peers:         3,
+			ETA:           600,
 			Size:          1234,
 		}}, nil
 	}}
@@ -153,6 +156,12 @@ func TestReconcileUpdatesProgress(t *testing.T) {
 	}
 	if tr.DLSpeed != 5000 {
 		t.Errorf("dlspeed = %d, want 5000", tr.DLSpeed)
+	}
+	if tr.Seeds != 14 || tr.Peers != 3 {
+		t.Errorf("seeds/peers = %d/%d, want 14/3", tr.Seeds, tr.Peers)
+	}
+	if tr.ETA != 600 {
+		t.Errorf("eta = %d, want 600", tr.ETA)
 	}
 	if tr.Size != 1234 {
 		t.Errorf("size = %d, want 1234", tr.Size)

@@ -407,6 +407,41 @@ func TestSubmitCacheCheckIsInformationalOnly(t *testing.T) {
 	if got := countState(t, st, store.StateTorBoxActive); got != 1 {
 		t.Errorf("active = %d, want 1 (uncached release still submitted)", got)
 	}
+	// The (not-)cached result is recorded for the dashboard.
+	tr, _, err := st.GetTorrent(context.Background(), fmt.Sprintf("%040x", 1))
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	if tr.Cached {
+		t.Errorf("cached = true, want false (release was not cached)")
+	}
+}
+
+func TestSubmitRecordsCacheHit(t *testing.T) {
+	// A release already on TorBox is flagged cached so the dashboard can show an
+	// instant hit.
+	st := newStore(t)
+	seedQueued(t, st, 1)
+
+	tb := &fakeTB{
+		fn: func(torbox.CreateTorrentRequest) (*torbox.CreateTorrentResult, error) {
+			return okResult(1)
+		},
+		cache: func([]string) (map[string]torbox.CachedInfo, error) {
+			return map[string]torbox.CachedInfo{"x": {}}, nil // cached
+		},
+	}
+	e := New(st, tb, Config{MaxSlots: 3, CacheCheck: true}, nil)
+	if err := e.submitPass(context.Background()); err != nil {
+		t.Fatalf("submitPass: %v", err)
+	}
+	tr, _, err := st.GetTorrent(context.Background(), fmt.Sprintf("%040x", 1))
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	if !tr.Cached {
+		t.Errorf("cached = false, want true (release was cached on TorBox)")
+	}
 }
 
 func TestSubmitNoCacheCheckWhenDisabled(t *testing.T) {

@@ -64,3 +64,35 @@ func TestUITorrents(t *testing.T) {
 		t.Errorf("eta = %d, want 7", ut.ETA)
 	}
 }
+
+func TestUITorrentsTorBoxPhaseFields(t *testing.T) {
+	srv, st := newTestServer(t)
+	seedTorrent(t, st, store.Torrent{
+		Infohash: strings.Repeat("b", 40), Name: "Movie", Size: 2000,
+		State: store.StateTorBoxActive, TorBoxProgress: 0.3,
+		Seeds: 12, Peers: 4, ETA: 300, Cached: true,
+	})
+
+	var got uiResponse
+	_, body := get(t, srv, "/ui/torrents")
+	if err := json.Unmarshal([]byte(body), &got); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if len(got.Torrents) != 1 {
+		t.Fatalf("torrents = %d, want 1", len(got.Torrents))
+	}
+	ut := got.Torrents[0]
+	if ut.Phase != "torbox" {
+		t.Errorf("phase = %q, want torbox", ut.Phase)
+	}
+	if ut.Seeds != 12 || ut.Peers != 4 {
+		t.Errorf("seeds/peers = %d/%d, want 12/4", ut.Seeds, ut.Peers)
+	}
+	// In the TorBox phase the ETA is TorBox's own estimate, not a disk-speed derivation.
+	if ut.ETA != 300 {
+		t.Errorf("eta = %d, want 300 (TorBox-side)", ut.ETA)
+	}
+	if !ut.Cached {
+		t.Errorf("cached = false, want true")
+	}
+}

@@ -25,6 +25,10 @@ type Torrent struct {
 	TorBoxProgress float64
 	LocalProgress  float64
 	DLSpeed        int64
+	Seeds          int
+	Peers          int
+	ETA            int64
+	Cached         bool
 	Error          string
 	AddedOn        int64
 	ActiveSince    int64
@@ -57,14 +61,16 @@ type TorrentFilter struct {
 }
 
 const torrentColumns = `id, infohash, torbox_id, name, category, save_path, content_path,
-	size, state, torbox_state, torbox_progress, local_progress, dlspeed, error,
+	size, state, torbox_state, torbox_progress, local_progress, dlspeed,
+	seeds, peers, eta, cached, error,
 	added_on, active_since, progress_at, completed_on, created_at, updated_at`
 
 func scanTorrent(s interface{ Scan(...any) error }) (Torrent, error) {
 	var t Torrent
 	err := s.Scan(
 		&t.ID, &t.Infohash, &t.TorBoxID, &t.Name, &t.Category, &t.SavePath, &t.ContentPath,
-		&t.Size, &t.State, &t.TorBoxState, &t.TorBoxProgress, &t.LocalProgress, &t.DLSpeed, &t.Error,
+		&t.Size, &t.State, &t.TorBoxState, &t.TorBoxProgress, &t.LocalProgress, &t.DLSpeed,
+		&t.Seeds, &t.Peers, &t.ETA, &t.Cached, &t.Error,
 		&t.AddedOn, &t.ActiveSince, &t.ProgressAt, &t.CompletedOn, &t.CreatedAt, &t.UpdatedAt,
 	)
 	return t, err

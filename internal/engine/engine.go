@@ -259,12 +259,13 @@ func (e *Engine) submit(ctx context.Context, t store.Torrent) bool {
 		return true
 	}
 
-	// Informational cache check: log whether TorBox already has the content so a
-	// long fetch isn't mistaken for a stall. Never gates submission — uncached
-	// releases are still valid and the stall detector covers ones TorBox can't
-	// make progress on.
+	// Informational cache check: learn whether TorBox already has the content so a
+	// long fetch isn't mistaken for a stall, and so the dashboard can flag an
+	// instant hit. Never gates submission — uncached releases are still valid and
+	// the stall detector covers ones TorBox can't make progress on.
+	cached := false
 	if e.cacheCheck {
-		e.logCacheStatus(ctx, t.Infohash)
+		cached = e.cacheStatus(ctx, t.Infohash)
 	}
 
 	res, err := e.torbox.CreateTorrent(ctx, req)
@@ -301,6 +302,11 @@ func (e *Engine) submit(ctx context.Context, t store.Torrent) bool {
 		e.log.Error("mark active", "infohash", t.Infohash, "err", err)
 		return false
 	}
+	if e.cacheCheck {
+		if err := e.store.SetTorBoxCached(ctx, t.ID, cached); err != nil {
+			e.log.Error("record cache status", "infohash", t.Infohash, "err", err)
+		}
+	}
 	// TorBox may queue the submission (returns a queued id, no torrent id) when the
 	// account's active-download slots are full. Such a torrent isn't in mylist yet;
 	// mark it queued so the reconciler waits for it to activate (matched by hash)
@@ -319,22 +325,25 @@ func (e *Engine) submit(ctx context.Context, t store.Torrent) bool {
 	return true
 }
 
-// logCacheStatus reports whether TorBox already has the content for infohash. It
-// is purely informational (errors are swallowed) and never affects submission.
-func (e *Engine) logCacheStatus(ctx context.Context, infohash string) {
+// cacheStatus reports whether TorBox already has the content for infohash. It
+// logs the result (errors are swallowed) and never affects submission. The
+// returned bool is recorded so the dashboard can flag an instant cache hit; a
+// failed check returns false (treated as "not known cached").
+func (e *Engine) cacheStatus(ctx context.Context, infohash string) bool {
 	cached, err := e.torbox.CheckCached(ctx, []string{infohash}, false)
 	if err != nil {
 		e.log.Debug("cache check failed (continuing)", "infohash", infohash, "err", err)
-		return
+		return false
 	}
 	// Exactly one hash was queried, so any returned entry means it's cached
 	// (avoids depending on the response's key casing).
 	if len(cached) > 0 {
 		e.log.Info("cached on TorBox; content should be available shortly", "infohash", infohash)
-	} else {
-		e.log.Info("not cached on TorBox; will fetch server-side (failed only if it stalls)",
-			"infohash", infohash, "stall_timeout", e.stallAfter)
+		return true
 	}
+	e.log.Info("not cached on TorBox; will fetch server-side (failed only if it stalls)",
+		"infohash", infohash, "stall_timeout", e.stallAfter)
+	return false
 }
 
 // fail moves a torrent to ERROR, logging if the store update itself fails.

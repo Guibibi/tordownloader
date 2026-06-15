@@ -34,10 +34,12 @@ func seedTorrent(t *testing.T, st *store.Store, tor store.Torrent) int64 {
 	t.Helper()
 	res, err := st.DB().ExecContext(context.Background(),
 		`INSERT INTO torrents (infohash, name, category, save_path, content_path, size,
-			state, torbox_progress, local_progress, dlspeed, added_on, completed_on)
-		 VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`,
+			state, torbox_progress, local_progress, dlspeed, seeds, peers, eta, cached,
+			added_on, completed_on)
+		 VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
 		tor.Infohash, tor.Name, tor.Category, tor.SavePath, tor.ContentPath, tor.Size,
-		tor.State, tor.TorBoxProgress, tor.LocalProgress, tor.DLSpeed, tor.AddedOn, tor.CompletedOn)
+		tor.State, tor.TorBoxProgress, tor.LocalProgress, tor.DLSpeed,
+		tor.Seeds, tor.Peers, tor.ETA, tor.Cached, tor.AddedOn, tor.CompletedOn)
 	if err != nil {
 		t.Fatalf("seed torrent: %v", err)
 	}

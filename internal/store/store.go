@@ -31,6 +31,10 @@ CREATE TABLE IF NOT EXISTS torrents (
   torbox_progress REAL    NOT NULL DEFAULT 0,
   local_progress  REAL    NOT NULL DEFAULT 0,
   dlspeed         INTEGER NOT NULL DEFAULT 0,
+  seeds           INTEGER NOT NULL DEFAULT 0,   -- TorBox-reported seeders (fetching phase)
+  peers           INTEGER NOT NULL DEFAULT 0,   -- TorBox-reported leechers (fetching phase)
+  eta             INTEGER NOT NULL DEFAULT 0,   -- TorBox-side seconds remaining (fetching phase)
+  cached          INTEGER NOT NULL DEFAULT 0,   -- 1 = already on TorBox at submit (instant hit)
   error           TEXT    NOT NULL DEFAULT '',
   added_on        INTEGER NOT NULL DEFAULT 0,
   active_since    INTEGER NOT NULL DEFAULT 0,   -- when it entered TORBOX_ACTIVE
@@ -109,6 +113,10 @@ func (s *Store) migrate(ctx context.Context) error {
 		{"torrents", "magnet", "TEXT NOT NULL DEFAULT ''"},
 		{"torrents", "source_blob", "BLOB"},
 		{"torrents", "progress_at", "INTEGER NOT NULL DEFAULT 0"},
+		{"torrents", "seeds", "INTEGER NOT NULL DEFAULT 0"},
+		{"torrents", "peers", "INTEGER NOT NULL DEFAULT 0"},
+		{"torrents", "eta", "INTEGER NOT NULL DEFAULT 0"},
+		{"torrents", "cached", "INTEGER NOT NULL DEFAULT 0"},
 	}
 	for _, c := range cols {
 		if err := s.ensureColumn(ctx, c.table, c.column, c.ddl); err != nil {

@@ -40,6 +40,14 @@
   .badge.done   { background: rgba(54,201,139,.15); color: var(--done); }
   .badge.error  { background: rgba(255,95,109,.15); color: var(--error); }
   .badge.queued { background: rgba(107,114,128,.18); color: #aab2c0; }
+  .badge.cached { background: rgba(245,196,75,.15); color: #f5c44b; }
+  .group-head {
+    color: var(--muted); font-size: 12px; cursor: pointer; user-select: none;
+    margin: 18px 0 8px; display: flex; align-items: center; gap: 6px;
+  }
+  .group-head:hover { color: var(--text); }
+  .group-head .caret { transition: transform .15s ease; display: inline-block; }
+  .group-head.collapsed .caret { transform: rotate(-90deg); }
   .meta { display: flex; gap: 16px; flex-wrap: wrap; color: var(--muted); font-size: 12px; margin: 8px 0 10px; }
   .meta b { color: var(--text); font-weight: 600; }
   .bar { height: 8px; background: var(--panel2); border-radius: 6px; overflow: hidden; display: flex; }
@@ -87,6 +95,14 @@ const fmtEta = s => {
   if (s < 3600) return Math.floor(s/60) + "m " + (s%60) + "s";
   const h = Math.floor(s/3600); return h + "h " + Math.floor((s%3600)/60) + "m";
 };
+const fmtAge = ts => {
+  if (!ts) return "";
+  const s = Math.floor(Date.now()/1000) - ts;
+  if (s < 60) return "just now";
+  if (s < 3600) return Math.floor(s/60) + "m ago";
+  if (s < 86400) return Math.floor(s/3600) + "h ago";
+  return Math.floor(s/86400) + "d ago";
+};
 const esc = s => { const d = document.createElement("div"); d.textContent = s ?? ""; return d.innerHTML; };
 
 function bar(t) {
@@ -106,25 +122,57 @@ function bar(t) {
 
 function card(t) {
   const pct = Math.round(t.progress*100);
-  const detail = t.phase === "torbox"
-    ? `TorBox ${Math.round(t.torbox_progress*100)}%`
-    : (t.phase === "local"
-        ? `Disk ${Math.round(t.local_progress*100)}% · ${fmtSpeed(t.dlspeed)} · ETA ${fmtEta(t.eta)}`
-        : "");
+  let detail = "";
+  if (t.phase === "torbox") {
+    const parts = [`TorBox ${Math.round(t.torbox_progress*100)}%`];
+    if (t.seeds || t.peers) parts.push(`▲ ${t.seeds} · ▼ ${t.peers}`);
+    if (t.dlspeed > 0) parts.push(fmtSpeed(t.dlspeed));
+    if (t.eta >= 0) parts.push(`ETA ${fmtEta(t.eta)}`);
+    detail = parts.join(" · ");
+  } else if (t.phase === "local") {
+    detail = `Disk ${Math.round(t.local_progress*100)}% · ${fmtSpeed(t.dlspeed)} · ETA ${fmtEta(t.eta)}`;
+  }
+  const age = fmtAge(t.added_on);
   return `<div class="card">
     <div class="row1">
       <span class="name" title="${esc(t.name)}">${esc(t.name)}</span>
+      ${t.cached ? `<span class="badge cached" title="Already on TorBox when grabbed">⚡ cached</span>` : ""}
       <span class="badge ${t.phase}">${esc(t.state_label)}</span>
     </div>
     <div class="meta">
       <span><b>${fmtSize(t.size)}</b></span>
       ${t.category ? `<span>${esc(t.category)}</span>` : ""}
       ${detail ? `<span class="dim">${detail}</span>` : ""}
+      ${age ? `<span class="dim" title="added">${age}</span>` : ""}
     </div>
     ${bar(t)}
     <div class="barlabel"><span>${esc(t.state_label)}</span><span class="pct">${pct}%</span></div>
     ${t.error ? `<div class="errmsg">${esc(t.error)}</div>` : ""}
   </div>`;
+}
+
+// Active phases sort to the top; completed torrents collapse into their own group.
+const PHASE_RANK = { torbox: 0, local: 0, queued: 1, error: 2, done: 3 };
+let doneCollapsed = true;
+
+function render(ts) {
+  const list = document.getElementById("list");
+  if (!ts.length) { list.innerHTML = `<div class="empty">No torrents yet.</div>`; return; }
+  const active = ts.filter(t => t.phase !== "done");
+  const done = ts.filter(t => t.phase === "done");
+  active.sort((a, b) => (PHASE_RANK[a.phase] - PHASE_RANK[b.phase]) || (b.added_on - a.added_on));
+  done.sort((a, b) => b.added_on - a.added_on);
+
+  let html = active.map(card).join("");
+  if (done.length) {
+    html += `<div class="group-head${doneCollapsed ? " collapsed" : ""}" id="doneHead">
+      <span class="caret">▾</span> Completed (${done.length})
+    </div>
+    <div id="doneList" style="display:${doneCollapsed ? "none" : "block"}">${done.map(card).join("")}</div>`;
+  }
+  list.innerHTML = html;
+  const head = document.getElementById("doneHead");
+  if (head) head.onclick = () => { doneCollapsed = !doneCollapsed; render(ts); };
 }
 
 async function tick() {
@@ -138,10 +186,7 @@ async function tick() {
     const done = ts.filter(t => t.phase === "done").length;
     document.getElementById("counts").textContent =
       `${ts.length} torrent${ts.length===1?"":"s"} · ${active} active · ${done} done`;
-    const list = document.getElementById("list");
-    list.innerHTML = ts.length
-      ? ts.map(card).join("")
-      : `<div class="empty">No torrents yet.</div>`;
+    render(ts);
   } catch (e) {
     document.getElementById("counts").textContent = "connection lost…";
   }
