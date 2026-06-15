@@ -48,6 +48,17 @@
   .group-head:hover { color: var(--text); }
   .group-head .caret { transition: transform .15s ease; display: inline-block; }
   .group-head.collapsed .caret { transform: rotate(-90deg); }
+  .row1.expandable { cursor: pointer; }
+  .row1 .caret { color: var(--muted); font-size: 11px; transition: transform .15s ease; display: inline-block; }
+  .row1 .caret.collapsed { transform: rotate(-90deg); }
+  .files { margin: 10px 0 2px; border-top: 1px solid var(--border); padding-top: 8px; }
+  .file { display: flex; align-items: center; gap: 10px; padding: 3px 0; font-size: 12px; }
+  .file .ficon { width: 14px; text-align: center; }
+  .file.done .ficon { color: var(--done); }
+  .file.pending .ficon { color: var(--muted); }
+  .file .fname { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .file.pending .fname { color: var(--muted); }
+  .file .fsize { color: var(--muted); white-space: nowrap; }
   .meta { display: flex; gap: 16px; flex-wrap: wrap; color: var(--muted); font-size: 12px; margin: 8px 0 10px; }
   .meta b { color: var(--text); font-weight: 600; }
   .bar { height: 8px; background: var(--panel2); border-radius: 6px; overflow: hidden; display: flex; }
@@ -125,6 +136,32 @@ function bar(t) {
 // each poll. 0 disables the stall countdown.
 let stallTimeout = 0;
 
+// Hashes whose per-file breakdown is expanded, and a cache of the last rendered
+// file list per hash so re-renders (every poll) don't flash a loading state.
+const expanded = new Set();
+const filesCache = {};
+
+function fileRow(f) {
+  const cls = f.done ? "done" : "pending";
+  return `<div class="file ${cls}">
+    <span class="ficon">${f.done ? "✓" : "○"}</span>
+    <span class="fname" title="${esc(f.path)}">${esc(f.name)}</span>
+    <span class="fsize">${fmtSize(f.size)}</span>
+  </div>`;
+}
+
+async function loadFiles(hash) {
+  try {
+    const r = await fetch("/ui/torrents/files?hash=" + encodeURIComponent(hash), { cache: "no-store" });
+    if (!r.ok) return;
+    const d = await r.json();
+    const html = (d.files || []).map(fileRow).join("") || `<div class="dim">No files.</div>`;
+    filesCache[hash] = html;
+    const el = document.getElementById("files-" + hash);
+    if (el) el.innerHTML = html; // only patch if still expanded/present
+  } catch (e) { /* leave the cached/placeholder content in place */ }
+}
+
 // stallRemaining returns the seconds a stalled TorBox fetch has left before it's
 // failed, or null when no countdown applies (not fetching, moving bytes, queued
 // on TorBox, or stall-failing disabled). A 60s grace avoids flagging brand-new
@@ -154,8 +191,12 @@ function card(t) {
   const stallMsg = stall === null ? ""
     : (stall <= 0 ? "⚠ no progress — failing…"
                   : `⚠ no progress — fails in ${fmtEta(stall)}`);
+  // Files exist once content is on TorBox and we've recorded them (local/done).
+  const expandable = t.phase === "local" || t.phase === "done";
+  const isOpen = expanded.has(t.hash);
   return `<div class="card">
-    <div class="row1">
+    <div class="row1${expandable ? " expandable" : ""}" ${expandable ? `data-toggle="${t.hash}"` : ""}>
+      ${expandable ? `<span class="caret${isOpen ? "" : " collapsed"}">▾</span>` : ""}
       <span class="name" title="${esc(t.name)}">${esc(t.name)}</span>
       ${t.cached ? `<span class="badge cached" title="Already on TorBox when grabbed">⚡ cached</span>` : ""}
       <span class="badge ${t.phase}">${esc(t.state_label)}</span>
@@ -170,6 +211,7 @@ function card(t) {
     <div class="barlabel"><span>${esc(t.state_label)}</span><span class="pct">${pct}%</span></div>
     ${stallMsg ? `<div class="stall">${stallMsg}</div>` : ""}
     ${t.error ? `<div class="errmsg">${esc(t.error)}</div>` : ""}
+    ${isOpen ? `<div class="files" id="files-${t.hash}">${filesCache[t.hash] || `<div class="dim">Loading files…</div>`}</div>` : ""}
   </div>`;
 }
 
@@ -195,6 +237,15 @@ function render(ts) {
   list.innerHTML = html;
   const head = document.getElementById("doneHead");
   if (head) head.onclick = () => { doneCollapsed = !doneCollapsed; render(ts); };
+  // Wire per-card file toggles, then refresh any expanded breakdowns.
+  list.querySelectorAll("[data-toggle]").forEach(el => {
+    el.onclick = () => {
+      const h = el.getAttribute("data-toggle");
+      if (expanded.has(h)) expanded.delete(h); else expanded.add(h);
+      render(ts);
+    };
+  });
+  expanded.forEach(h => loadFiles(h));
 }
 
 async function tick() {

@@ -3,6 +3,7 @@ package qbit
 import (
 	_ "embed"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/guibibi/tordownloader/internal/store"
@@ -124,6 +125,55 @@ func (h *Handler) uiTorrents(w http.ResponseWriter, r *http.Request) {
 		Version:      appVersion,
 		StallTimeout: int64(h.stallTimeout / time.Second),
 	})
+}
+
+// uiFile is the dashboard view of one file within a torrent. Per-file progress is
+// binary: Done flips when the file finishes and verifies (Downloaded isn't
+// tracked mid-stream), so the dashboard renders a done/pending list rather than
+// per-file bars.
+type uiFile struct {
+	Name string `json:"name"` // short file name
+	Path string `json:"path"` // full path within the torrent (preserves folders)
+	Size int64  `json:"size"`
+	Done bool   `json:"done"`
+}
+
+// uiFilesResponse is the payload for the expandable per-file breakdown.
+type uiFilesResponse struct {
+	Files []uiFile `json:"files"`
+}
+
+// uiFiles returns one torrent's file list (by infohash) for the dashboard's
+// expandable breakdown. Fetched lazily on expand so the main poll stays light.
+func (h *Handler) uiFiles(w http.ResponseWriter, r *http.Request) {
+	hash := strings.ToLower(r.URL.Query().Get("hash"))
+	if hash == "" {
+		http.Error(w, "missing hash", http.StatusBadRequest)
+		return
+	}
+	t, ok, err := h.store.GetTorrent(r.Context(), hash)
+	if err != nil {
+		h.serverError(w, r, err)
+		return
+	}
+	if !ok {
+		http.NotFound(w, r)
+		return
+	}
+	files, err := h.store.ListFiles(r.Context(), t.ID)
+	if err != nil {
+		h.serverError(w, r, err)
+		return
+	}
+	out := make([]uiFile, 0, len(files))
+	for _, f := range files {
+		name := f.ShortName
+		if name == "" {
+			name = f.RelPath
+		}
+		out = append(out, uiFile{Name: name, Path: f.RelPath, Size: f.Size, Done: f.Done})
+	}
+	h.writeJSON(w, r, uiFilesResponse{Files: out})
 }
 
 // uiPhase groups the internal state into a coarse phase the page colours by.

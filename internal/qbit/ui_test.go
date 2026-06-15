@@ -129,3 +129,55 @@ func TestUITorrentsStallCountdownPayload(t *testing.T) {
 		t.Errorf("torbox_state = %q, want downloading", ut.TorBoxState)
 	}
 }
+
+func TestUIFiles(t *testing.T) {
+	srv, st := newTestServer(t)
+	hash := strings.Repeat("d", 40)
+	id := seedTorrent(t, st, store.Torrent{
+		Infohash: hash, Name: "Pack S01", Size: 300, State: store.StateLocalDload,
+	})
+	ctx := context.Background()
+	for _, f := range []struct {
+		rel, short string
+		size       int64
+		done       int
+	}{
+		{"Pack S01/e01.mkv", "e01.mkv", 100, 1},
+		{"Pack S01/e02.mkv", "e02.mkv", 200, 0},
+	} {
+		if _, err := st.DB().ExecContext(ctx,
+			`INSERT INTO files (torrent_id, rel_path, short_name, size, done) VALUES (?,?,?,?,?)`,
+			id, f.rel, f.short, f.size, f.done); err != nil {
+			t.Fatalf("insert file: %v", err)
+		}
+	}
+
+	resp, body := get(t, srv, "/ui/torrents/files?hash="+hash)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	}
+	var got uiFilesResponse
+	if err := json.Unmarshal([]byte(body), &got); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if len(got.Files) != 2 {
+		t.Fatalf("files = %d, want 2", len(got.Files))
+	}
+	if got.Files[0].Name != "e01.mkv" || got.Files[0].Size != 100 || !got.Files[0].Done {
+		t.Errorf("file[0] = %+v, want e01.mkv/100/done", got.Files[0])
+	}
+	if got.Files[1].Done {
+		t.Errorf("file[1] should be pending, got done")
+	}
+	if got.Files[1].Path != "Pack S01/e02.mkv" {
+		t.Errorf("file[1] path = %q, want full rel path", got.Files[1].Path)
+	}
+
+	// Unknown hash 404s; missing hash is a 400.
+	if r, _ := get(t, srv, "/ui/torrents/files?hash="+strings.Repeat("e", 40)); r.StatusCode != http.StatusNotFound {
+		t.Errorf("unknown hash status = %d, want 404", r.StatusCode)
+	}
+	if r, _ := get(t, srv, "/ui/torrents/files"); r.StatusCode != http.StatusBadRequest {
+		t.Errorf("missing hash status = %d, want 400", r.StatusCode)
+	}
+}

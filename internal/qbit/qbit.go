@@ -107,6 +107,7 @@ func (h *Handler) Routes() http.Handler {
 	// so uiIndex 404s anything that isn't exactly "/".
 	mux.HandleFunc("/", h.uiIndex)
 	mux.HandleFunc("/ui/torrents", h.uiTorrents)
+	mux.HandleFunc("/ui/torrents/files", h.uiFiles)
 
 	return mux
 }
