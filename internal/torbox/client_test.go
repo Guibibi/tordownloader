@@ -8,6 +8,8 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"golang.org/x/time/rate"
 )
 
 func newClient(t *testing.T, h http.HandlerFunc) *Client {
@@ -185,6 +187,70 @@ func TestPlainTextErrorBodyIsTypedAPIError(t *testing.T) {
 	}
 	if apiErr.StatusCode != http.StatusTooManyRequests {
 		t.Errorf("status = %d, want 429", apiErr.StatusCode)
+	}
+}
+
+func TestNewLimiter(t *testing.T) {
+	if newLimiter(0) != nil {
+		t.Error("newLimiter(0) should disable the limiter (nil)")
+	}
+	if newLimiter(-5) != nil {
+		t.Error("newLimiter(negative) should disable the limiter (nil)")
+	}
+	l := newLimiter(280)
+	if l == nil {
+		t.Fatal("newLimiter(280) = nil, want a limiter")
+	}
+	if got, want := float64(l.Limit()), 280.0/60.0; got != want {
+		t.Errorf("Limit() = %v, want %v (280/min)", got, want)
+	}
+	if got := l.Burst(); got != 5 {
+		t.Errorf("Burst() = %d, want 5", got)
+	}
+}
+
+func TestRateLimitPacesRequests(t *testing.T) {
+	c := newClient(t, func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(`{"success":true,"data":[]}`))
+	})
+	// One token per 20ms, burst 1: the first call is immediate, each of the next
+	// three waits ~20ms, so four calls take at least ~60ms. (Only the lower bound
+	// is asserted — the limiter can only add delay, never remove it, so this can't
+	// flake on a slow machine.)
+	c.limiter = rate.NewLimiter(rate.Every(20*time.Millisecond), 1)
+
+	start := time.Now()
+	for i := 0; i < 4; i++ {
+		if _, err := c.MyList(context.Background(), false); err != nil {
+			t.Fatalf("MyList #%d: %v", i, err)
+		}
+	}
+	if elapsed := time.Since(start); elapsed < 45*time.Millisecond {
+		t.Errorf("4 calls took %v, want >= ~60ms (rate limited)", elapsed)
+	}
+}
+
+func TestRateLimitRespectsContext(t *testing.T) {
+	c := newClient(t, func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(`{"success":true,"data":"https://cdn/x"}`))
+	})
+	// A token only every hour, burst 1: the first request drains the bucket, so
+	// the next can't get a token — a deadlined ctx must make it fail fast rather
+	// than block, so a shutdown/delete isn't stuck behind the limiter.
+	c.limiter = rate.NewLimiter(rate.Every(time.Hour), 1)
+
+	fileID := 1
+	if _, err := c.RequestDL(context.Background(), RequestDLParams{TorrentID: 1, FileID: &fileID}); err != nil {
+		t.Fatalf("first RequestDL: %v", err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	start := time.Now()
+	if _, err := c.RequestDL(ctx, RequestDLParams{TorrentID: 1, FileID: &fileID}); err == nil {
+		t.Fatal("want error when the limiter blocks past the ctx deadline, got nil")
+	}
+	if elapsed := time.Since(start); elapsed > time.Second {
+		t.Errorf("blocked %v before failing, want fast (<1s)", elapsed)
 	}
 }
 

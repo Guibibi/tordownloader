@@ -20,12 +20,19 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"golang.org/x/time/rate"
 )
 
 const (
 	defaultBaseURL    = "https://api.torbox.app"
 	defaultAPIVersion = "v1"
 	maxBackoff        = 30 * time.Second
+	// defaultRatePerMin caps all TorBox API calls just under the account's general
+	// 300/min limit, with headroom for timing slop. Every endpoint shares this
+	// budget; staying under it means a burst of requestdl links (a big pack of
+	// small files) is paced instead of bouncing off a 429.
+	defaultRatePerMin = 280
 )
 
 // Client talks to the TorBox API.
@@ -36,6 +43,10 @@ type Client struct {
 	httpClient     *http.Client
 	maxRetries     int
 	initialBackoff time.Duration
+	// limiter paces outbound API calls to stay under TorBox's general rate limit.
+	// nil means unlimited. Shared across all goroutines using the client (the
+	// parallel downloaders, reconciler, and submitter), so the cap is global.
+	limiter *rate.Limiter
 }
 
 // Option configures a Client.
@@ -65,6 +76,28 @@ func WithInitialBackoff(d time.Duration) Option {
 	}
 }
 
+// WithRateLimit caps the sustained rate of TorBox API calls to perMinute
+// requests, smoothing bursts (e.g. requestdl links for a big pack) so they stay
+// under TorBox's general 300/min limit instead of tripping a 429. A small burst
+// lets the parallel downloaders grab links without artificial stalls while the
+// average holds. perMinute <= 0 disables the limiter (unlimited).
+func WithRateLimit(perMinute int) Option {
+	return func(c *Client) {
+		c.limiter = newLimiter(perMinute)
+	}
+}
+
+// newLimiter builds a token-bucket limiter for perMinute requests, or nil to
+// disable. The burst is ~one second of budget (min 1) so a handful of parallel
+// link requests proceed at once without pushing the windowed total over the cap.
+func newLimiter(perMinute int) *rate.Limiter {
+	if perMinute <= 0 {
+		return nil
+	}
+	burst := perMinute/60 + 1
+	return rate.NewLimiter(rate.Limit(float64(perMinute)/60.0), burst)
+}
+
 // New returns a TorBox client authenticated with apiKey.
 func New(apiKey string, opts ...Option) *Client {
 	c := &Client{
@@ -74,6 +107,7 @@ func New(apiKey string, opts ...Option) *Client {
 		httpClient:     &http.Client{Timeout: 60 * time.Second},
 		maxRetries:     4,
 		initialBackoff: 500 * time.Millisecond,
+		limiter:        newLimiter(defaultRatePerMin),
 	}
 	for _, o := range opts {
 		o(c)
@@ -275,6 +309,14 @@ func (c *Client) do(ctx context.Context, method, endpoint string, query url.Valu
 
 	backoff := c.initialBackoff
 	for attempt := 0; ; attempt++ {
+		// Consume a rate-limit token before every request (retries included), so
+		// the global cap holds across all concurrent callers. Blocks until a token
+		// is free or ctx is cancelled.
+		if c.limiter != nil {
+			if err := c.limiter.Wait(ctx); err != nil {
+				return nil, fmt.Errorf("torbox: rate limit wait: %w", err)
+			}
+		}
 		var rdr io.Reader
 		if body != nil {
 			rdr = bytes.NewReader(body)

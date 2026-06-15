@@ -34,6 +34,10 @@ type TorBoxConfig struct {
 	MaxActiveSlots int      `yaml:"max_active_slots"`
 	CacheCheck     bool     `yaml:"cache_check"`
 	PollInterval   Duration `yaml:"poll_interval"`
+	// MaxRequestsPerMin caps the rate of TorBox API calls (all endpoints share
+	// TorBox's general 300/min limit). A burst of requestdl links for a large pack
+	// is paced to stay under the cap instead of tripping a 429. 0 disables the cap.
+	MaxRequestsPerMin int `yaml:"max_requests_per_min"`
 }
 
 // DownloadConfig configures how files are written to local disk.
@@ -80,10 +84,11 @@ func Default() *Config {
 	return &Config{
 		Server: ServerConfig{ListenAddr: "0.0.0.0:6500"},
 		TorBox: TorBoxConfig{
-			BaseURL:        "https://api.torbox.app",
-			MaxActiveSlots: 3,
-			CacheCheck:     true,
-			PollInterval:   Duration(10 * time.Second),
+			BaseURL:           "https://api.torbox.app",
+			MaxActiveSlots:    3,
+			CacheCheck:        true,
+			PollInterval:      Duration(10 * time.Second),
+			MaxRequestsPerMin: 280,
 		},
 		Download: DownloadConfig{
 			Root:             "/downloads",

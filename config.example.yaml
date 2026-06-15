@@ -11,6 +11,7 @@ torbox:
   max_active_slots: 3              # Essential plan = 3 concurrent download slots
   cache_check: true                # check cached availability on add (fail-fast)
   poll_interval: 10s               # how often to poll TorBox /mylist
+  max_requests_per_min: 280        # cap on all TorBox API calls (general limit is 300/min); 0 disables
 
 download:
   root: "/downloads"               # shared with Sonarr/Radarr, mapped identically across containers
