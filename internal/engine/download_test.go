@@ -102,6 +102,47 @@ func TestDownloadPassCompletes(t *testing.T) {
 	}
 }
 
+// TestDownloadPassDeletesFromTorBoxOnComplete asserts that once the content is on
+// local disk, the engine deletes the torrent from TorBox to free the account's
+// scarce slot — without waiting for Sonarr's delete (which may be disabled).
+func TestDownloadPassDeletesFromTorBoxOnComplete(t *testing.T) {
+	body := bytes.Repeat([]byte("x"), 500)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.ServeContent(w, r, "f", time.Time{}, bytes.NewReader(body))
+	}))
+	defer srv.Close()
+
+	st := newStore(t)
+	save := filepath.Join(t.TempDir(), "tv")
+	hash := "cccccccccccccccccccccccccccccccccccccccc"
+	seedLocalQueued(t, st, hash, save, []store.FileInput{
+		{TorBoxFileID: 0, RelPath: "show/e01.mkv", ShortName: "e01.mkv", Size: int64(len(body))},
+	})
+
+	var ctlID int
+	var ctlOp torbox.Operation
+	var ctlCalled int
+	tb := &fakeTB{
+		dl:  func(torbox.RequestDLParams) (string, error) { return srv.URL, nil },
+		ctl: func(id int, op torbox.Operation) error { ctlCalled++; ctlID = id; ctlOp = op; return nil },
+	}
+	e := New(st, tb, Config{ParallelFiles: 1, IncompleteSubdir: ".incomplete"}, nil)
+
+	if err := e.downloadPass(context.Background()); err != nil {
+		t.Fatalf("downloadPass: %v", err)
+	}
+
+	tr, _, _ := st.GetTorrent(context.Background(), hash)
+	if tr.State != store.StateComplete {
+		t.Fatalf("state = %q, want COMPLETE", tr.State)
+	}
+	// Slot freed on TorBox, but local content stays so Sonarr can still import.
+	if ctlCalled != 1 || ctlOp != torbox.OpDelete || ctlID != 4242 {
+		t.Errorf("ControlTorrent calls=%d id=%d op=%q, want 1 delete on id 4242", ctlCalled, ctlID, ctlOp)
+	}
+	assertBytes(t, filepath.Join(save, "show", "e01.mkv"), body)
+}
+
 func TestDownloadPassFailsOnLinkError(t *testing.T) {
 	st := newStore(t)
 	save := filepath.Join(t.TempDir(), "tv")

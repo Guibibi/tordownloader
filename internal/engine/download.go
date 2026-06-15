@@ -161,4 +161,16 @@ func (e *Engine) downloadOne(ctx context.Context, t store.Torrent) {
 		return
 	}
 	e.log.Info("download complete", "infohash", t.Infohash, "content_path", contentPath)
+
+	// Free the TorBox slot now that the content is safely on local disk. TorBox no
+	// longer needs to seed it — Sonarr imports from /downloads, not TorBox — and
+	// waiting for Sonarr's delete (which may be disabled, or deferred while the
+	// torrent "seeds") would pin one of the account's scarce slots, starving the
+	// queued torrents. We keep the local files and the DB row (reported pausedUP)
+	// so Sonarr can still import; the later Sonarr-driven delete then just clears
+	// local state, with this TorBox delete already a no-op. Best-effort and
+	// detached so it completes regardless of the pass context.
+	delCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
+	e.removeFromTorBox(delCtx, t)
+	cancel()
 }

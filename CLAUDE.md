@@ -25,6 +25,11 @@ headless, download-to-disk. Runs as one Docker container on the user's **Unraid*
 - Torrents only (no Usenet — user's plan has none).
 - Per-file downloads via `requestdl`, preserve folder structure (no zip/extract).
 - On Sonarr delete: remove from TorBox **and** local.
+- Free the TorBox slot as soon as the local download completes: on COMPLETE we
+  delete the torrent from TorBox (slots are scarce — 3 — and TorBox seeds forever
+  otherwise, starving the queue). Local files + DB row stay (reported `pausedUP`)
+  so Sonarr can still import; the later Sonarr delete then just clears local state.
+  Don't rely on Sonarr's "Remove Completed" to free slots — it's deferred/optional.
 - Headless: YAML/env config, SQLite state, logs (no Web UI in v1).
 - Fail on *stall* (not on slowness): cache check on add (informational); ERROR only when a
   fetching torrent makes no progress for `failure.stall_timeout` (default 10m). Optional
