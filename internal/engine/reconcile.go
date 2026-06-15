@@ -145,14 +145,19 @@ func (e *Engine) reconcileOne(ctx context.Context, t store.Torrent, byID map[int
 	// the wait won't rescue, so fail it: that reports an error to Sonarr/Radarr
 	// which blacklists the release and grabs another. A slow but moving download
 	// keeps resetting progress_at (via Advancing) and is never failed for speed.
-	if e.stallAfter > 0 && !advancing {
+	//
+	// A cached release is a special case: TorBox already has the bytes, so a 0%
+	// sit is just the server materialising content it told us it has, not a dead
+	// peer-fetch. It gets the longer cachedStallAfter grace instead of the normal
+	// stallAfter — still bounded, so a genuinely broken hand-off can't hang forever.
+	if stallAfter := e.stallTimeoutFor(t); stallAfter > 0 && !advancing {
 		stalledSince := t.ProgressAt
 		if stalledSince == 0 {
 			stalledSince = t.ActiveSince
 		}
-		if now.Sub(time.Unix(stalledSince, 0)) > e.stallAfter {
-			e.fail(ctx, t, fmt.Sprintf("no download progress for %s (download_state=%q, seeds=%d, peers=%d)",
-				e.stallAfter, tb.DownloadState, tb.Seeds, tb.Peers))
+		if now.Sub(time.Unix(stalledSince, 0)) > stallAfter {
+			e.fail(ctx, t, fmt.Sprintf("no download progress for %s (download_state=%q, seeds=%d, peers=%d, cached=%v)",
+				stallAfter, tb.DownloadState, tb.Seeds, tb.Peers, t.Cached))
 			return
 		}
 	}
@@ -163,6 +168,18 @@ func (e *Engine) reconcileOne(ctx context.Context, t store.Torrent, byID map[int
 	if e.failAfter > 0 && now.Sub(time.Unix(t.ActiveSince, 0)) > e.failAfter {
 		e.fail(ctx, t, fmt.Sprintf("not available within %s of becoming active", e.failAfter))
 	}
+}
+
+// stallTimeoutFor returns the no-progress grace a torrent gets before it's failed:
+// the longer cachedStallAfter for a release TorBox reported as cached (it's only
+// waiting for the server to surface bytes it already has), or the normal
+// stallAfter for one being fetched from peers. A non-positive value disables the
+// stall check for that class.
+func (e *Engine) stallTimeoutFor(t store.Torrent) time.Duration {
+	if t.Cached {
+		return e.cachedStallAfter
+	}
+	return e.stallAfter
 }
 
 // lookupTorBox finds a torrent's mylist entry, preferring its stored id and

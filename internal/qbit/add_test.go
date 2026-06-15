@@ -190,7 +190,7 @@ func TestDeleteWithEngineDeleteFn(t *testing.T) {
 		t.Fatalf("add: %v", err)
 	}
 
-	h := New(st, "/downloads", 10*time.Minute, deleteFn, nil)
+	h := New(st, "/downloads", 10*time.Minute, 30*time.Minute, deleteFn, nil)
 	srv := httptest.NewServer(h.Routes())
 	t.Cleanup(srv.Close)
 
@@ -236,7 +236,7 @@ func TestDeleteWithEngineDeleteFnAll(t *testing.T) {
 		return nil
 	}
 
-	h := New(st, "/downloads", 10*time.Minute, deleteFn, nil)
+	h := New(st, "/downloads", 10*time.Minute, 30*time.Minute, deleteFn, nil)
 	srv := httptest.NewServer(h.Routes())
 	t.Cleanup(srv.Close)
 

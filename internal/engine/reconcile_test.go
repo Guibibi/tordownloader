@@ -232,6 +232,57 @@ func TestReconcileStallFail(t *testing.T) {
 	}
 }
 
+func TestReconcileCachedUsesLongerStallWindow(t *testing.T) {
+	st := newStore(t)
+	hash := "9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a"
+	// Cached release sitting at 0% for 8m: past the 5m normal stall window, but
+	// within the 30m cached grace, so it must NOT be failed — it's just waiting for
+	// TorBox to surface bytes it already has.
+	tr := seedActive(t, st, hash, 41, "/downloads/tv", 8*time.Minute)
+	if err := st.SetTorBoxCached(context.Background(), tr.ID, true); err != nil {
+		t.Fatalf("set cached: %v", err)
+	}
+
+	tb := &fakeTB{list: func() ([]torbox.Torrent, error) {
+		return []torbox.Torrent{{
+			ID: 41, DownloadState: "downloading", Active: true,
+			Progress: 0, DownloadSpeed: 0, Cached: true, DownloadPresent: false,
+		}}, nil
+	}}
+	e := New(st, tb, Config{MaxSlots: 3, StallTimeout: 5 * time.Minute, CachedStallTimeout: 30 * time.Minute}, nil)
+	if err := e.reconcilePass(context.Background()); err != nil {
+		t.Fatalf("reconcilePass: %v", err)
+	}
+	if tr := getTorrent(t, st, hash); tr.State != store.StateTorBoxActive {
+		t.Fatalf("state = %q, want TORBOX_ACTIVE (cached, within longer window)", tr.State)
+	}
+}
+
+func TestReconcileCachedStallFailPastCachedWindow(t *testing.T) {
+	st := newStore(t)
+	hash := "9b9b9b9b9b9b9b9b9b9b9b9b9b9b9b9b9b9b9b9b"
+	// Cached release stuck at 0% for 31m, past even the 30m cached grace: the
+	// hand-off is genuinely broken, so the safety net fails it.
+	tr := seedActive(t, st, hash, 42, "/downloads/tv", 31*time.Minute)
+	if err := st.SetTorBoxCached(context.Background(), tr.ID, true); err != nil {
+		t.Fatalf("set cached: %v", err)
+	}
+
+	tb := &fakeTB{list: func() ([]torbox.Torrent, error) {
+		return []torbox.Torrent{{
+			ID: 42, DownloadState: "downloading", Active: true,
+			Progress: 0, DownloadSpeed: 0, Cached: true, DownloadPresent: false,
+		}}, nil
+	}}
+	e := New(st, tb, Config{MaxSlots: 3, StallTimeout: 5 * time.Minute, CachedStallTimeout: 30 * time.Minute}, nil)
+	if err := e.reconcilePass(context.Background()); err != nil {
+		t.Fatalf("reconcilePass: %v", err)
+	}
+	if tr := getTorrent(t, st, hash); tr.State != store.StateError {
+		t.Fatalf("state = %q, want ERROR (cached but broken past 30m)", tr.State)
+	}
+}
+
 func TestReconcileStallFailDeletesFromTorBox(t *testing.T) {
 	st := newStore(t)
 	hash := "8888888888888888888888888888888888888888"

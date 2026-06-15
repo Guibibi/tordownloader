@@ -33,10 +33,11 @@ const downloadInterval = 2 * time.Second
 
 // Defaults applied when Config leaves a field unset.
 const (
-	defaultPollInterval     = 10 * time.Second
-	defaultStallTimeout     = 10 * time.Minute
-	defaultParallelFiles    = 4
-	defaultIncompleteSubdir = ".incomplete"
+	defaultPollInterval       = 10 * time.Second
+	defaultStallTimeout       = 10 * time.Minute
+	defaultCachedStallTimeout = 30 * time.Minute
+	defaultParallelFiles      = 4
+	defaultIncompleteSubdir   = ".incomplete"
 )
 
 // createRateLimitCooldown is how long to pause createtorrent submissions after a
@@ -60,13 +61,14 @@ type TorBoxAPI interface {
 
 // Config tunes the engine's background workers.
 type Config struct {
-	MaxSlots         int           // TorBox concurrent-slot limit (default 1)
-	PollInterval     time.Duration // reconciler cadence (default 10s)
-	FailTimeout      time.Duration // optional absolute cap from active_since (0 = disabled, the default)
-	StallTimeout     time.Duration // fail after this long with no forward progress (default 10m; <0 disables)
-	ParallelFiles    int           // concurrent file downloads per torrent (default 4)
-	IncompleteSubdir string        // staging dir under the save path (default .incomplete)
-	CacheCheck       bool          // log TorBox cache status on submit (informational)
+	MaxSlots           int           // TorBox concurrent-slot limit (default 1)
+	PollInterval       time.Duration // reconciler cadence (default 10s)
+	FailTimeout        time.Duration // optional absolute cap from active_since (0 = disabled, the default)
+	StallTimeout       time.Duration // fail after this long with no forward progress (default 10m; <0 disables)
+	CachedStallTimeout time.Duration // stall grace for cached releases waiting on TorBox (default 30m; <0 disables)
+	ParallelFiles      int           // concurrent file downloads per torrent (default 4)
+	IncompleteSubdir   string        // staging dir under the save path (default .incomplete)
+	CacheCheck         bool          // log TorBox cache status on submit (informational)
 }
 
 // activeDownload tracks the currently in-flight download so a delete can
@@ -79,17 +81,18 @@ type activeDownload struct {
 
 // Engine runs the background workers.
 type Engine struct {
-	store      *store.Store
-	torbox     TorBoxAPI
-	maxSlots   int
-	pollEvery  time.Duration
-	failAfter  time.Duration
-	stallAfter time.Duration
-	parallel   int
-	incomplete string
-	cacheCheck bool
-	httpClient *http.Client
-	log        *slog.Logger
+	store            *store.Store
+	torbox           TorBoxAPI
+	maxSlots         int
+	pollEvery        time.Duration
+	failAfter        time.Duration
+	stallAfter       time.Duration
+	cachedStallAfter time.Duration
+	parallel         int
+	incomplete       string
+	cacheCheck       bool
+	httpClient       *http.Client
+	log              *slog.Logger
 
 	mu             sync.Mutex
 	activeDownload *activeDownload
@@ -126,6 +129,11 @@ func New(st *store.Store, tb TorBoxAPI, cfg Config, log *slog.Logger) *Engine {
 	if cfg.StallTimeout == 0 {
 		cfg.StallTimeout = defaultStallTimeout
 	}
+	// Same convention for the cached-release grace: 0 = unset → default; negative
+	// disables it (cached releases then never stall-fail).
+	if cfg.CachedStallTimeout == 0 {
+		cfg.CachedStallTimeout = defaultCachedStallTimeout
+	}
 	if cfg.ParallelFiles < 1 {
 		cfg.ParallelFiles = defaultParallelFiles
 	}
@@ -133,15 +141,16 @@ func New(st *store.Store, tb TorBoxAPI, cfg Config, log *slog.Logger) *Engine {
 		cfg.IncompleteSubdir = defaultIncompleteSubdir
 	}
 	return &Engine{
-		store:      st,
-		torbox:     tb,
-		maxSlots:   cfg.MaxSlots,
-		pollEvery:  cfg.PollInterval,
-		failAfter:  cfg.FailTimeout,
-		stallAfter: cfg.StallTimeout,
-		parallel:   cfg.ParallelFiles,
-		incomplete: cfg.IncompleteSubdir,
-		cacheCheck: cfg.CacheCheck,
+		store:            st,
+		torbox:           tb,
+		maxSlots:         cfg.MaxSlots,
+		pollEvery:        cfg.PollInterval,
+		failAfter:        cfg.FailTimeout,
+		stallAfter:       cfg.StallTimeout,
+		cachedStallAfter: cfg.CachedStallTimeout,
+		parallel:         cfg.ParallelFiles,
+		incomplete:       cfg.IncompleteSubdir,
+		cacheCheck:       cfg.CacheCheck,
 		// No client timeout: downloads can be long; cancellation is via ctx.
 		httpClient: &http.Client{},
 		log:        log,
@@ -154,7 +163,8 @@ func New(st *store.Store, tb TorBoxAPI, cfg Config, log *slog.Logger) *Engine {
 func (e *Engine) Run(ctx context.Context) {
 	e.log.Info("engine started",
 		"max_active_slots", e.maxSlots, "poll_interval", e.pollEvery,
-		"stall_timeout", e.stallAfter, "fail_timeout", e.failAfter, "parallel_files", e.parallel)
+		"stall_timeout", e.stallAfter, "cached_stall_timeout", e.cachedStallAfter,
+		"fail_timeout", e.failAfter, "parallel_files", e.parallel)
 
 	// Rebuild in-memory state from SQLite + TorBox: re-sync active torrents
 	// and recover any content already finalized on disk.

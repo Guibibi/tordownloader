@@ -84,19 +84,20 @@ func run() error {
 	// TorBox client + engine submitter (slot-gated createtorrent).
 	tbClient := torbox.New(cfg.TorBox.APIKey, torbox.WithBaseURL(cfg.TorBox.BaseURL))
 	eng := engine.New(st, tbClient, engine.Config{
-		MaxSlots:         cfg.TorBox.MaxActiveSlots,
-		PollInterval:     cfg.TorBox.PollInterval.Std(),
-		FailTimeout:      cfg.Failure.Timeout.Std(),
-		StallTimeout:     cfg.Failure.StallTimeout.Std(),
-		ParallelFiles:    cfg.Download.ParallelFiles,
-		IncompleteSubdir: cfg.Download.IncompleteSubdir,
-		CacheCheck:       cfg.TorBox.CacheCheck,
+		MaxSlots:           cfg.TorBox.MaxActiveSlots,
+		PollInterval:       cfg.TorBox.PollInterval.Std(),
+		FailTimeout:        cfg.Failure.Timeout.Std(),
+		StallTimeout:       cfg.Failure.StallTimeout.Std(),
+		CachedStallTimeout: cfg.Failure.CachedStallTimeout.Std(),
+		ParallelFiles:      cfg.Download.ParallelFiles,
+		IncompleteSubdir:   cfg.Download.IncompleteSubdir,
+		CacheCheck:         cfg.TorBox.CacheCheck,
 	}, slog.Default())
 	go eng.Run(ctx)
 
 	srv := &http.Server{
 		Addr:    cfg.Server.ListenAddr,
-		Handler: qbit.New(st, cfg.Download.Root, cfg.Failure.StallTimeout.Std(), eng.DeleteTorrent, slog.Default()).Routes(),
+		Handler: qbit.New(st, cfg.Download.Root, cfg.Failure.StallTimeout.Std(), cfg.Failure.CachedStallTimeout.Std(), eng.DeleteTorrent, slog.Default()).Routes(),
 		// Bound the header-read phase so a slow/stalled client can't pin a
 		// connection open indefinitely (Slowloris). Handlers themselves are
 		// quick, so no ReadTimeout/WriteTimeout that could truncate a response.

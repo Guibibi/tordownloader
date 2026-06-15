@@ -37,6 +37,11 @@ type Handler struct {
 	// stall-failing is disabled, and no countdown is shown.
 	stallTimeout time.Duration
 
+	// cachedStallTimeout mirrors the engine's failure.cached_stall_timeout: the
+	// longer grace a cached release gets while TorBox surfaces it. The dashboard
+	// uses it for the countdown on cached torrents. 0 disables it for them.
+	cachedStallTimeout time.Duration
+
 	// deleteFn is called to remove a torrent end-to-end: TorBox deletion,
 	// local file cleanup, and DB drop. When nil, the handler falls back to
 	// store.DeleteByHashes (DB-only removal, for testing).
@@ -44,21 +49,24 @@ type Handler struct {
 }
 
 // New builds a Handler. root is the download root reported in app/preferences
-// and used as the base for category save paths. stallTimeout mirrors the
-// engine's failure.stall_timeout so the dashboard can show a stall countdown (0
-// disables it). deleteFn is the engine's delete function; when nil the handler
-// falls back to store-level DB-only deletion (useful in tests).
-func New(st *store.Store, root string, stallTimeout time.Duration, deleteFn engine.DeleteFunc, log *slog.Logger) *Handler {
+// and used as the base for category save paths. stallTimeout and
+// cachedStallTimeout mirror the engine's failure.stall_timeout /
+// failure.cached_stall_timeout so the dashboard can show the right stall
+// countdown per torrent (0 disables it). deleteFn is the engine's delete
+// function; when nil the handler falls back to store-level DB-only deletion
+// (useful in tests).
+func New(st *store.Store, root string, stallTimeout, cachedStallTimeout time.Duration, deleteFn engine.DeleteFunc, log *slog.Logger) *Handler {
 	if log == nil {
 		log = slog.Default()
 	}
 	return &Handler{
-		store:        st,
-		root:         root,
-		stallTimeout: stallTimeout,
-		deleteFn:     deleteFn,
-		httpClient:   &http.Client{Timeout: 30 * time.Second},
-		log:          log,
+		store:              st,
+		root:               root,
+		stallTimeout:       stallTimeout,
+		cachedStallTimeout: cachedStallTimeout,
+		deleteFn:           deleteFn,
+		httpClient:         &http.Client{Timeout: 30 * time.Second},
+		log:                log,
 	}
 }
 

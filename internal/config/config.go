@@ -61,6 +61,12 @@ type FailureConfig struct {
 	// slow but advancing download keeps resetting the clock and is never failed for
 	// being slow. A non-positive value disables stall detection.
 	StallTimeout Duration `yaml:"stall_timeout"`
+	// CachedStallTimeout is the stall grace for a release TorBox reported as cached.
+	// Such a release sits at 0% only while TorBox materialises bytes it already has,
+	// not because peers are dead, so it gets a longer grace than StallTimeout — but
+	// still bounded, as a safety net if the hand-off is genuinely broken. A
+	// non-positive value disables stall-failing for cached releases.
+	CachedStallTimeout Duration `yaml:"cached_stall_timeout"`
 }
 
 // LogConfig configures structured logging.
@@ -85,7 +91,7 @@ func Default() *Config {
 			ParallelFiles:    4,
 		},
 		Database: DatabaseConfig{Path: "data/tordownloader.db"},
-		Failure:  FailureConfig{Timeout: 0, StallTimeout: Duration(10 * time.Minute)},
+		Failure:  FailureConfig{Timeout: 0, StallTimeout: Duration(10 * time.Minute), CachedStallTimeout: Duration(30 * time.Minute)},
 		Log:      LogConfig{Level: "info", Format: "text"},
 	}
 }

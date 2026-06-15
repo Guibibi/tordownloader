@@ -132,9 +132,11 @@ function bar(t) {
   </div>`;
 }
 
-// Module-level mirror of the configured failure.stall_timeout (seconds), set on
-// each poll. 0 disables the stall countdown.
+// Module-level mirrors of the configured stall timeouts (seconds), set on each
+// poll. 0 disables the corresponding countdown. Cached releases get the longer
+// cachedStallTimeout (they're only waiting for TorBox to surface bytes it has).
 let stallTimeout = 0;
+let cachedStallTimeout = 0;
 
 // Hashes whose per-file breakdown is expanded, and a cache of the last rendered
 // file list per hash so re-renders (every poll) don't flash a loading state.
@@ -167,11 +169,13 @@ async function loadFiles(hash) {
 // on TorBox, or stall-failing disabled). A 60s grace avoids flagging brand-new
 // or just-advanced torrents.
 function stallRemaining(t) {
-  if (t.phase !== "torbox" || stallTimeout <= 0) return null;
+  if (t.phase !== "torbox") return null;
+  const timeout = t.cached ? cachedStallTimeout : stallTimeout;
+  if (timeout <= 0) return null;
   if (t.torbox_state === "queued" || t.dlspeed > 0 || !t.progress_at) return null;
   const elapsed = Math.floor(Date.now()/1000) - t.progress_at;
   if (elapsed < 60) return null;
-  return stallTimeout - elapsed;
+  return timeout - elapsed;
 }
 
 function card(t) {
@@ -255,6 +259,7 @@ async function tick() {
     document.getElementById("ver").textContent = d.version || "";
     document.getElementById("speed").textContent = fmtSpeed(d.dlspeed) || "0 B/s";
     stallTimeout = d.stall_timeout || 0;
+    cachedStallTimeout = d.cached_stall_timeout || 0;
     const ts = d.torrents || [];
     const active = ts.filter(t => t.phase === "torbox" || t.phase === "local").length;
     const done = ts.filter(t => t.phase === "done").length;
