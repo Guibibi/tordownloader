@@ -1,6 +1,7 @@
 // Package torbox is a thin client for the TorBox API: the few endpoints
 // tordownloader needs (createtorrent, mylist, checkcached, requestdl,
-// controltorrent), with bearer auth and rate-limit/backoff handling.
+// controltorrent, controlqueued), with bearer auth and rate-limit/backoff
+// handling.
 //
 // Rate limits to respect (TorBox): general 300/min, createtorrent 60/hour.
 // This client retries 429/5xx with exponential backoff honoring Retry-After.
@@ -239,6 +240,29 @@ func (c *Client) ControlTorrent(ctx context.Context, torrentID int, op Operation
 // DeleteTorrent removes a torrent (and its data) from the TorBox account.
 func (c *Client) DeleteTorrent(ctx context.Context, torrentID int) error {
 	return c.ControlTorrent(ctx, torrentID, OpDelete)
+}
+
+// ControlQueued performs an operation (delete) on a *queued* download — one
+// TorBox accepted but hasn't promoted into an active slot yet. Queued downloads
+// live in a separate namespace from active torrents: their queued_id is not a
+// torrent_id, so controltorrent (and the web UI's delete) won't touch them. They
+// must be removed through this dedicated endpoint instead.
+func (c *Client) ControlQueued(ctx context.Context, queuedID int, op Operation) error {
+	body, err := json.Marshal(map[string]any{
+		"queued_id": queuedID,
+		"operation": string(op),
+		"type":      "torrent",
+	})
+	if err != nil {
+		return err
+	}
+	_, err = c.do(ctx, http.MethodPost, "queued/controlqueued", nil, body, "application/json", true)
+	return err
+}
+
+// DeleteQueued removes a queued download from the TorBox account.
+func (c *Client) DeleteQueued(ctx context.Context, queuedID int) error {
+	return c.ControlQueued(ctx, queuedID, OpDelete)
 }
 
 // do performs an HTTP request to the TorBox API with retries on 429/5xx, parses

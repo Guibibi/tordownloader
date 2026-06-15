@@ -15,6 +15,7 @@ type Torrent struct {
 	ID             int64
 	Infohash       string
 	TorBoxID       sql.NullInt64
+	TorBoxQueuedID sql.NullInt64
 	Name           string
 	Category       string
 	SavePath       string
@@ -60,7 +61,7 @@ type TorrentFilter struct {
 	Hashes []string
 }
 
-const torrentColumns = `id, infohash, torbox_id, name, category, save_path, content_path,
+const torrentColumns = `id, infohash, torbox_id, torbox_queued_id, name, category, save_path, content_path,
 	size, state, torbox_state, torbox_progress, local_progress, dlspeed,
 	seeds, peers, eta, cached, error,
 	added_on, active_since, progress_at, completed_on, created_at, updated_at`
@@ -68,7 +69,7 @@ const torrentColumns = `id, infohash, torbox_id, name, category, save_path, cont
 func scanTorrent(s interface{ Scan(...any) error }) (Torrent, error) {
 	var t Torrent
 	err := s.Scan(
-		&t.ID, &t.Infohash, &t.TorBoxID, &t.Name, &t.Category, &t.SavePath, &t.ContentPath,
+		&t.ID, &t.Infohash, &t.TorBoxID, &t.TorBoxQueuedID, &t.Name, &t.Category, &t.SavePath, &t.ContentPath,
 		&t.Size, &t.State, &t.TorBoxState, &t.TorBoxProgress, &t.LocalProgress, &t.DLSpeed,
 		&t.Seeds, &t.Peers, &t.ETA, &t.Cached, &t.Error,
 		&t.AddedOn, &t.ActiveSince, &t.ProgressAt, &t.CompletedOn, &t.CreatedAt, &t.UpdatedAt,

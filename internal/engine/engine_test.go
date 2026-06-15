@@ -23,6 +23,7 @@ type fakeTB struct {
 	get   func(id int) (*torbox.Torrent, error)
 	dl    func(p torbox.RequestDLParams) (string, error)
 	ctl   func(torrentID int, op torbox.Operation) error
+	ctlq  func(queuedID int, op torbox.Operation) error
 	cache func(hashes []string) (map[string]torbox.CachedInfo, error)
 }
 
@@ -67,6 +68,15 @@ func (f *fakeTB) ControlTorrent(_ context.Context, torrentID int, op torbox.Oper
 		return nil
 	}
 	return f.ctl(torrentID, op)
+}
+
+func (f *fakeTB) ControlQueued(_ context.Context, queuedID int, op torbox.Operation) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.ctlq == nil {
+		return nil
+	}
+	return f.ctlq(queuedID, op)
 }
 
 func (f *fakeTB) CheckCached(_ context.Context, hashes []string, _ bool) (map[string]torbox.CachedInfo, error) {
@@ -344,8 +354,13 @@ func TestSubmitQueuedResultMarksQueued(t *testing.T) {
 	if tr.TorBoxState != "queued" {
 		t.Errorf("torbox_state = %q, want queued", tr.TorBoxState)
 	}
-	if !tr.TorBoxID.Valid || tr.TorBoxID.Int64 != int64(qid) {
-		t.Errorf("torbox_id = %v, want %d", tr.TorBoxID, qid)
+	// The queued_id is tracked in its own column, NOT torbox_id (a different
+	// namespace): controltorrent can't delete a queued download.
+	if !tr.TorBoxQueuedID.Valid || tr.TorBoxQueuedID.Int64 != int64(qid) {
+		t.Errorf("torbox_queued_id = %v, want %d", tr.TorBoxQueuedID, qid)
+	}
+	if tr.TorBoxID.Valid {
+		t.Errorf("torbox_id = %v, want NULL for a queued download", tr.TorBoxID)
 	}
 }
 
@@ -612,6 +627,80 @@ func TestDeleteTorrentNoTorBoxID(t *testing.T) {
 	// DB row is gone.
 	if _, ok, _ := st.GetTorrent(context.Background(), hash); ok {
 		t.Error("torrent still in DB after delete")
+	}
+}
+
+func TestDeleteTorrentQueuedUsesControlQueued(t *testing.T) {
+	// A torrent still parked in TorBox's queue must be removed via controlqueued
+	// (queued_id), not controltorrent — its queued_id is a separate namespace.
+	st := newStore(t)
+	ctx := context.Background()
+	hash := "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+	tr, _, err := st.AddTorrent(ctx, store.AddTorrentParams{Infohash: hash, Name: "show"})
+	if err != nil {
+		t.Fatalf("add: %v", err)
+	}
+	if err := st.MarkQueued(ctx, tr.ID, 7777); err != nil {
+		t.Fatalf("mark queued: %v", err)
+	}
+
+	var ctlCalled, ctlqCalled, gotQueuedID int
+	var gotOp torbox.Operation
+	tb := &fakeTB{
+		ctl:  func(int, torbox.Operation) error { ctlCalled++; return nil },
+		ctlq: func(id int, op torbox.Operation) error { ctlqCalled++; gotQueuedID = id; gotOp = op; return nil },
+	}
+	e := New(st, tb, Config{MaxSlots: 1}, nil)
+
+	if err := e.DeleteTorrent(ctx, hash, true); err != nil {
+		t.Fatalf("DeleteTorrent: %v", err)
+	}
+	if ctlCalled != 0 {
+		t.Errorf("ControlTorrent called %d times, want 0 (queued, not active)", ctlCalled)
+	}
+	if ctlqCalled != 1 || gotQueuedID != 7777 || gotOp != torbox.OpDelete {
+		t.Errorf("ControlQueued calls=%d id=%d op=%q, want 1 delete on id 7777", ctlqCalled, gotQueuedID, gotOp)
+	}
+	if _, ok, _ := st.GetTorrent(ctx, hash); ok {
+		t.Error("torrent still in DB after delete")
+	}
+}
+
+func TestFailQueuedUsesControlQueued(t *testing.T) {
+	// When a still-queued torrent is failed, cleanup targets controlqueued so the
+	// queued download is actually removed (the bug that orphaned 62 downloads).
+	st := newStore(t)
+	ctx := context.Background()
+	hash := "ffffffffffffffffffffffffffffffffffffffff"
+	tr, _, err := st.AddTorrent(ctx, store.AddTorrentParams{Infohash: hash, Name: "show"})
+	if err != nil {
+		t.Fatalf("add: %v", err)
+	}
+	if err := st.MarkQueued(ctx, tr.ID, 8888); err != nil {
+		t.Fatalf("mark queued: %v", err)
+	}
+	tr, _, err = st.GetTorrent(ctx, hash)
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+
+	var ctlCalled, ctlqCalled, gotQueuedID int
+	tb := &fakeTB{
+		ctl:  func(int, torbox.Operation) error { ctlCalled++; return nil },
+		ctlq: func(id int, _ torbox.Operation) error { ctlqCalled++; gotQueuedID = id; return nil },
+	}
+	e := New(st, tb, Config{MaxSlots: 1}, nil)
+
+	e.fail(ctx, tr, "stalled in queue")
+
+	if ctlCalled != 0 {
+		t.Errorf("ControlTorrent called %d times, want 0 (queued, not active)", ctlCalled)
+	}
+	if ctlqCalled != 1 || gotQueuedID != 8888 {
+		t.Errorf("ControlQueued calls=%d id=%d, want 1 on id 8888", ctlqCalled, gotQueuedID)
+	}
+	if got := countState(t, st, store.StateError); got != 1 {
+		t.Errorf("error state = %d, want 1", got)
 	}
 }
 

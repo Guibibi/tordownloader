@@ -102,6 +102,25 @@ func (s *Store) MarkActive(ctx context.Context, id int64, torboxID int) error {
 	return nil
 }
 
+// MarkQueued records a createtorrent that TorBox parked in its own queue
+// (returned a queued_id, no torrent id — happens when the account's active slots
+// are full). It transitions to TORBOX_ACTIVE with torbox_state='queued' and
+// stores the queued_id in its own column (NOT torbox_id, which is a different
+// namespace and needs the controlqueued endpoint to delete). The active_since /
+// progress_at clocks are seeded so the stall timer is sane once it activates.
+func (s *Store) MarkQueued(ctx context.Context, id int64, queuedID int) error {
+	now := time.Now().Unix()
+	_, err := s.db.ExecContext(ctx, `
+		UPDATE torrents SET torbox_queued_id = ?, state = ?, torbox_state = ?,
+			active_since = ?, progress_at = ?, updated_at = ?
+		WHERE id = ?`,
+		queuedID, StateTorBoxActive, "queued", now, now, now, id)
+	if err != nil {
+		return fmt.Errorf("mark queued %d: %w", id, err)
+	}
+	return nil
+}
+
 // SetTorBoxCached records whether TorBox already had the content when we
 // submitted it (an instant cache hit vs a server-side fetch). It is a
 // submit-time fact, written once; the per-pass status update never touches it.
@@ -122,11 +141,13 @@ func (s *Store) SetTorBoxCached(ctx context.Context, id int64, cached bool) erro
 // UpdateTorBoxID changes the operational TorBox id for a torrent without
 // touching its state or clocks. Used when a torrent is re-matched by infohash
 // under a new id (e.g. promoted from TorBox's queue). Only touches TORBOX_ACTIVE
-// rows so a concurrent transition isn't clobbered.
+// rows so a concurrent transition isn't clobbered. Adopting a real torrent id
+// also clears torbox_queued_id: the queued entry was consumed when it activated,
+// so cleanup must target the torrent id from here on.
 func (s *Store) UpdateTorBoxID(ctx context.Context, id int64, torboxID int) error {
 	now := time.Now().Unix()
 	_, err := s.db.ExecContext(ctx, `
-		UPDATE torrents SET torbox_id = ?, updated_at = ? WHERE id = ? AND state = ?`,
+		UPDATE torrents SET torbox_id = ?, torbox_queued_id = NULL, updated_at = ? WHERE id = ? AND state = ?`,
 		torboxID, now, id, StateTorBoxActive)
 	if err != nil {
 		return fmt.Errorf("update torbox id %d: %w", id, err)

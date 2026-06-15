@@ -54,6 +54,7 @@ type TorBoxAPI interface {
 	GetTorrent(ctx context.Context, id int, bypassCache bool) (*torbox.Torrent, error)
 	RequestDL(ctx context.Context, p torbox.RequestDLParams) (string, error)
 	ControlTorrent(ctx context.Context, torrentID int, op torbox.Operation) error
+	ControlQueued(ctx context.Context, queuedID int, op torbox.Operation) error
 	CheckCached(ctx context.Context, hashes []string, listFiles bool) (map[string]torbox.CachedInfo, error)
 }
 
@@ -293,36 +294,44 @@ func (e *Engine) submit(ctx context.Context, t store.Torrent) bool {
 	// A successful create means the quota has room again; clear any cooldown.
 	e.createCooldownUntil = time.Time{}
 
-	id := torboxID(res)
-	if id == 0 {
+	// TorBox may queue the submission (returns a queued id, no torrent id) when the
+	// account's active-download slots are full. A queued download lives in its own
+	// namespace — its queued_id is not a torrent_id — so record it separately and
+	// mark the torrent queued. It isn't in mylist yet; the reconciler waits for it
+	// to activate (matched by hash) instead of treating its absence as "vanished".
+	switch {
+	case res.TorrentID != nil:
+		if err := e.store.MarkActive(ctx, t.ID, *res.TorrentID); err != nil {
+			e.log.Error("mark active", "infohash", t.Infohash, "err", err)
+			return false
+		}
+		e.recordCacheHit(ctx, t, cached)
+		e.log.Info("submitted to TorBox", "infohash", t.Infohash, "torbox_id", *res.TorrentID, "name", t.Name)
+		return true
+	case res.QueuedID != nil:
+		if err := e.store.MarkQueued(ctx, t.ID, *res.QueuedID); err != nil {
+			e.log.Error("mark torbox-queued", "infohash", t.Infohash, "err", err)
+			return false
+		}
+		e.recordCacheHit(ctx, t, cached)
+		e.log.Info("queued on TorBox; waiting for an active slot",
+			"infohash", t.Infohash, "queued_id", *res.QueuedID, "name", t.Name)
+		return true
+	default:
 		e.fail(ctx, t, "createtorrent returned no torrent id")
 		return true
 	}
-	if err := e.store.MarkActive(ctx, t.ID, id); err != nil {
-		e.log.Error("mark active", "infohash", t.Infohash, "err", err)
-		return false
+}
+
+// recordCacheHit persists whether TorBox already had the content at submit time,
+// when cache checking is enabled. Errors are logged, not propagated.
+func (e *Engine) recordCacheHit(ctx context.Context, t store.Torrent, cached bool) {
+	if !e.cacheCheck {
+		return
 	}
-	if e.cacheCheck {
-		if err := e.store.SetTorBoxCached(ctx, t.ID, cached); err != nil {
-			e.log.Error("record cache status", "infohash", t.Infohash, "err", err)
-		}
+	if err := e.store.SetTorBoxCached(ctx, t.ID, cached); err != nil {
+		e.log.Error("record cache status", "infohash", t.Infohash, "err", err)
 	}
-	// TorBox may queue the submission (returns a queued id, no torrent id) when the
-	// account's active-download slots are full. Such a torrent isn't in mylist yet;
-	// mark it queued so the reconciler waits for it to activate (matched by hash)
-	// instead of treating its absence as "vanished".
-	if res.TorrentID == nil && res.QueuedID != nil {
-		if err := e.store.UpdateTorBoxStatus(ctx, t.ID, store.TorBoxStatus{
-			State: torboxQueued, Advancing: true,
-		}); err != nil {
-			e.log.Error("mark torbox-queued", "infohash", t.Infohash, "err", err)
-		}
-		e.log.Info("queued on TorBox; waiting for an active slot",
-			"infohash", t.Infohash, "queued_id", id, "name", t.Name)
-		return true
-	}
-	e.log.Info("submitted to TorBox", "infohash", t.Infohash, "torbox_id", id, "name", t.Name)
-	return true
 }
 
 // cacheStatus reports whether TorBox already has the content for infohash. It
@@ -351,36 +360,37 @@ func (e *Engine) fail(ctx context.Context, t store.Torrent, reason string) {
 	e.log.Warn("torrent failed", "infohash", t.Infohash, "reason", reason)
 
 	// Best-effort: remove the abandoned torrent from TorBox so failed grabs don't
-	// pile up in the library. Only when we actually created it (have a TorBox id);
-	// a pre-submit failure never created anything, and a vanished torrent is
-	// already gone (the delete just no-ops). Bounded and detached from the pass
-	// context so the cleanup still runs if the engine is shutting down.
-	if t.TorBoxID.Valid {
-		delCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
-		if err := e.torbox.ControlTorrent(delCtx, int(t.TorBoxID.Int64), torbox.OpDelete); err != nil {
-			e.log.Warn("TorBox delete after failure (continuing)",
-				"infohash", t.Infohash, "torbox_id", t.TorBoxID.Int64, "err", err)
-		}
-		cancel()
-	}
+	// pile up in the library. A pre-submit failure never created anything, and a
+	// vanished torrent is already gone (the delete just no-ops). Bounded and
+	// detached from the pass context so the cleanup still runs if the engine is
+	// shutting down.
+	delCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
+	e.removeFromTorBox(delCtx, t)
+	cancel()
 
 	if err := e.store.MarkError(ctx, t.ID, reason); err != nil {
 		e.log.Error("mark error", "infohash", t.Infohash, "err", err)
 	}
 }
 
-// torboxID picks the operational id from a createtorrent result, preferring the
-// active torrent id over a queued id.
-func torboxID(res *torbox.CreateTorrentResult) int {
+// removeFromTorBox best-effort deletes a torrent from the TorBox account,
+// targeting the correct endpoint for its lifecycle stage: an active torrent goes
+// through controltorrent (torrent_id), while one still parked in TorBox's queue
+// goes through controlqueued (queued_id) — its queued_id is a separate namespace
+// that controltorrent does not touch. A torrent never submitted (no id of either
+// kind) is a no-op. Errors are logged, not propagated.
+func (e *Engine) removeFromTorBox(ctx context.Context, t store.Torrent) {
 	switch {
-	case res == nil:
-		return 0
-	case res.TorrentID != nil:
-		return *res.TorrentID
-	case res.QueuedID != nil:
-		return *res.QueuedID
-	default:
-		return 0
+	case t.TorBoxID.Valid:
+		if err := e.torbox.ControlTorrent(ctx, int(t.TorBoxID.Int64), torbox.OpDelete); err != nil {
+			e.log.Warn("TorBox delete (continuing)",
+				"infohash", t.Infohash, "torbox_id", t.TorBoxID.Int64, "err", err)
+		}
+	case t.TorBoxQueuedID.Valid:
+		if err := e.torbox.ControlQueued(ctx, int(t.TorBoxQueuedID.Int64), torbox.OpDelete); err != nil {
+			e.log.Warn("TorBox queued delete (continuing)",
+				"infohash", t.Infohash, "queued_id", t.TorBoxQueuedID.Int64, "err", err)
+		}
 	}
 }
 
@@ -419,13 +429,9 @@ func (e *Engine) DeleteTorrent(ctx context.Context, infohash string, deleteFiles
 	}
 
 	// 3. Delete from TorBox (best-effort: if the call fails we still clean up
-	//    locally — the torrent will naturally expire on TorBox).
-	if t.TorBoxID.Valid {
-		if err := e.torbox.ControlTorrent(ctx, int(t.TorBoxID.Int64), torbox.OpDelete); err != nil {
-			e.log.Warn("TorBox delete failed (continuing with local cleanup)",
-				"infohash", infohash, "torbox_id", t.TorBoxID.Int64, "err", err)
-		}
-	}
+	//    locally — the torrent will naturally expire on TorBox). Routes to the
+	//    active or queued endpoint depending on the torrent's stage.
+	e.removeFromTorBox(ctx, t)
 
 	// 4. Remove local files when the caller requested it (Sonarr passes
 	//    deleteFiles=true after importing, keeping /downloads clean).

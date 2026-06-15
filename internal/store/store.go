@@ -18,7 +18,8 @@ const schema = `
 CREATE TABLE IF NOT EXISTS torrents (
   id              INTEGER PRIMARY KEY AUTOINCREMENT,
   infohash        TEXT    NOT NULL UNIQUE,      -- lowercase 40-hex; the key Sonarr tracks
-  torbox_id       INTEGER,                      -- TorBox's torrent id (operational handle)
+  torbox_id       INTEGER,                      -- TorBox's torrent id (operational handle, once active)
+  torbox_queued_id INTEGER,                     -- TorBox queued-download id while waiting for a slot (separate from torbox_id)
   name            TEXT    NOT NULL DEFAULT '',
   category        TEXT    NOT NULL DEFAULT '',
   save_path       TEXT    NOT NULL DEFAULT '',
@@ -110,6 +111,7 @@ func (s *Store) migrate(ctx context.Context) error {
 	// Additive column migrations for databases created before these columns
 	// existed. CREATE TABLE IF NOT EXISTS won't add columns to an existing table.
 	cols := []struct{ table, column, ddl string }{
+		{"torrents", "torbox_queued_id", "INTEGER"},
 		{"torrents", "magnet", "TEXT NOT NULL DEFAULT ''"},
 		{"torrents", "source_blob", "BLOB"},
 		{"torrents", "progress_at", "INTEGER NOT NULL DEFAULT 0"},
