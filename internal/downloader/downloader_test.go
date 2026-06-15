@@ -150,6 +150,64 @@ func TestDownloadReRequestsExpiredLink(t *testing.T) {
 	}
 }
 
+func TestDownloadRetriesTransientStatus(t *testing.T) {
+	// Shrink the backoff so the retry path runs instantly.
+	oldBase, oldMax := retryBaseDelay, retryMaxDelay
+	retryBaseDelay, retryMaxDelay = time.Millisecond, time.Millisecond
+	defer func() { retryBaseDelay, retryMaxDelay = oldBase, oldMax }()
+
+	data := bytes.Repeat([]byte("q"), 300)
+	var hits int32
+	mux := http.NewServeMux()
+	// First two GETs blip with a transient 400 (the real-world failure: a CDN
+	// link returning 400 mid-fetch); the third succeeds.
+	mux.HandleFunc("/f", func(w http.ResponseWriter, r *http.Request) {
+		if atomic.AddInt32(&hits, 1) <= 2 {
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		http.ServeContent(w, r, "file", time.Time{}, bytes.NewReader(data))
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	var calls int32
+	link := func(context.Context, int) (string, error) {
+		atomic.AddInt32(&calls, 1)
+		return srv.URL + "/f", nil
+	}
+	dir := t.TempDir()
+	dest := filepath.Join(dir, "f.bin")
+	if err := Download(context.Background(), []File{{Dest: dest, Size: int64(len(data))}}, link, Options{}); err != nil {
+		t.Fatalf("Download: %v", err)
+	}
+	assertFile(t, dest, data)
+	if calls < 3 {
+		t.Errorf("link requested %d times, want >= 3 (re-request after each transient 400)", calls)
+	}
+}
+
+func TestDownloadFailsAfterPersistentTransient(t *testing.T) {
+	// Always-400 link: exhausts retries and returns an error (a genuinely dead
+	// file should still fail the torrent so Sonarr blacklists the release).
+	oldBase, oldMax := retryBaseDelay, retryMaxDelay
+	retryBaseDelay, retryMaxDelay = time.Millisecond, time.Millisecond
+	defer func() { retryBaseDelay, retryMaxDelay = oldBase, oldMax }()
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusBadRequest)
+	}))
+	defer srv.Close()
+
+	dir := t.TempDir()
+	err := Download(context.Background(),
+		[]File{{Dest: filepath.Join(dir, "f.bin"), Size: 100}},
+		staticLink(srv.URL+"/f"), Options{})
+	if err == nil {
+		t.Fatal("expected an error after exhausting transient retries")
+	}
+}
+
 func TestFinalizeSingleFolder(t *testing.T) {
 	dir := t.TempDir()
 	staging := filepath.Join(dir, ".incomplete", "hash")

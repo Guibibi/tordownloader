@@ -20,17 +20,31 @@ import (
 
 const (
 	// maxLinkRetries bounds how many times one file re-requests a fresh CDN link
-	// (links expire ~3h) before giving up.
-	maxLinkRetries          = 3
+	// (links expire ~3h, and the CDN occasionally returns transient 4xx/5xx)
+	// before giving up. With the backoff schedule below a genuinely-dead file
+	// still fails within ~1-2 minutes.
+	maxLinkRetries          = 5
 	defaultProgressInterval = time.Second
+)
+
+// retryBaseDelay/retryMaxDelay shape the exponential backoff between attempts on
+// a transient CDN error, so a 429 (rate limit) isn't burned through instantly.
+// Expired-link and range-reset retries don't back off — they're expected, not
+// transient. They are vars (not consts) so tests can shrink them.
+var (
+	retryBaseDelay = 2 * time.Second
+	retryMaxDelay  = 30 * time.Second
 )
 
 // errExpiredLink signals that a CDN link was rejected (expired/unauthorized) and
 // the file should be retried with a freshly requested link. errRangeReset
-// signals a partial file must be re-fetched from the start.
+// signals a partial file must be re-fetched from the start. errTransient signals
+// a transient CDN failure (e.g. 400/429/5xx) worth retrying with a fresh link
+// after a backoff rather than failing the whole torrent over one blip.
 var (
 	errExpiredLink = errors.New("download link expired")
 	errRangeReset  = errors.New("range reset required")
+	errTransient   = errors.New("transient download error")
 )
 
 // LinkFunc returns a fresh, time-limited CDN URL for the given TorBox file id.
@@ -176,6 +190,16 @@ func fetch(ctx context.Context, client *http.Client, f File, link LinkFunc, down
 		switch {
 		case err == nil:
 			return nil
+		case errors.Is(err, errTransient):
+			lastErr = err
+			// Back off before re-requesting, so a rate-limit (429) or flapping
+			// CDN gets a chance to recover instead of burning every retry at once.
+			if attempt < maxLinkRetries {
+				if werr := backoff(ctx, attempt); werr != nil {
+					return werr
+				}
+			}
+			continue
 		case errors.Is(err, errExpiredLink), errors.Is(err, errRangeReset):
 			lastErr = err
 			continue // re-request a link and (for range reset) restart from 0
@@ -184,6 +208,23 @@ func fetch(ctx context.Context, client *http.Client, f File, link LinkFunc, down
 		}
 	}
 	return lastErr
+}
+
+// backoff sleeps for an exponentially growing delay (capped) before the next
+// retry attempt, returning early if the context is cancelled.
+func backoff(ctx context.Context, attempt int) error {
+	d := retryBaseDelay << attempt
+	if d > retryMaxDelay || d <= 0 {
+		d = retryMaxDelay
+	}
+	t := time.NewTimer(d)
+	defer t.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-t.C:
+		return nil
+	}
 }
 
 // downloadOnce performs a single GET, resuming via Range from the current
@@ -224,6 +265,8 @@ func downloadOnce(ctx context.Context, client *http.Client, url string, f File, 
 		return errRangeReset
 	case isExpiredStatus(resp.StatusCode):
 		return errExpiredLink
+	case isTransientStatus(resp.StatusCode):
+		return fmt.Errorf("%w: http %d", errTransient, resp.StatusCode)
 	default:
 		return fmt.Errorf("unexpected http status %d", resp.StatusCode)
 	}
@@ -300,6 +343,19 @@ func isExpiredStatus(code int) bool {
 	default:
 		return false
 	}
+}
+
+// isTransientStatus reports whether an HTTP status is a transient CDN failure
+// worth retrying with a fresh link (after backoff) rather than failing the whole
+// torrent. Covers bad-request blips, timeouts, too-early, rate limits, and any
+// server-side 5xx. Real qBittorrent CDN links occasionally return 400 mid-fetch.
+func isTransientStatus(code int) bool {
+	switch code {
+	case http.StatusBadRequest, http.StatusRequestTimeout,
+		http.StatusTooEarly, http.StatusTooManyRequests:
+		return true
+	}
+	return code >= 500 && code <= 599
 }
 
 // countWriter tallies bytes written into an atomic total for progress reporting.
