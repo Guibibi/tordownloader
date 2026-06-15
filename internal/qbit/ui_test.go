@@ -1,10 +1,12 @@
 package qbit
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/guibibi/tordownloader/internal/store"
 )
@@ -94,5 +96,36 @@ func TestUITorrentsTorBoxPhaseFields(t *testing.T) {
 	}
 	if !ut.Cached {
 		t.Errorf("cached = false, want true")
+	}
+}
+
+func TestUITorrentsStallCountdownPayload(t *testing.T) {
+	srv, st := newTestServer(t) // newTestServer configures a 10m stall timeout.
+	id := seedTorrent(t, st, store.Torrent{
+		Infohash: strings.Repeat("c", 40), Name: "Stalling", Size: 1000,
+		State: store.StateTorBoxActive, TorBoxProgress: 0.1,
+	})
+	// A frozen stall clock from 8 minutes ago.
+	froze := time.Now().Add(-8 * time.Minute).Unix()
+	if _, err := st.DB().ExecContext(context.Background(),
+		`UPDATE torrents SET progress_at = ?, torbox_state = 'downloading' WHERE id = ?`, froze, id); err != nil {
+		t.Fatalf("freeze progress_at: %v", err)
+	}
+
+	var got uiResponse
+	_, body := get(t, srv, "/ui/torrents")
+	if err := json.Unmarshal([]byte(body), &got); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	// The dashboard derives the countdown from these; assert they reach the client.
+	if got.StallTimeout != 600 {
+		t.Errorf("stall_timeout = %d, want 600", got.StallTimeout)
+	}
+	ut := got.Torrents[0]
+	if ut.ProgressAt != froze {
+		t.Errorf("progress_at = %d, want %d", ut.ProgressAt, froze)
+	}
+	if ut.TorBoxState != "downloading" {
+		t.Errorf("torbox_state = %q, want downloading", ut.TorBoxState)
 	}
 }

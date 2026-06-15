@@ -96,7 +96,7 @@ func run() error {
 
 	srv := &http.Server{
 		Addr:    cfg.Server.ListenAddr,
-		Handler: qbit.New(st, cfg.Download.Root, eng.DeleteTorrent, slog.Default()).Routes(),
+		Handler: qbit.New(st, cfg.Download.Root, cfg.Failure.StallTimeout.Std(), eng.DeleteTorrent, slog.Default()).Routes(),
 		// Bound the header-read phase so a slow/stalled client can't pin a
 		// connection open indefinitely (Slowloris). Handlers themselves are
 		// quick, so no ReadTimeout/WriteTimeout that could truncate a response.

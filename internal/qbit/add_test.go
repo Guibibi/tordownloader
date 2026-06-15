@@ -14,6 +14,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/anacrolix/torrent/bencode"
 	"github.com/guibibi/tordownloader/internal/store"
@@ -189,7 +190,7 @@ func TestDeleteWithEngineDeleteFn(t *testing.T) {
 		t.Fatalf("add: %v", err)
 	}
 
-	h := New(st, "/downloads", deleteFn, nil)
+	h := New(st, "/downloads", 10*time.Minute, deleteFn, nil)
 	srv := httptest.NewServer(h.Routes())
 	t.Cleanup(srv.Close)
 
@@ -235,7 +236,7 @@ func TestDeleteWithEngineDeleteFnAll(t *testing.T) {
 		return nil
 	}
 
-	h := New(st, "/downloads", deleteFn, nil)
+	h := New(st, "/downloads", 10*time.Minute, deleteFn, nil)
 	srv := httptest.NewServer(h.Routes())
 	t.Cleanup(srv.Close)
 

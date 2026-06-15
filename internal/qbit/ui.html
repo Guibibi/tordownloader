@@ -59,6 +59,7 @@
   .barlabel { display: flex; justify-content: space-between; font-size: 12px; color: var(--muted); margin-top: 6px; }
   .barlabel .pct { color: var(--text); font-weight: 600; }
   .errmsg { color: var(--error); font-size: 12px; margin-top: 8px; word-break: break-word; }
+  .stall { color: #f0a23b; font-size: 12px; margin-top: 8px; }
   .legend { color: var(--muted); font-size: 12px; display: flex; gap: 14px; margin-top: 4px; }
   .legend i { display: inline-block; width: 9px; height: 9px; border-radius: 2px; margin-right: 5px; vertical-align: middle; }
   .dim { color: var(--muted); }
@@ -120,6 +121,22 @@ function bar(t) {
   </div>`;
 }
 
+// Module-level mirror of the configured failure.stall_timeout (seconds), set on
+// each poll. 0 disables the stall countdown.
+let stallTimeout = 0;
+
+// stallRemaining returns the seconds a stalled TorBox fetch has left before it's
+// failed, or null when no countdown applies (not fetching, moving bytes, queued
+// on TorBox, or stall-failing disabled). A 60s grace avoids flagging brand-new
+// or just-advanced torrents.
+function stallRemaining(t) {
+  if (t.phase !== "torbox" || stallTimeout <= 0) return null;
+  if (t.torbox_state === "queued" || t.dlspeed > 0 || !t.progress_at) return null;
+  const elapsed = Math.floor(Date.now()/1000) - t.progress_at;
+  if (elapsed < 60) return null;
+  return stallTimeout - elapsed;
+}
+
 function card(t) {
   const pct = Math.round(t.progress*100);
   let detail = "";
@@ -133,6 +150,10 @@ function card(t) {
     detail = `Disk ${Math.round(t.local_progress*100)}% · ${fmtSpeed(t.dlspeed)} · ETA ${fmtEta(t.eta)}`;
   }
   const age = fmtAge(t.added_on);
+  const stall = stallRemaining(t);
+  const stallMsg = stall === null ? ""
+    : (stall <= 0 ? "⚠ no progress — failing…"
+                  : `⚠ no progress — fails in ${fmtEta(stall)}`);
   return `<div class="card">
     <div class="row1">
       <span class="name" title="${esc(t.name)}">${esc(t.name)}</span>
@@ -147,6 +168,7 @@ function card(t) {
     </div>
     ${bar(t)}
     <div class="barlabel"><span>${esc(t.state_label)}</span><span class="pct">${pct}%</span></div>
+    ${stallMsg ? `<div class="stall">${stallMsg}</div>` : ""}
     ${t.error ? `<div class="errmsg">${esc(t.error)}</div>` : ""}
   </div>`;
 }
@@ -181,6 +203,7 @@ async function tick() {
     const d = await r.json();
     document.getElementById("ver").textContent = d.version || "";
     document.getElementById("speed").textContent = fmtSpeed(d.dlspeed) || "0 B/s";
+    stallTimeout = d.stall_timeout || 0;
     const ts = d.torrents || [];
     const active = ts.filter(t => t.phase === "torbox" || t.phase === "local").length;
     const done = ts.filter(t => t.phase === "done").length;

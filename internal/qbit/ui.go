@@ -3,6 +3,7 @@ package qbit
 import (
 	_ "embed"
 	"net/http"
+	"time"
 
 	"github.com/guibibi/tordownloader/internal/store"
 )
@@ -22,6 +23,7 @@ type uiTorrent struct {
 	Size           int64   `json:"size"`
 	State          string  `json:"state"`
 	StateLabel     string  `json:"state_label"`
+	TorBoxState    string  `json:"torbox_state"`
 	Phase          string  `json:"phase"`
 	TorBoxProgress float64 `json:"torbox_progress"`
 	LocalProgress  float64 `json:"local_progress"`
@@ -34,6 +36,10 @@ type uiTorrent struct {
 	Error          string  `json:"error"`
 	Category       string  `json:"category"`
 	AddedOn        int64   `json:"added_on"`
+	// ProgressAt is the last time the TorBox fetch advanced (the stall clock). The
+	// dashboard pairs it with StallTimeout to show how long a stalled fetch has
+	// left before it's failed.
+	ProgressAt int64 `json:"progress_at"`
 }
 
 // uiResponse is the payload the dashboard polls.
@@ -41,6 +47,9 @@ type uiResponse struct {
 	Torrents []uiTorrent `json:"torrents"`
 	DLSpeed  int64       `json:"dlspeed"`
 	Version  string      `json:"version"`
+	// StallTimeout is the configured failure.stall_timeout in seconds; 0 means
+	// stall-failing is disabled and the dashboard shows no countdown.
+	StallTimeout int64 `json:"stall_timeout"`
 }
 
 // uiIndex serves the dashboard HTML at /.
@@ -92,6 +101,7 @@ func (h *Handler) uiTorrents(w http.ResponseWriter, r *http.Request) {
 			Size:           t.Size,
 			State:          t.State,
 			StateLabel:     uiStateLabel(t),
+			TorBoxState:    t.TorBoxState,
 			Phase:          phase,
 			TorBoxProgress: clamp01(t.TorBoxProgress),
 			LocalProgress:  clamp01(t.LocalProgress),
@@ -104,10 +114,16 @@ func (h *Handler) uiTorrents(w http.ResponseWriter, r *http.Request) {
 			Error:          t.Error,
 			Category:       t.Category,
 			AddedOn:        t.AddedOn,
+			ProgressAt:     t.ProgressAt,
 		})
 	}
 
-	h.writeJSON(w, r, uiResponse{Torrents: out, DLSpeed: totalDL, Version: appVersion})
+	h.writeJSON(w, r, uiResponse{
+		Torrents:     out,
+		DLSpeed:      totalDL,
+		Version:      appVersion,
+		StallTimeout: int64(h.stallTimeout / time.Second),
+	})
 }
 
 // uiPhase groups the internal state into a coarse phase the page colours by.

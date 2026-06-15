@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/guibibi/tordownloader/internal/store"
 )
@@ -24,7 +25,7 @@ func newTestServer(t *testing.T) (*httptest.Server, *store.Store) {
 	}
 	t.Cleanup(func() { _ = st.Close() })
 
-	srv := httptest.NewServer(New(st, "/downloads", nil, nil).Routes())
+	srv := httptest.NewServer(New(st, "/downloads", 10*time.Minute, nil, nil).Routes())
 	t.Cleanup(srv.Close)
 	return srv, st
 }
