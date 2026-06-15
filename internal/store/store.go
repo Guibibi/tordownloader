@@ -85,6 +85,17 @@ func Open(ctx context.Context, path string) (*Store, error) {
 	if err != nil {
 		return nil, fmt.Errorf("open db: %w", err)
 	}
+
+	// SQLite permits only one writer at a time. database/sql's default pool opens
+	// connections on demand, so our concurrent writers — the parallel per-file
+	// downloaders (MarkFileDone), the progress reporter, the reconcile/submit
+	// passes, and Sonarr's bulk /torrents/add calls — collide on the write lock
+	// and return SQLITE_BUSY even with WAL + busy_timeout (the busy handler isn't
+	// always invoked for write-write contention). Pinning the pool to a single
+	// connection serializes all access in-process, so SQLite never sees a
+	// conflict; busy_timeout then only has to cover an external reader. The
+	// workload is small, bursty writes, so the throughput cost is negligible.
+	db.SetMaxOpenConns(1)
 	if err := db.PingContext(ctx); err != nil {
 		_ = db.Close()
 		return nil, fmt.Errorf("ping db: %w", err)
