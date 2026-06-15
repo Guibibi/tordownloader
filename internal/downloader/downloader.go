@@ -184,7 +184,22 @@ func fetch(ctx context.Context, client *http.Client, f File, link LinkFunc, down
 		}
 		url, err := link(ctx, f.TorBoxID)
 		if err != nil {
-			return fmt.Errorf("request link: %w", err)
+			// A link request can fail transiently — most often TorBox's general
+			// rate limit (429) when many files request links at once (a big pack of
+			// small files blows through requestdl). Failing here would fail the
+			// whole torrent over one throttled call, so back off and re-request,
+			// the same as a transient CDN error; we give up only after the retry
+			// budget. A cancelled ctx (shutdown/delete) is never retried.
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+			lastErr = fmt.Errorf("request link: %w", err)
+			if attempt < maxLinkRetries {
+				if werr := backoff(ctx, attempt); werr != nil {
+					return werr
+				}
+			}
+			continue
 		}
 		err = downloadOnce(ctx, client, url, f, downloaded)
 		switch {

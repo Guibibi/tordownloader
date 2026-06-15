@@ -319,6 +319,15 @@ func (c *Client) do(ctx context.Context, method, endpoint string, query url.Valu
 		var env Envelope
 		if len(respBody) > 0 {
 			if err := json.Unmarshal(respBody, &env); err != nil {
+				// Non-JSON body. On an error status (e.g. a gateway/proxy answering a
+				// throttled requestdl with a plain-text "rate limit exceeded" 429,
+				// not the JSON envelope) surface a typed APIError so callers can
+				// react to the status — otherwise a rate limit looks like a decode
+				// bug and can't be retried or backed off. Only a success status with
+				// an unparseable body is a genuine decode failure.
+				if resp.StatusCode >= 400 {
+					return nil, &APIError{StatusCode: resp.StatusCode, Detail: strings.TrimSpace(truncate(respBody, 200))}
+				}
 				return nil, fmt.Errorf("torbox: decode response (http %d): %w; body=%s", resp.StatusCode, err, truncate(respBody, 200))
 			}
 		}

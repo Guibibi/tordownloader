@@ -3,6 +3,7 @@ package downloader
 import (
 	"bytes"
 	"context"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -184,6 +185,60 @@ func TestDownloadRetriesTransientStatus(t *testing.T) {
 	assertFile(t, dest, data)
 	if calls < 3 {
 		t.Errorf("link requested %d times, want >= 3 (re-request after each transient 400)", calls)
+	}
+}
+
+func TestDownloadRetriesLinkRequestError(t *testing.T) {
+	// Shrink the backoff so the retry path runs instantly.
+	oldBase, oldMax := retryBaseDelay, retryMaxDelay
+	retryBaseDelay, retryMaxDelay = time.Millisecond, time.Millisecond
+	defer func() { retryBaseDelay, retryMaxDelay = oldBase, oldMax }()
+
+	data := bytes.Repeat([]byte("q"), 300)
+	srv := contentServer(map[string][]byte{"/f": data})
+	defer srv.Close()
+
+	// The link request is rate-limited the first two times — the real failure that
+	// killed a 362-file pack: requestdl 429s when a burst of small files hammers
+	// it. The torrent must ride it out (re-request after backoff), not fail.
+	var calls int32
+	link := func(context.Context, int) (string, error) {
+		if atomic.AddInt32(&calls, 1) <= 2 {
+			return "", errors.New("torbox: rate limit exceeded [http 429]")
+		}
+		return srv.URL + "/f", nil
+	}
+	dir := t.TempDir()
+	dest := filepath.Join(dir, "f.bin")
+	if err := Download(context.Background(), []File{{Dest: dest, Size: int64(len(data))}}, link, Options{}); err != nil {
+		t.Fatalf("Download: %v", err)
+	}
+	assertFile(t, dest, data)
+	if calls < 3 {
+		t.Errorf("link requested %d times, want >= 3 (retry after rate-limited link request)", calls)
+	}
+}
+
+func TestDownloadFailsAfterPersistentLinkError(t *testing.T) {
+	// A link request that never recovers must still fail eventually (bounded
+	// retries), so a genuinely dead torrent surfaces to Sonarr rather than
+	// re-requesting forever.
+	oldBase, oldMax := retryBaseDelay, retryMaxDelay
+	retryBaseDelay, retryMaxDelay = time.Millisecond, time.Millisecond
+	defer func() { retryBaseDelay, retryMaxDelay = oldBase, oldMax }()
+
+	var calls int32
+	link := func(context.Context, int) (string, error) {
+		atomic.AddInt32(&calls, 1)
+		return "", errors.New("torbox: rate limit exceeded [http 429]")
+	}
+	err := Download(context.Background(),
+		[]File{{Dest: filepath.Join(t.TempDir(), "f.bin"), Size: 100}}, link, Options{})
+	if err == nil {
+		t.Fatal("expected an error after exhausting link-request retries")
+	}
+	if calls < 2 {
+		t.Errorf("link requested %d times, want multiple retries before giving up", calls)
 	}
 }
 

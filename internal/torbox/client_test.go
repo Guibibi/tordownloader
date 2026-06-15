@@ -161,6 +161,33 @@ func TestControlTorrent(t *testing.T) {
 	}
 }
 
+func TestPlainTextErrorBodyIsTypedAPIError(t *testing.T) {
+	// TorBox's gateway can answer a throttled requestdl with a 429 and a
+	// plain-text body ("rate limit exceeded") rather than the JSON envelope. The
+	// client must surface that as a typed *APIError carrying the status — not a
+	// JSON-decode error — so callers (the downloader's link retry, the engine's
+	// createtorrent cooldown) can recognize and react to the rate limit.
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusTooManyRequests)
+		_, _ = w.Write([]byte("rate limit exceeded"))
+	}))
+	defer srv.Close()
+	c := New("test-key", WithBaseURL(srv.URL), WithInitialBackoff(time.Millisecond), WithMaxRetries(0))
+
+	fileID := 4
+	_, err := c.RequestDL(context.Background(), RequestDLParams{TorrentID: 123, FileID: &fileID})
+	if err == nil {
+		t.Fatal("want error, got nil")
+	}
+	apiErr, ok := err.(*APIError)
+	if !ok {
+		t.Fatalf("error type = %T, want *APIError (got: %v)", err, err)
+	}
+	if apiErr.StatusCode != http.StatusTooManyRequests {
+		t.Errorf("status = %d, want 429", apiErr.StatusCode)
+	}
+}
+
 func TestRetryOn429(t *testing.T) {
 	var calls atomic.Int32
 	c := newClient(t, func(w http.ResponseWriter, r *http.Request) {
