@@ -23,21 +23,29 @@ headless, download-to-disk. Runs as one Docker container on the user's **Unraid*
 - Torrents only (no Usenet — user's plan has none).
 - Per-file downloads via `requestdl`, preserve folder structure (no zip/extract).
 - On Sonarr delete: remove from TorBox **and** local.
-- Free the TorBox slot as soon as the local download completes: on COMPLETE we
-  delete the torrent from TorBox (slots are scarce — 3 — and TorBox seeds forever
-  otherwise, starving the queue). Local files + DB row stay (reported `pausedUP`)
-  so Sonarr can still import; the later Sonarr delete then just clears local state.
-  Don't rely on Sonarr's "Remove Completed" to free slots — it's deferred/optional.
-  The delete-on-complete is **not** the only safety net: a **reaper** in the reconcile
-  loop (and on startup) deletes any COMPLETE/ERROR torrent still on TorBox and clears
-  its refs, so a delete missed by an old build, a crash, or a transient error
-  self-heals instead of pinning a slot forever.
-- **Slot accounting = real occupancy, not TORBOX_ACTIVE count.** A torrent holds a
-  TorBox slot from `createtorrent` until it's deleted — through caching, local
-  download, and COMPLETE-not-yet-reaped. The submitter gates on the count of rows
-  still holding a `torbox_id`/`torbox_queued_id`, and a successful TorBox delete
-  clears those refs. Undercounting (gating on TORBOX_ACTIVE only) was the bug that
-  over-submitted and let completed-but-undeleted torrents starve the queue.
+- **TorBox slot model (corrected 2026-06-16).** A torrent occupies one of the
+  account's concurrent slots **only while `active`** — downloading/caching, or
+  *seeding*. A **cached** torrent that isn't seeding is **inactive** and holds **no
+  slot** (`mylist` says so directly: `active: bool`, `download_state: "cached"`). We
+  run with **seeding disabled** (TorBox account setting; `createtorrent` sends no
+  `seed`, so the account default applies), so a torrent goes inactive the instant it
+  finishes caching and **frees its slot automatically**. It does *not* "seed forever"
+  or pin a slot until deleted — earlier docs claimed that and were wrong.
+- Still delete from TorBox on COMPLETE, and still run the **reaper** (reconcile loop +
+  startup) over leftover COMPLETE/ERROR torrents — but both are now **hygiene, not
+  slot recovery**: once the bytes are on local disk we don't need TorBox's copy, so we
+  drop it to keep `mylist` tidy. A non-seeding cached torrent already holds no slot, so
+  nothing "starves the queue" if a delete is missed. (Local files + DB row stay,
+  reported `pausedUP`, so Sonarr can still import; the later Sonarr delete just clears
+  local state.)
+- **Slot accounting.** True occupancy = torrents **actively caching** (`active==true`),
+  not the count still carrying a `torbox_id`. ⚠️ **Known gap:** the submitter currently
+  gates on `CountOnTorBox` (`store/writes.go` — rows with a non-null
+  `torbox_id`/`torbox_queued_id`), which **over-counts**: it includes cached `LOCAL_*`
+  and un-reaped COMPLETE rows that aren't active on TorBox. Safe (it can't over-submit
+  past 3) but it **throttles the queue** — e.g. while pulling two large cached torrents
+  to disk it behaves as if 2 slots are busy though TorBox sees 0 active. The correct
+  gate counts only active/caching torrents; left conservative for now.
 - **Don't use TorBox's own queue.** Our QUEUED state is the single queue. Because we
   gate on real occupancy, `createtorrent` shouldn't be queued by TorBox; if it is
   (an orphan torrent we don't track holds a slot), cancel the queued entry via
@@ -70,8 +78,8 @@ headless, download-to-disk. Runs as one Docker container on the user's **Unraid*
 - TorBox may **queue** a `createtorrent` (returns a queued id, not a torrent id) when the
   account's active slots are full. We no longer adopt that queue: we gate submissions on real
   slot occupancy so it shouldn't happen, and if it does we `controlqueued`-delete the entry and
-  leave the torrent in our own QUEUED to retry. (Reaping completed torrents keeps occupancy
-  honest, so a healthy account stays below the cap.) On 429 the submitter pauses for a cooldown
+  leave the torrent in our own QUEUED to retry. (With seeding disabled a torrent goes inactive
+  once cached and stops counting toward the cap on its own; reaping is just cleanup.) On 429 the submitter pauses for a cooldown
   (hourly quota). A torrent absent from `mylist` is failed only after a grace window **and** a
   direct id lookup confirms it's gone.
 - Download into an incomplete dir, then atomic move, so Sonarr never imports partial files.

@@ -158,6 +158,13 @@ ones the engine uses:
 
 We treat **`download_present == true`** as the trigger to begin local downloads.
 
+> **Slot semantics.** `active == true` is the only thing that consumes one of the
+> account's concurrent slots (downloading/caching, or seeding). A `cached`, non-seeding
+> torrent is `active: false` and consumes **no** slot — so with seeding disabled,
+> completed torrents free their slot automatically and the library is effectively
+> unbounded; only concurrent *caching* is capped (3 on Essential). A cached torrent does
+> **not** pin a slot until deleted (an earlier assumption that was wrong).
+
 > Other fields present but unused: `auth_id`, `server`, `magnet`, `ratio`, `upload_speed`,
 > `torrent_file`, `expires_at`, `availability`, `total_uploaded`, `total_downloaded`, `owner`,
 > `allow_zipped`, `seed_torrent`, `long_term_seeding`, `private`, `cached_at`,
