@@ -204,7 +204,14 @@ func (e *Engine) submitPass(ctx context.Context) error {
 		// In createtorrent rate-limit cooldown; skip quietly until it elapses.
 		return nil
 	}
-	active, err := e.store.CountByState(ctx, store.StateTorBoxActive)
+	// Gate on real TorBox occupancy, not the count of TORBOX_ACTIVE rows. A torrent
+	// holds a slot for its whole life on the account — caching, while we pull it to
+	// disk (LOCAL_QUEUED/LOCAL_DOWNLOAD), and while it sits COMPLETE-but-not-yet-
+	// reaped — and none of those later states are TORBOX_ACTIVE. Counting only
+	// TORBOX_ACTIVE under-counts occupancy, so we'd over-submit and TorBox would
+	// queue the overflow; gating on the true count means createtorrent never has to
+	// be queued and our own QUEUED state is the single queue.
+	onTorBox, err := e.store.CountOnTorBox(ctx)
 	if err != nil {
 		return err
 	}
@@ -212,14 +219,14 @@ func (e *Engine) submitPass(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	free := e.maxSlots - active
+	free := e.maxSlots - onTorBox
 	if free <= 0 {
 		// Slots are full: surface that queued torrents are waiting (otherwise this
 		// looks like a stuck/nameless hash from the *arr side). Logged once per
 		// contention episode to avoid spamming every pass.
 		if len(queued) > 0 && !e.slotWaitLogged {
 			e.log.Info("all TorBox slots busy; queued torrents waiting for a slot",
-				"queued", len(queued), "active", active, "max_slots", e.maxSlots)
+				"queued", len(queued), "on_torbox", onTorBox, "max_slots", e.maxSlots)
 			e.slotWaitLogged = true
 		}
 		return nil
@@ -304,11 +311,6 @@ func (e *Engine) submit(ctx context.Context, t store.Torrent) bool {
 	// A successful create means the quota has room again; clear any cooldown.
 	e.createCooldownUntil = time.Time{}
 
-	// TorBox may queue the submission (returns a queued id, no torrent id) when the
-	// account's active-download slots are full. A queued download lives in its own
-	// namespace — its queued_id is not a torrent_id — so record it separately and
-	// mark the torrent queued. It isn't in mylist yet; the reconciler waits for it
-	// to activate (matched by hash) instead of treating its absence as "vanished".
 	switch {
 	case res.TorrentID != nil:
 		if err := e.store.MarkActive(ctx, t.ID, *res.TorrentID); err != nil {
@@ -319,14 +321,21 @@ func (e *Engine) submit(ctx context.Context, t store.Torrent) bool {
 		e.log.Info("submitted to TorBox", "infohash", t.Infohash, "torbox_id", *res.TorrentID, "name", t.Name)
 		return true
 	case res.QueuedID != nil:
-		if err := e.store.MarkQueued(ctx, t.ID, *res.QueuedID); err != nil {
-			e.log.Error("mark torbox-queued", "infohash", t.Infohash, "err", err)
-			return false
+		// We gate on real occupancy, so the account shouldn't be full when we submit.
+		// If TorBox still queued it — e.g. a torrent added outside this app is
+		// holding a slot we don't account for — don't adopt its queue. That second
+		// namespace (queued_id, controlqueued, re-match-on-activation) was a source
+		// of bugs. Cancel the queued entry and leave the torrent in our own QUEUED
+		// to retry once a slot genuinely frees.
+		delCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
+		if err := e.torbox.ControlQueued(delCtx, *res.QueuedID, torbox.OpDelete); err != nil {
+			e.log.Warn("cancel TorBox-queued submission (continuing)",
+				"infohash", t.Infohash, "queued_id", *res.QueuedID, "err", err)
 		}
-		e.recordCacheHit(ctx, t, cached)
-		e.log.Info("queued on TorBox; waiting for an active slot",
+		cancel()
+		e.log.Info("TorBox queued the submission (account full); cancelled, will retry from our queue",
 			"infohash", t.Infohash, "queued_id", *res.QueuedID, "name", t.Name)
-		return true
+		return false
 	default:
 		e.fail(ctx, t, "createtorrent returned no torrent id")
 		return true
@@ -395,12 +404,22 @@ func (e *Engine) removeFromTorBox(ctx context.Context, t store.Torrent) {
 		if err := e.torbox.ControlTorrent(ctx, int(t.TorBoxID.Int64), torbox.OpDelete); err != nil {
 			e.log.Warn("TorBox delete (continuing)",
 				"infohash", t.Infohash, "torbox_id", t.TorBoxID.Int64, "err", err)
+			return
 		}
 	case t.TorBoxQueuedID.Valid:
 		if err := e.torbox.ControlQueued(ctx, int(t.TorBoxQueuedID.Int64), torbox.OpDelete); err != nil {
 			e.log.Warn("TorBox queued delete (continuing)",
 				"infohash", t.Infohash, "queued_id", t.TorBoxQueuedID.Int64, "err", err)
+			return
 		}
+	default:
+		return
+	}
+	// Delete succeeded: drop the TorBox refs so the torrent stops counting toward
+	// slot occupancy and the reaper won't keep retrying it. A no-op for a row that
+	// is about to be deleted entirely (Sonarr delete).
+	if err := e.store.ClearTorBoxRefs(ctx, t.ID); err != nil {
+		e.log.Warn("clear torbox refs (continuing)", "infohash", t.Infohash, "err", err)
 	}
 }
 

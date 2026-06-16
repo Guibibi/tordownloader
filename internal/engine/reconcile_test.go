@@ -460,47 +460,67 @@ func TestReconcileAdoptsChangedID(t *testing.T) {
 	}
 }
 
-func TestReconcileQueuedNotStalled(t *testing.T) {
+// A COMPLETE torrent still present on TorBox is reaped: deleted from the account
+// and its refs cleared, freeing the slot. This is the self-heal for completed
+// torrents that would otherwise seed forever and starve the queue.
+func TestReconcileReapsCompletedFromTorBox(t *testing.T) {
 	st := newStore(t)
-	hash := "dededededededededededededededededededede"
-	// Sitting in TorBox's queue (Active=false, no progress) well past the stall
-	// window — must not be failed; it hasn't started yet.
-	seedActive(t, st, hash, 88, "/downloads/tv", 30*time.Minute)
+	ctx := context.Background()
+	hash := "abababababababababababababababababababab"
 
-	tb := &fakeTB{list: func() ([]torbox.Torrent, error) {
-		return []torbox.Torrent{{ID: 88, Hash: hash, Active: false, Progress: 0, DownloadSpeed: 0}}, nil
-	}}
-	e := New(st, tb, Config{MaxSlots: 3, StallTimeout: 5 * time.Minute}, nil)
-	if err := e.reconcilePass(context.Background()); err != nil {
+	tr := seedActive(t, st, hash, 500, "/downloads/tv", 0)
+	if err := st.MarkComplete(ctx, tr.ID, "/downloads/tv/show", 10); err != nil {
+		t.Fatalf("mark complete: %v", err)
+	}
+
+	var deleted int
+	var deletedOp torbox.Operation
+	tb := &fakeTB{
+		list: func() ([]torbox.Torrent, error) {
+			return []torbox.Torrent{{ID: 500, Hash: hash}}, nil // still on TorBox
+		},
+		ctl: func(_ int, op torbox.Operation) error { deleted++; deletedOp = op; return nil },
+	}
+	e := New(st, tb, Config{MaxSlots: 3}, nil)
+	if err := e.reconcilePass(ctx); err != nil {
 		t.Fatalf("reconcilePass: %v", err)
 	}
-	tr := getTorrent(t, st, hash)
-	if tr.State != store.StateTorBoxActive {
-		t.Fatalf("state = %q, want still TORBOX_ACTIVE (queued)", tr.State)
+
+	if deleted != 1 || deletedOp != torbox.OpDelete {
+		t.Errorf("ControlTorrent = (calls %d, op %q), want (1, delete)", deleted, deletedOp)
 	}
-	if tr.TorBoxState != "queued" {
-		t.Errorf("torbox_state = %q, want queued", tr.TorBoxState)
+	if n, err := st.CountOnTorBox(ctx); err != nil || n != 0 {
+		t.Errorf("CountOnTorBox = %d (err %v), want 0 (slot freed)", n, err)
 	}
 }
 
-func TestReconcileQueuedAbsentNotVanished(t *testing.T) {
+// A COMPLETE torrent already gone from TorBox (e.g. deleted out-of-band) is not
+// re-deleted; the reaper just clears our accounting so the slot frees.
+func TestReconcileReapClearsRefsWhenAlreadyGone(t *testing.T) {
 	st := newStore(t)
-	hash := "efefefefefefefefefefefefefefefefefefefef"
-	// Marked queued at submit and not yet in mylist, past the vanish grace: a
-	// queued torrent must not be declared vanished while waiting to activate.
-	tr := seedActive(t, st, hash, 91, "/downloads/tv", 5*time.Minute)
-	if _, err := st.DB().ExecContext(context.Background(),
-		`UPDATE torrents SET torbox_state = 'queued' WHERE id = ?`, tr.ID); err != nil {
-		t.Fatalf("mark queued: %v", err)
+	ctx := context.Background()
+	hash := "cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd"
+
+	tr := seedActive(t, st, hash, 600, "/downloads/tv", 0)
+	if err := st.MarkComplete(ctx, tr.ID, "/downloads/tv/show", 10); err != nil {
+		t.Fatalf("mark complete: %v", err)
 	}
 
-	tb := &fakeTB{list: func() ([]torbox.Torrent, error) { return []torbox.Torrent{}, nil }}
+	var deleteCalls int
+	tb := &fakeTB{
+		list: func() ([]torbox.Torrent, error) { return []torbox.Torrent{}, nil }, // not on TorBox
+		ctl:  func(int, torbox.Operation) error { deleteCalls++; return nil },
+	}
 	e := New(st, tb, Config{MaxSlots: 3}, nil)
-	if err := e.reconcilePass(context.Background()); err != nil {
+	if err := e.reconcilePass(ctx); err != nil {
 		t.Fatalf("reconcilePass: %v", err)
 	}
-	if tr := getTorrent(t, st, hash); tr.State != store.StateTorBoxActive {
-		t.Errorf("state = %q, want still TORBOX_ACTIVE (queued, not vanished)", tr.State)
+
+	if deleteCalls != 0 {
+		t.Errorf("ControlTorrent calls = %d, want 0 (already gone, nothing to delete)", deleteCalls)
+	}
+	if n, err := st.CountOnTorBox(ctx); err != nil || n != 0 {
+		t.Errorf("CountOnTorBox = %d (err %v), want 0 (refs cleared)", n, err)
 	}
 }
 

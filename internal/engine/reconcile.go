@@ -18,20 +18,20 @@ import (
 // failing (confirmPresent).
 const vanishGrace = 2 * time.Minute
 
-// torboxQueued is the torbox_state we record for a torrent TorBox has queued
-// (accepted but not yet working). It marks the torrent so the reconciler waits
-// for it to activate instead of failing it as vanished/stalled.
-const torboxQueued = "queued"
-
-// reconcilePass polls TorBox for every TORBOX_ACTIVE torrent and advances it:
-// refreshes progress, moves torrents whose content is present to LOCAL_QUEUED,
-// and fails torrents that vanish or exceed the fail-fast timeout.
+// reconcilePass polls TorBox once per cadence and does two things against the
+// single mylist read: reaps torrents that are finished with TorBox but still
+// holding a slot (reapPass), and advances every TORBOX_ACTIVE torrent (refresh
+// progress, hand content off to the downloader, fail vanished/stalled ones).
 func (e *Engine) reconcilePass(ctx context.Context) error {
 	active, err := e.store.ListByState(ctx, store.StateTorBoxActive)
 	if err != nil {
 		return err
 	}
-	if len(active) == 0 {
+	reapable, err := e.store.ListReapable(ctx)
+	if err != nil {
+		return err
+	}
+	if len(active) == 0 && len(reapable) == 0 {
 		return nil
 	}
 	// bypass_cache so a just-finished torrent is seen promptly (mylist is
@@ -41,16 +41,12 @@ func (e *Engine) reconcilePass(ctx context.Context) error {
 		// Transient: leave torrents active and retry next pass.
 		return fmt.Errorf("mylist: %w", err)
 	}
-	// Index by both id and infohash. Hash matching lets us re-find a torrent that
-	// TorBox re-activated under a new id (e.g. promoted from its queue).
-	byID := make(map[int]torbox.Torrent, len(list))
-	byHash := make(map[string]torbox.Torrent, len(list))
-	for _, t := range list {
-		byID[t.ID] = t
-		if t.Hash != "" {
-			byHash[strings.ToLower(t.Hash)] = t
-		}
-	}
+	byID, byHash := indexTorBox(list)
+
+	// Free slots held by torrents already done with TorBox before advancing the
+	// active ones, so a freed slot is available to the submitter next pass.
+	e.reapPass(ctx, reapable, byID, byHash)
+
 	for _, t := range active {
 		if ctx.Err() != nil {
 			return ctx.Err()
@@ -60,16 +56,66 @@ func (e *Engine) reconcilePass(ctx context.Context) error {
 	return nil
 }
 
+// indexTorBox keys a mylist by both torrent id and (lowercased) infohash. Hash
+// matching lets us re-find a torrent TorBox re-activated under a new id.
+func indexTorBox(list []torbox.Torrent) (map[int]torbox.Torrent, map[string]torbox.Torrent) {
+	byID := make(map[int]torbox.Torrent, len(list))
+	byHash := make(map[string]torbox.Torrent, len(list))
+	for _, t := range list {
+		byID[t.ID] = t
+		if t.Hash != "" {
+			byHash[strings.ToLower(t.Hash)] = t
+		}
+	}
+	return byID, byHash
+}
+
+// reapPass deletes from TorBox every torrent that is finished with it (COMPLETE
+// or ERROR) yet still holds a slot, then clears its refs so the slot frees for
+// the submitter. It is the self-healing backstop to downloadOne's
+// delete-on-complete: a delete missed because the app was an older build, was
+// restarted between completion and delete, or hit a transient TorBox error would
+// otherwise pin a scarce slot forever — the failure mode where completed
+// torrents seed indefinitely and starve the queue.
+func (e *Engine) reapPass(ctx context.Context, reapable []store.Torrent, byID map[int]torbox.Torrent, byHash map[string]torbox.Torrent) {
+	if len(reapable) == 0 {
+		return
+	}
+	e.log.Info("reaping torrents still holding a TorBox slot after completion/failure", "count", len(reapable))
+	for _, t := range reapable {
+		if ctx.Err() != nil {
+			return
+		}
+		switch {
+		case isPresent(t, byID, byHash):
+			// Still on TorBox: delete it; removeFromTorBox clears refs on success.
+			e.removeFromTorBox(ctx, t)
+		case t.TorBoxID.Valid:
+			// Had an active id but it's gone from mylist (e.g. deleted out-of-band):
+			// nothing to delete, just free our accounting.
+			if err := e.store.ClearTorBoxRefs(ctx, t.ID); err != nil {
+				e.log.Warn("reap: clear refs (continuing)", "infohash", t.Infohash, "err", err)
+			}
+		case t.TorBoxQueuedID.Valid:
+			// A queued entry never appears in mylist; best-effort delete + clear.
+			e.removeFromTorBox(ctx, t)
+		}
+	}
+}
+
+// isPresent reports whether a torrent is still in the TorBox mylist (by id or
+// infohash).
+func isPresent(t store.Torrent, byID map[int]torbox.Torrent, byHash map[string]torbox.Torrent) bool {
+	_, ok := lookupTorBox(t, byID, byHash)
+	return ok
+}
+
 // reconcileOne advances a single TORBOX_ACTIVE torrent against its mylist entry.
 func (e *Engine) reconcileOne(ctx context.Context, t store.Torrent, byID map[int]torbox.Torrent, byHash map[string]torbox.Torrent) {
 	tb, ok := lookupTorBox(t, byID, byHash)
 	if !ok {
-		// Not in mylist. A torrent we submitted into TorBox's queue won't appear
-		// until it activates, so don't fail it while it's known-queued.
-		if t.TorBoxState == torboxQueued {
-			return
-		}
-		// Within the grace window, tolerate brief post-submit propagation lag.
+		// Not in mylist. Within the grace window, tolerate brief post-submit
+		// propagation lag.
 		if t.ActiveSince > 0 && time.Since(time.Unix(t.ActiveSince, 0)) < vanishGrace {
 			return
 		}
@@ -100,18 +146,6 @@ func (e *Engine) reconcileOne(ctx context.Context, t store.Torrent, byID map[int
 			return
 		}
 		e.toLocalQueued(ctx, t, tb)
-		return
-	}
-
-	// Still waiting in TorBox's queue (accepted, not yet working): keep its clocks
-	// pending (Advancing) and don't apply the stall/vanish checks. Once it starts,
-	// the stall clock effectively runs from when it left the queue.
-	if isQueuedOnTorBox(tb) {
-		if err := e.store.UpdateTorBoxStatus(ctx, t.ID, store.TorBoxStatus{
-			State: torboxQueued, Advancing: true,
-		}); err != nil {
-			e.log.Error("update torbox status", "infohash", t.Infohash, "err", err)
-		}
 		return
 	}
 
@@ -197,19 +231,6 @@ func lookupTorBox(t store.Torrent, byID map[int]torbox.Torrent, byHash map[strin
 		}
 	}
 	return torbox.Torrent{}, false
-}
-
-// isQueuedOnTorBox reports whether TorBox has the torrent queued (accepted but
-// not yet in an active download slot) rather than actively working it. Such a
-// torrent must not be treated as stalled. `Active` is the primary signal; the
-// extra guards mean anything actually moving (progress/bytes) or finished is
-// never misread as queued, so the stall detector is preserved.
-func isQueuedOnTorBox(tb torbox.Torrent) bool {
-	return !tb.Active &&
-		tb.Progress == 0 &&
-		tb.DownloadSpeed == 0 &&
-		!tb.DownloadPresent &&
-		!tb.DownloadFinished
 }
 
 // confirmPresent does a direct id lookup to check a torrent really is gone before

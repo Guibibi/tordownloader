@@ -251,12 +251,13 @@ func TestSubmitPassLogsSlotWaitOnce(t *testing.T) {
 		t.Errorf("slot-wait logged %d times, want 1", got)
 	}
 
-	// Free a slot; the next pass should resume and submit.
+	// Free a slot (as a reap would, by clearing the TorBox refs); the next pass
+	// should resume and submit.
 	active, err := st.ListByState(context.Background(), store.StateTorBoxActive)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := st.MarkError(context.Background(), active[0].ID, "freed for test"); err != nil {
+	if err := st.ClearTorBoxRefs(context.Background(), active[0].ID); err != nil {
 		t.Fatal(err)
 	}
 	if err := e.submitPass(context.Background()); err != nil {
@@ -331,36 +332,69 @@ func TestSubmitRateLimitCooldown(t *testing.T) {
 	}
 }
 
-func TestSubmitQueuedResultMarksQueued(t *testing.T) {
+func TestSubmitQueuedResultIsCancelledAndRequeued(t *testing.T) {
+	// We gate on real occupancy, so a queued_id back from TorBox means the account
+	// is full for a reason we don't track (e.g. an orphan torrent). We must not
+	// adopt TorBox's queue: cancel the queued entry and leave the torrent in our
+	// own QUEUED to retry.
 	st := newStore(t)
 	seedQueued(t, st, 1)
 	qid := 555
-	tb := &fakeTB{fn: func(torbox.CreateTorrentRequest) (*torbox.CreateTorrentResult, error) {
-		// TorBox queued it: queued_id only, no torrent_id.
-		return &torbox.CreateTorrentResult{QueuedID: &qid}, nil
-	}}
+	var cancelledID int
+	var cancelledOp torbox.Operation
+	tb := &fakeTB{
+		fn: func(torbox.CreateTorrentRequest) (*torbox.CreateTorrentResult, error) {
+			return &torbox.CreateTorrentResult{QueuedID: &qid}, nil
+		},
+		ctlq: func(id int, op torbox.Operation) error { cancelledID = id; cancelledOp = op; return nil },
+	}
 	e := New(st, tb, Config{MaxSlots: 3}, nil)
 	if err := e.submitPass(context.Background()); err != nil {
 		t.Fatalf("submitPass: %v", err)
 	}
-	active, err := st.ListByState(context.Background(), store.StateTorBoxActive)
-	if err != nil || len(active) != 1 {
-		t.Fatalf("list active: err=%v n=%d", err, len(active))
+
+	// The queued entry was cancelled on TorBox.
+	if cancelledID != qid || cancelledOp != torbox.OpDelete {
+		t.Errorf("ControlQueued = (id %d, op %q), want (%d, delete)", cancelledID, cancelledOp, qid)
 	}
-	tr := active[0]
-	if tr.State != store.StateTorBoxActive {
-		t.Errorf("state = %q, want TORBOX_ACTIVE", tr.State)
+	// The torrent stays in our own queue, holding no TorBox refs.
+	if got := countState(t, st, store.StateQueued); got != 1 {
+		t.Errorf("queued = %d, want 1 (stays in our queue to retry)", got)
 	}
-	if tr.TorBoxState != "queued" {
-		t.Errorf("torbox_state = %q, want queued", tr.TorBoxState)
+	if n, err := st.CountOnTorBox(context.Background()); err != nil || n != 0 {
+		t.Errorf("CountOnTorBox = %d (err %v), want 0 (nothing adopted)", n, err)
 	}
-	// The queued_id is tracked in its own column, NOT torbox_id (a different
-	// namespace): controltorrent can't delete a queued download.
-	if !tr.TorBoxQueuedID.Valid || tr.TorBoxQueuedID.Int64 != int64(qid) {
-		t.Errorf("torbox_queued_id = %v, want %d", tr.TorBoxQueuedID, qid)
+}
+
+func TestSubmitGatesOnRealOccupancy(t *testing.T) {
+	// A torrent already pulled to local disk (LOCAL_DOWNLOAD) still holds its
+	// TorBox slot until reaped. With max_slots=1 and one such torrent, the
+	// submitter must not submit anything — even though no row is TORBOX_ACTIVE.
+	st := newStore(t)
+	ctx := context.Background()
+
+	busy, _, err := st.AddTorrent(ctx, store.AddTorrentParams{Infohash: fmt.Sprintf("%040x", 1), Name: "busy"})
+	if err != nil {
+		t.Fatal(err)
 	}
-	if tr.TorBoxID.Valid {
-		t.Errorf("torbox_id = %v, want NULL for a queued download", tr.TorBoxID)
+	if err := st.MarkActive(ctx, busy.ID, 100); err != nil { // torbox_id set → occupies a slot
+		t.Fatal(err)
+	}
+	if _, err := st.DB().ExecContext(ctx,
+		`UPDATE torrents SET state = ? WHERE id = ?`, store.StateLocalDload, busy.ID); err != nil {
+		t.Fatal(err)
+	}
+	seedQueued2(t, st, 2) // two waiting in our queue
+
+	tb := &fakeTB{fn: func(torbox.CreateTorrentRequest) (*torbox.CreateTorrentResult, error) {
+		return okResult(999)
+	}}
+	e := New(st, tb, Config{MaxSlots: 1}, nil)
+	if err := e.submitPass(ctx); err != nil {
+		t.Fatalf("submitPass: %v", err)
+	}
+	if tb.calls != 0 {
+		t.Errorf("createtorrent calls = %d, want 0 (the slot is held by a downloading torrent)", tb.calls)
 	}
 }
 
@@ -489,6 +523,18 @@ func listQueued(t *testing.T, st *store.Store) []store.Torrent {
 		t.Fatalf("list queued: %v", err)
 	}
 	return ts
+}
+
+// seedTorBoxQueued parks a torrent in the legacy TorBox-queued shape (TORBOX_ACTIVE
+// with only a queued_id) directly, since the engine no longer produces it. Used to
+// verify cleanup still routes such rows through controlqueued.
+func seedTorBoxQueued(t *testing.T, st *store.Store, id int64, queuedID int) {
+	t.Helper()
+	if _, err := st.DB().ExecContext(context.Background(),
+		`UPDATE torrents SET state = ?, torbox_queued_id = ? WHERE id = ?`,
+		store.StateTorBoxActive, queuedID, id); err != nil {
+		t.Fatalf("seed torbox-queued: %v", err)
+	}
 }
 
 // seedTorrentFull inserts a torrent with full state for DeleteTorrent tests.
@@ -640,9 +686,7 @@ func TestDeleteTorrentQueuedUsesControlQueued(t *testing.T) {
 	if err != nil {
 		t.Fatalf("add: %v", err)
 	}
-	if err := st.MarkQueued(ctx, tr.ID, 7777); err != nil {
-		t.Fatalf("mark queued: %v", err)
-	}
+	seedTorBoxQueued(t, st, tr.ID, 7777)
 
 	var ctlCalled, ctlqCalled, gotQueuedID int
 	var gotOp torbox.Operation
@@ -676,9 +720,7 @@ func TestFailQueuedUsesControlQueued(t *testing.T) {
 	if err != nil {
 		t.Fatalf("add: %v", err)
 	}
-	if err := st.MarkQueued(ctx, tr.ID, 8888); err != nil {
-		t.Fatalf("mark queued: %v", err)
-	}
+	seedTorBoxQueued(t, st, tr.ID, 8888)
 	tr, _, err = st.GetTorrent(ctx, hash)
 	if err != nil {
 		t.Fatalf("get: %v", err)
