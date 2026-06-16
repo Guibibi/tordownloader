@@ -85,11 +85,18 @@ from it (see API_REFERENCE.md §3 for the exact mapping).
 ## 4. Engine loops
 
 - **Submission gate**: a worker pops QUEUED torrents and calls `createtorrent` while
-  `count(TORBOX_ACTIVE) < max_active_slots` (default 3). On rate-limit, back off and retry
-  (don't fail). On TorBox rejection (e.g. `DOWNLOAD_TOO_LARGE`), → ERROR.
-- **Reconciler**: every `poll_interval` (default ~10s), calls TorBox `mylist` and updates each
-  tracked torrent's `torbox_state`, `progress`, `download_present`, file list. Drives
-  TORBOX_ACTIVE → LOCAL_QUEUED and fails torrents that stall (no forward progress for
+  **real TorBox occupancy** `< max_active_slots` (default 3). Occupancy is *every torrent
+  still holding a TorBox identifier* (`torbox_id` or `torbox_queued_id`), not just
+  TORBOX_ACTIVE rows — a torrent holds its slot for its whole life on the account (caching,
+  while we pull it to disk, and until it is deleted). Gating on the true count means
+  `createtorrent` is never forced into TorBox's own queue; our QUEUED state is the single
+  queue. On rate-limit, back off and retry (don't fail). On TorBox rejection (e.g.
+  `DOWNLOAD_TOO_LARGE`), → ERROR.
+- **Reconciler**: every `poll_interval` (default ~10s), reads TorBox `mylist` once and (a)
+  **reaps** any COMPLETE/ERROR torrent still on TorBox — deletes it and clears its refs so
+  the slot frees (the self-healing backstop to delete-on-complete) — then (b) updates each
+  TORBOX_ACTIVE torrent's `torbox_state`, `progress`, `download_present`, file list, driving
+  TORBOX_ACTIVE → LOCAL_QUEUED and failing torrents that stall (no forward progress for
   `stall_timeout`) or exceed the optional absolute `timeout` cap.
 - **Downloader**: pulls LOCAL_QUEUED torrents, enumerates files, requests `requestdl` per file,
   downloads with bounded concurrency into an incomplete dir, atomically moves into the save
@@ -186,7 +193,8 @@ categories(
 | Exceeds optional absolute `timeout` cap (disabled by default) | → ERROR. |
 | TorBox rejects >200GB | → ERROR immediately. |
 | `createtorrent` rate-limited (429) | Pause submissions for a cooldown (hourly quota), stay QUEUED. |
-| TorBox queues the submission (queued id) | Mark torbox_state=`queued`; reconciler waits for it to activate (re-matched by infohash, new id adopted) instead of failing it. |
+| TorBox queues the submission (queued id) | Shouldn't happen — we gate on real occupancy. If it does (e.g. an orphan torrent added outside the app holds a slot), cancel the queued entry via `controlqueued` and leave the torrent in our own QUEUED to retry. We never adopt TorBox's queue. |
+| Completed/failed torrent still on TorBox (missed delete: old build, crash, transient error) | Reaper deletes it on the next reconcile pass and frees the slot — so a leaked slot self-heals instead of seeding forever and starving the queue. |
 | `requestdl` link expired mid-download | Re-request and resume. |
 | Container restart | Reconcile from SQLite + `mylist`; resume partial files via Range. |
 | Torrent vanished on TorBox | → ERROR, but only after a grace window and a direct id lookup confirms it's really gone (so a lagging/paged mylist doesn't kill a live torrent). |

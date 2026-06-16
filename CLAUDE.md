@@ -28,6 +28,21 @@ headless, download-to-disk. Runs as one Docker container on the user's **Unraid*
   otherwise, starving the queue). Local files + DB row stay (reported `pausedUP`)
   so Sonarr can still import; the later Sonarr delete then just clears local state.
   Don't rely on Sonarr's "Remove Completed" to free slots — it's deferred/optional.
+  The delete-on-complete is **not** the only safety net: a **reaper** in the reconcile
+  loop (and on startup) deletes any COMPLETE/ERROR torrent still on TorBox and clears
+  its refs, so a delete missed by an old build, a crash, or a transient error
+  self-heals instead of pinning a slot forever.
+- **Slot accounting = real occupancy, not TORBOX_ACTIVE count.** A torrent holds a
+  TorBox slot from `createtorrent` until it's deleted — through caching, local
+  download, and COMPLETE-not-yet-reaped. The submitter gates on the count of rows
+  still holding a `torbox_id`/`torbox_queued_id`, and a successful TorBox delete
+  clears those refs. Undercounting (gating on TORBOX_ACTIVE only) was the bug that
+  over-submitted and let completed-but-undeleted torrents starve the queue.
+- **Don't use TorBox's own queue.** Our QUEUED state is the single queue. Because we
+  gate on real occupancy, `createtorrent` shouldn't be queued by TorBox; if it is
+  (an orphan torrent we don't track holds a slot), cancel the queued entry via
+  `controlqueued` and retry from our own queue. The old "adopt the queued_id, re-match
+  by infohash on activation" path was removed — it was a fragile second namespace.
 - Headless: YAML/env config, SQLite state, logs (no Web UI in v1).
 - Fail on *stall* (not on slowness): cache check on add (informational); ERROR only when a
   fetching torrent makes no progress for `failure.stall_timeout` (default 10m). Optional
@@ -53,11 +68,12 @@ headless, download-to-disk. Runs as one Docker container on the user's **Unraid*
   absolute cap from active_since, disabled by default. Both clocks run only while
   TORBOX_ACTIVE, not while waiting in our own queue.
 - TorBox may **queue** a `createtorrent` (returns a queued id, not a torrent id) when the
-  account's active slots are full — common when bulk-adding past the **60/hour** createtorrent
-  cap. Such a torrent isn't in `mylist` until it activates (under a *new* id). The reconciler
-  marks it `torbox_state=queued`, matches it back by infohash when it activates, and never
-  treats queued/absent as "vanished". Absence is only failed after a grace window **and** a
-  direct id lookup confirms it. On 429 the submitter pauses for a cooldown (hourly quota).
+  account's active slots are full. We no longer adopt that queue: we gate submissions on real
+  slot occupancy so it shouldn't happen, and if it does we `controlqueued`-delete the entry and
+  leave the torrent in our own QUEUED to retry. (Reaping completed torrents keeps occupancy
+  honest, so a healthy account stays below the cap.) On 429 the submitter pauses for a cooldown
+  (hourly quota). A torrent absent from `mylist` is failed only after a grace window **and** a
+  direct id lookup confirms it's gone.
 - Download into an incomplete dir, then atomic move, so Sonarr never imports partial files.
 - Some TorBox JSON field names in API_REFERENCE.md come from secondary sources — **verify
   against the live API in M1** before depending on them.
