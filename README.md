@@ -161,10 +161,8 @@ full set of knobs (see [`config.example.yaml`](config.example.yaml), which docum
 
 | Doc | What's inside |
 |---|---|
-| [PRD](docs/PRD.md) | Product requirements & scope |
 | [Architecture](docs/ARCHITECTURE.md) | Components, state machine, data model |
 | [API Reference](docs/API_REFERENCE.md) | qBittorrent endpoints emulated, TorBox endpoints used, state mapping |
-| [Roadmap](docs/ROADMAP.md) | Implementation milestones |
 
 ## Status
 

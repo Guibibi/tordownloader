@@ -8,10 +8,8 @@ headless, download-to-disk. Runs as one Docker container on the user's **Unraid*
 (Sonarr/Radarr/Prowlarr already there; `/downloads` shared and mapped identically).
 
 ## Read first
-- `docs/PRD.md` — scope & requirements
 - `docs/ARCHITECTURE.md` — components, state machine, data model, tech choices
 - `docs/API_REFERENCE.md` — qBit endpoints emulated + TorBox endpoints used + **state mapping**
-- `docs/ROADMAP.md` — milestones (M0–M8); start at the lowest incomplete one
 
 ## Project tracking (Linear)
 - Milestones map 1:1 to Linear issues in team **GUI** (Guibibi): M0–M8 = **GUI-22 … GUI-30**.
