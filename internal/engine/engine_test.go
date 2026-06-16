@@ -251,13 +251,14 @@ func TestSubmitPassLogsSlotWaitOnce(t *testing.T) {
 		t.Errorf("slot-wait logged %d times, want 1", got)
 	}
 
-	// Free a slot (as a reap would, by clearing the TorBox refs); the next pass
-	// should resume and submit.
+	// Free a slot the way it really frees: TorBox finishes caching one, so the
+	// reconciler moves it out of TORBOX_ACTIVE to pull it locally (cached =
+	// inactive = no slot). The next pass should resume and submit.
 	active, err := st.ListByState(context.Background(), store.StateTorBoxActive)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := st.ClearTorBoxRefs(context.Background(), active[0].ID); err != nil {
+	if err := st.MarkLocalQueued(context.Background(), active[0].ID, "/downloads/x", 10, nil); err != nil {
 		t.Fatal(err)
 	}
 	if err := e.submitPass(context.Background()); err != nil {
@@ -361,28 +362,29 @@ func TestSubmitQueuedResultIsCancelledAndRequeued(t *testing.T) {
 	if got := countState(t, st, store.StateQueued); got != 1 {
 		t.Errorf("queued = %d, want 1 (stays in our queue to retry)", got)
 	}
-	if n, err := st.CountOnTorBox(context.Background()); err != nil || n != 0 {
-		t.Errorf("CountOnTorBox = %d (err %v), want 0 (nothing adopted)", n, err)
+	if n, err := st.CountActiveSlots(context.Background()); err != nil || n != 0 {
+		t.Errorf("CountActiveSlots = %d (err %v), want 0 (nothing adopted)", n, err)
 	}
 }
 
-func TestSubmitGatesOnRealOccupancy(t *testing.T) {
-	// A torrent already pulled to local disk (LOCAL_DOWNLOAD) still holds its
-	// TorBox slot until reaped. With max_slots=1 and one such torrent, the
-	// submitter must not submit anything — even though no row is TORBOX_ACTIVE.
+func TestSubmitDoesNotCountCachedLocalDownloads(t *testing.T) {
+	// A torrent already cached on TorBox and being pulled to local disk
+	// (LOCAL_DOWNLOAD) is inactive on TorBox and holds no slot. With max_slots=1
+	// and one such torrent, the submitter must still submit a queued torrent — the
+	// slot is free even though a row carries a torbox_id.
 	st := newStore(t)
 	ctx := context.Background()
 
-	busy, _, err := st.AddTorrent(ctx, store.AddTorrentParams{Infohash: fmt.Sprintf("%040x", 1), Name: "busy"})
+	cached, _, err := st.AddTorrent(ctx, store.AddTorrentParams{Infohash: fmt.Sprintf("%040x", 1), Name: "cached"})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := st.MarkActive(ctx, busy.ID, 100); err != nil { // torbox_id set → occupies a slot
+	if err := st.MarkActive(ctx, cached.ID, 100); err != nil { // torbox_id set...
 		t.Fatal(err)
 	}
 	if _, err := st.DB().ExecContext(ctx,
-		`UPDATE torrents SET state = ? WHERE id = ?`, store.StateLocalDload, busy.ID); err != nil {
-		t.Fatal(err)
+		`UPDATE torrents SET state = ? WHERE id = ?`, store.StateLocalDload, cached.ID); err != nil {
+		t.Fatal(err) // ...but cached + pulling locally → no active slot
 	}
 	seedQueued2(t, st, 2) // two waiting in our queue
 
@@ -393,8 +395,8 @@ func TestSubmitGatesOnRealOccupancy(t *testing.T) {
 	if err := e.submitPass(ctx); err != nil {
 		t.Fatalf("submitPass: %v", err)
 	}
-	if tb.calls != 0 {
-		t.Errorf("createtorrent calls = %d, want 0 (the slot is held by a downloading torrent)", tb.calls)
+	if tb.calls != 1 {
+		t.Errorf("createtorrent calls = %d, want 1 (the local-download torrent holds no slot)", tb.calls)
 	}
 }
 

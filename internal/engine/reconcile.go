@@ -71,17 +71,17 @@ func indexTorBox(list []torbox.Torrent) (map[int]torbox.Torrent, map[string]torb
 }
 
 // reapPass deletes from TorBox every torrent that is finished with it (COMPLETE
-// or ERROR) yet still holds a slot, then clears its refs so the slot frees for
-// the submitter. It is the self-healing backstop to downloadOne's
-// delete-on-complete: a delete missed because the app was an older build, was
-// restarted between completion and delete, or hit a transient TorBox error would
-// otherwise pin a scarce slot forever — the failure mode where completed
-// torrents seed indefinitely and starve the queue.
+// or ERROR) yet is still present on the account, then clears its refs. This is
+// hygiene, not slot recovery: with seeding disabled a cached torrent is inactive
+// and holds no slot, so a leftover — from a delete missed because the app was an
+// older build, was restarted between completion and delete, or hit a transient
+// TorBox error — only clutters mylist; it does not pin a slot or starve the queue.
+// We still clean it up so the account's list stays tied to what we track.
 func (e *Engine) reapPass(ctx context.Context, reapable []store.Torrent, byID map[int]torbox.Torrent, byHash map[string]torbox.Torrent) {
 	if len(reapable) == 0 {
 		return
 	}
-	e.log.Info("reaping torrents still holding a TorBox slot after completion/failure", "count", len(reapable))
+	e.log.Info("reaping leftover torrents on TorBox after completion/failure", "count", len(reapable))
 	for _, t := range reapable {
 		if ctx.Err() != nil {
 			return

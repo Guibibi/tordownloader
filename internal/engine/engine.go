@@ -204,14 +204,14 @@ func (e *Engine) submitPass(ctx context.Context) error {
 		// In createtorrent rate-limit cooldown; skip quietly until it elapses.
 		return nil
 	}
-	// Gate on real TorBox occupancy, not the count of TORBOX_ACTIVE rows. A torrent
-	// holds a slot for its whole life on the account — caching, while we pull it to
-	// disk (LOCAL_QUEUED/LOCAL_DOWNLOAD), and while it sits COMPLETE-but-not-yet-
-	// reaped — and none of those later states are TORBOX_ACTIVE. Counting only
-	// TORBOX_ACTIVE under-counts occupancy, so we'd over-submit and TorBox would
-	// queue the overflow; gating on the true count means createtorrent never has to
-	// be queued and our own QUEUED state is the single queue.
-	onTorBox, err := e.store.CountOnTorBox(ctx)
+	// Gate on the slots actually in use: torrents TorBox is currently caching
+	// (state TORBOX_ACTIVE). A torrent stops consuming a slot the moment TorBox
+	// finishes caching it — we then pull it from the CDN (LOCAL_QUEUED/
+	// LOCAL_DOWNLOAD) and later mark it COMPLETE, none of which hold a slot (cached
+	// plus seeding-disabled = inactive on TorBox). So only active caching counts.
+	// Staying at/below the cap also keeps createtorrent out of TorBox's own queue,
+	// so our QUEUED state remains the single queue.
+	used, err := e.store.CountActiveSlots(ctx)
 	if err != nil {
 		return err
 	}
@@ -219,14 +219,14 @@ func (e *Engine) submitPass(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	free := e.maxSlots - onTorBox
+	free := e.maxSlots - used
 	if free <= 0 {
 		// Slots are full: surface that queued torrents are waiting (otherwise this
 		// looks like a stuck/nameless hash from the *arr side). Logged once per
 		// contention episode to avoid spamming every pass.
 		if len(queued) > 0 && !e.slotWaitLogged {
 			e.log.Info("all TorBox slots busy; queued torrents waiting for a slot",
-				"queued", len(queued), "on_torbox", onTorBox, "max_slots", e.maxSlots)
+				"queued", len(queued), "in_use", used, "max_slots", e.maxSlots)
 			e.slotWaitLogged = true
 		}
 		return nil

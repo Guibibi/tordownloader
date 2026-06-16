@@ -27,10 +27,11 @@ func setQueuedID(t *testing.T, st *Store, id int64, queuedID int) {
 	}
 }
 
-// CountOnTorBox counts every torrent still holding a TorBox identifier (active id
-// or queued id) — the true slot occupancy — and excludes rows whose refs were
-// cleared on deletion.
-func TestCountOnTorBox(t *testing.T) {
+// CountActiveSlots counts only torrents TorBox is actively caching (state
+// TORBOX_ACTIVE) — the real concurrent-slot occupancy. A QUEUED torrent isn't
+// submitted yet, and one we've moved to LOCAL_* (cached, pulling from the CDN)
+// is inactive on TorBox; neither holds a slot, even while carrying a torbox_id.
+func TestCountActiveSlots(t *testing.T) {
 	ctx := context.Background()
 	st := newWritesStore(t)
 
@@ -41,26 +42,29 @@ func TestCountOnTorBox(t *testing.T) {
 		}
 		return tr.ID
 	}
-	active := mk(hash(1))  // active torrent id → counts
-	queued := mk(hash(2))  // legacy queued id → counts
-	pending := mk(hash(3)) // QUEUED, no refs → does not count
+	a := mk(hash(1))       // caching on TorBox → counts
+	b := mk(hash(2))       // caching on TorBox → counts
+	pending := mk(hash(3)) // QUEUED, not submitted → no slot
 	_ = pending
 
-	if err := st.MarkActive(ctx, active, 100); err != nil {
+	if err := st.MarkActive(ctx, a, 100); err != nil {
 		t.Fatal(err)
 	}
-	setQueuedID(t, st, queued, 200)
-
-	if n, err := st.CountOnTorBox(ctx); err != nil || n != 2 {
-		t.Fatalf("CountOnTorBox = %d (err %v), want 2", n, err)
-	}
-
-	// Clearing one's refs frees its slot from the count.
-	if err := st.ClearTorBoxRefs(ctx, active); err != nil {
+	if err := st.MarkActive(ctx, b, 200); err != nil {
 		t.Fatal(err)
 	}
-	if n, err := st.CountOnTorBox(ctx); err != nil || n != 1 {
-		t.Fatalf("CountOnTorBox after clear = %d (err %v), want 1", n, err)
+	if n, err := st.CountActiveSlots(ctx); err != nil || n != 2 {
+		t.Fatalf("CountActiveSlots = %d (err %v), want 2", n, err)
+	}
+
+	// Once TorBox has cached it, we move it to LOCAL_QUEUED to pull from the CDN;
+	// it goes inactive on TorBox and frees its slot, even though it keeps its
+	// torbox_id until we later delete it.
+	if err := st.MarkLocalQueued(ctx, a, "/downloads/show", 10, nil); err != nil {
+		t.Fatal(err)
+	}
+	if n, err := st.CountActiveSlots(ctx); err != nil || n != 1 {
+		t.Fatalf("CountActiveSlots after caching = %d (err %v), want 1", n, err)
 	}
 }
 

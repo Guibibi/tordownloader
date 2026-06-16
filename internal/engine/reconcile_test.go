@@ -461,8 +461,8 @@ func TestReconcileAdoptsChangedID(t *testing.T) {
 }
 
 // A COMPLETE torrent still present on TorBox is reaped: deleted from the account
-// and its refs cleared, freeing the slot. This is the self-heal for completed
-// torrents that would otherwise seed forever and starve the queue.
+// and its refs cleared (hygiene). With seeding disabled it already holds no slot,
+// so this just keeps mylist tied to what we track and stops it being re-reaped.
 func TestReconcileReapsCompletedFromTorBox(t *testing.T) {
 	st := newStore(t)
 	ctx := context.Background()
@@ -489,13 +489,14 @@ func TestReconcileReapsCompletedFromTorBox(t *testing.T) {
 	if deleted != 1 || deletedOp != torbox.OpDelete {
 		t.Errorf("ControlTorrent = (calls %d, op %q), want (1, delete)", deleted, deletedOp)
 	}
-	if n, err := st.CountOnTorBox(ctx); err != nil || n != 0 {
-		t.Errorf("CountOnTorBox = %d (err %v), want 0 (slot freed)", n, err)
+	// Refs cleared after the delete, so it drops out of the reaper's worklist.
+	if reap, err := st.ListReapable(ctx); err != nil || len(reap) != 0 {
+		t.Errorf("ListReapable = %d (err %v), want 0 (refs cleared after reap)", len(reap), err)
 	}
 }
 
 // A COMPLETE torrent already gone from TorBox (e.g. deleted out-of-band) is not
-// re-deleted; the reaper just clears our accounting so the slot frees.
+// re-deleted; the reaper just clears our accounting so it isn't reaped again.
 func TestReconcileReapClearsRefsWhenAlreadyGone(t *testing.T) {
 	st := newStore(t)
 	ctx := context.Background()
@@ -519,8 +520,9 @@ func TestReconcileReapClearsRefsWhenAlreadyGone(t *testing.T) {
 	if deleteCalls != 0 {
 		t.Errorf("ControlTorrent calls = %d, want 0 (already gone, nothing to delete)", deleteCalls)
 	}
-	if n, err := st.CountOnTorBox(ctx); err != nil || n != 0 {
-		t.Errorf("CountOnTorBox = %d (err %v), want 0 (refs cleared)", n, err)
+	// Refs still get cleared, so it drops out of the reaper's worklist.
+	if reap, err := st.ListReapable(ctx); err != nil || len(reap) != 0 {
+		t.Errorf("ListReapable = %d (err %v), want 0 (refs cleared)", len(reap), err)
 	}
 }
 

@@ -102,28 +102,31 @@ func (s *Store) MarkActive(ctx context.Context, id int64, torboxID int) error {
 	return nil
 }
 
-// CountOnTorBox returns how many torrents still occupy a TorBox slot: any row
-// that still holds a TorBox identifier (an active torrent id or a queued id). A
-// slot is held for a torrent's whole life on the account — while caching, while
-// we pull it to local disk, and until it is deleted — so this, not the count of
-// TORBOX_ACTIVE rows, is the true occupancy the submitter must gate on.
-// Successful deletion clears the refs (ClearTorBoxRefs), dropping the row from
-// this count and freeing the slot for the next submission.
-func (s *Store) CountOnTorBox(ctx context.Context) (int, error) {
+// CountActiveSlots returns how many torrents currently occupy one of the account's
+// concurrent TorBox slots. A torrent consumes a slot only while it is active on
+// TorBox — caching/downloading (state TORBOX_ACTIVE), or seeding, which we leave
+// disabled. Once TorBox finishes caching, the torrent goes inactive: we move it to
+// LOCAL_* and pull it from the CDN (a plain file download that holds no slot), and
+// later mark it COMPLETE — so those rows, and COMPLETE/ERROR rows still awaiting
+// reap, are deliberately excluded even though they may still carry a torbox_id.
+// This count, gated against max_active_slots, tells the submitter whether a new
+// createtorrent has room.
+func (s *Store) CountActiveSlots(ctx context.Context) (int, error) {
 	var n int
 	err := s.db.QueryRowContext(ctx,
-		`SELECT COUNT(*) FROM torrents WHERE torbox_id IS NOT NULL OR torbox_queued_id IS NOT NULL`).Scan(&n)
+		`SELECT COUNT(*) FROM torrents WHERE state = ?`, StateTorBoxActive).Scan(&n)
 	if err != nil {
-		return 0, fmt.Errorf("count on torbox: %w", err)
+		return 0, fmt.Errorf("count active slots: %w", err)
 	}
 	return n, nil
 }
 
 // ListReapable returns torrents that are done with TorBox — COMPLETE (content is
 // safely on local disk) or ERROR (abandoned) — yet still hold a TorBox
-// identifier: they were never successfully deleted and are still pinning a scarce
-// slot. The reaper deletes these from TorBox and clears their refs. Oldest-first
-// so the longest-pinned slot is freed first.
+// identifier: they were never successfully deleted and still clutter the account's
+// list. The reaper deletes these from TorBox and clears their refs, oldest-first.
+// These hold no slot — a cached, non-seeding torrent is inactive on TorBox — so
+// this is hygiene, not slot recovery.
 func (s *Store) ListReapable(ctx context.Context) ([]Torrent, error) {
 	rows, err := s.db.QueryContext(ctx, fmt.Sprintf(`
 		SELECT %s FROM torrents
@@ -145,8 +148,9 @@ func (s *Store) ListReapable(ctx context.Context) ([]Torrent, error) {
 }
 
 // ClearTorBoxRefs drops a torrent's TorBox identifiers once it has been deleted
-// from the account. With both refs NULL the torrent no longer counts toward slot
-// occupancy (CountOnTorBox) and the reaper stops retrying its deletion.
+// from the account. With both refs NULL the torrent drops out of ListReapable so
+// the reaper stops retrying its deletion. (It does not change slot occupancy: a
+// COMPLETE/ERROR row is already inactive on TorBox and counts toward no slot.)
 // Idempotent; safe to call on a row about to be deleted.
 func (s *Store) ClearTorBoxRefs(ctx context.Context, id int64) error {
 	_, err := s.db.ExecContext(ctx, `
