@@ -48,9 +48,14 @@ type uiResponse struct {
 	Torrents []uiTorrent `json:"torrents"`
 	DLSpeed  int64       `json:"dlspeed"`
 	Version  string      `json:"version"`
-	// StallTimeout is the configured failure.stall_timeout in seconds; 0 means
-	// stall-failing is disabled and the dashboard shows no countdown.
+	// StallTimeout is the configured failure.stall_timeout in seconds — the grace
+	// for a fetch stalled at 0%; 0 means stall-failing is disabled for that tier
+	// and the dashboard shows no countdown.
 	StallTimeout int64 `json:"stall_timeout"`
+	// ProgressStallTimeout is the configured failure.progress_stall_timeout in
+	// seconds, used for the countdown on fetches that have made real progress;
+	// 0 disables it for them.
+	ProgressStallTimeout int64 `json:"progress_stall_timeout"`
 	// CachedStallTimeout is the configured failure.cached_stall_timeout in seconds,
 	// used for the countdown on cached torrents; 0 disables it for them.
 	CachedStallTimeout int64 `json:"cached_stall_timeout"`
@@ -123,11 +128,12 @@ func (h *Handler) uiTorrents(w http.ResponseWriter, r *http.Request) {
 	}
 
 	h.writeJSON(w, r, uiResponse{
-		Torrents:           out,
-		DLSpeed:            totalDL,
-		Version:            appVersion,
-		StallTimeout:       int64(h.stallTimeout / time.Second),
-		CachedStallTimeout: int64(h.cachedStallTimeout / time.Second),
+		Torrents:             out,
+		DLSpeed:              totalDL,
+		Version:              appVersion,
+		StallTimeout:         int64(h.stallTimeout / time.Second),
+		ProgressStallTimeout: int64(h.progressStallTimeout / time.Second),
+		CachedStallTimeout:   int64(h.cachedStallTimeout / time.Second),
 	})
 }
 

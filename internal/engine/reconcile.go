@@ -27,6 +27,7 @@ func (e *Engine) reconcilePass(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	e.pruneReannounce(active)
 	reapable, err := e.store.ListReapable(ctx)
 	if err != nil {
 		return err
@@ -174,26 +175,37 @@ func (e *Engine) reconcileOne(ctx context.Context, t store.Torrent, byID map[int
 	}
 	now := time.Now()
 
-	// Stall fail: the torrent is making no headway — no new bytes and progress
-	// isn't climbing. If it's been stuck this long it's a dead/unseeded release
-	// the wait won't rescue, so fail it: that reports an error to Sonarr/Radarr
-	// which blacklists the release and grabs another. A slow but moving download
-	// keeps resetting progress_at (via Advancing) and is never failed for speed.
-	//
-	// A cached release is a special case: TorBox already has the bytes, so a 0%
-	// sit is just the server materialising content it told us it has, not a dead
-	// peer-fetch. It gets the longer cachedStallAfter grace instead of the normal
-	// stallAfter — still bounded, so a genuinely broken hand-off can't hang forever.
-	if stallAfter := e.stallTimeoutFor(t); stallAfter > 0 && !advancing {
+	if advancing {
+		// Moving again: forget the nudge bookkeeping so a future stall episode
+		// starts a fresh reannounce cycle.
+		if _, wasStalled := e.lastReannounce[t.ID]; wasStalled {
+			e.log.Info("stalled torrent resumed progress",
+				"infohash", t.Infohash, "progress", fmt.Sprintf("%.0f%%", clamp01(tb.Progress)*100))
+			delete(e.lastReannounce, t.ID)
+		}
+	} else {
+		// Stalled: no new bytes and progress isn't climbing. How long we tolerate
+		// that depends on what's at stake (stallTimeoutFor): a 0% fetch is failed
+		// quickly — abandoning it costs nothing and the resulting error makes
+		// Sonarr/Radarr blacklist the release and grab another — while a fetch with
+		// real progress gets hours, because thin swarms lose their seeds and recover,
+		// and killing a partial download blacklists a release that would likely have
+		// finished. A slow but moving download keeps resetting progress_at (via
+		// Advancing) and is never failed for speed. While waiting, the stalled fetch
+		// is periodically nudged with a reannounce (maybeReannounce) so a returning
+		// seed is picked up promptly.
 		stalledSince := t.ProgressAt
 		if stalledSince == 0 {
 			stalledSince = t.ActiveSince
 		}
-		if now.Sub(time.Unix(stalledSince, 0)) > stallAfter {
-			e.fail(ctx, t, fmt.Sprintf("no download progress for %s (download_state=%q, seeds=%d, peers=%d, cached=%v)",
-				stallAfter, tb.DownloadState, tb.Seeds, tb.Peers, t.Cached))
+		stalledFor := now.Sub(time.Unix(stalledSince, 0))
+		hasProgress := t.TorBoxProgress > 0 || tb.Progress > 0
+		if stallAfter := e.stallTimeoutFor(t, hasProgress); stallAfter > 0 && stalledFor > stallAfter {
+			e.fail(ctx, t, fmt.Sprintf("no download progress for %s (progress=%.0f%%, download_state=%q, seeds=%d, peers=%d, cached=%v)",
+				stallAfter, clamp01(tb.Progress)*100, tb.DownloadState, tb.Seeds, tb.Peers, t.Cached))
 			return
 		}
+		e.maybeReannounce(ctx, t, tb, stalledFor)
 	}
 
 	// Optional absolute cap from active_since. Disabled by default
@@ -204,16 +216,69 @@ func (e *Engine) reconcileOne(ctx context.Context, t store.Torrent, byID map[int
 	}
 }
 
-// stallTimeoutFor returns the no-progress grace a torrent gets before it's failed:
-// the longer cachedStallAfter for a release TorBox reported as cached (it's only
-// waiting for the server to surface bytes it already has), or the normal
-// stallAfter for one being fetched from peers. A non-positive value disables the
-// stall check for that class.
-func (e *Engine) stallTimeoutFor(t store.Torrent) time.Duration {
-	if t.Cached {
+// stallTimeoutFor returns the no-progress grace a torrent gets before it's
+// failed. Three tiers: a release TorBox reported as cached waits on TorBox
+// itself, not on peers (cachedStallAfter); a peer-fetch that has already made
+// real progress gets the long progressStallAfter, because thin swarms drop to
+// zero seeds and recover on a scale of hours and failing it would blacklist a
+// release that would likely finish; a fetch that never left 0% gets the short
+// stallAfter, since abandoning it costs nothing and lets Sonarr/Radarr fall back
+// to another release sooner. A non-positive value disables the stall check for
+// that tier.
+func (e *Engine) stallTimeoutFor(t store.Torrent, hasProgress bool) time.Duration {
+	switch {
+	case t.Cached:
 		return e.cachedStallAfter
+	case hasProgress:
+		return e.progressStallAfter
+	default:
+		return e.stallAfter
 	}
-	return e.stallAfter
+}
+
+// maybeReannounce nudges a stalled peer-fetch with a TorBox reannounce so its
+// client re-contacts trackers, at most once per reannounceEvery. Stalls are
+// often transient — seeds drop off and come back — and a reannounce picks a
+// returning swarm up sooner than passively waiting on the stall clock. Cached
+// releases are skipped (they wait on TorBox, not on peers). The nudge time is
+// recorded per attempt (success or not) so a failing controltorrent call is not
+// retried every poll tick.
+func (e *Engine) maybeReannounce(ctx context.Context, t store.Torrent, tb torbox.Torrent, stalledFor time.Duration) {
+	if e.reannounceEvery <= 0 || t.Cached || tb.ID == 0 {
+		return
+	}
+	if stalledFor < e.reannounceEvery || time.Since(e.lastReannounce[t.ID]) < e.reannounceEvery {
+		return
+	}
+	e.lastReannounce[t.ID] = time.Now()
+	if err := e.torbox.ControlTorrent(ctx, tb.ID, torbox.OpReannounce); err != nil {
+		e.log.Warn("reannounce stalled torrent (continuing)",
+			"infohash", t.Infohash, "torbox_id", tb.ID, "err", err)
+		return
+	}
+	e.log.Info("stalled; nudged TorBox to reannounce",
+		"infohash", t.Infohash, "stalled_for", stalledFor.Round(time.Second),
+		"progress", fmt.Sprintf("%.0f%%", clamp01(tb.Progress)*100),
+		"seeds", tb.Seeds, "peers", tb.Peers)
+}
+
+// pruneReannounce drops reannounce bookkeeping for torrents that are no longer
+// TORBOX_ACTIVE (failed, completed, or deleted) so the map cannot grow
+// unbounded. Like lastReannounce itself, this runs only on the reconcile
+// goroutine.
+func (e *Engine) pruneReannounce(active []store.Torrent) {
+	if len(e.lastReannounce) == 0 {
+		return
+	}
+	keep := make(map[int64]bool, len(active))
+	for _, t := range active {
+		keep[t.ID] = true
+	}
+	for id := range e.lastReannounce {
+		if !keep[id] {
+			delete(e.lastReannounce, id)
+		}
+	}
 }
 
 // lookupTorBox finds a torrent's mylist entry, preferring its stored id and

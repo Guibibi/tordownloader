@@ -52,9 +52,15 @@ headless, download-to-disk. Runs as one Docker container on the user's **Unraid*
   `controlqueued` and retry from our own queue. The old "adopt the queued_id, re-match
   by infohash on activation" path was removed — it was a fragile second namespace.
 - Headless: YAML/env config, SQLite state, logs (no Web UI in v1).
-- Fail on *stall* (not on slowness): cache check on add (informational); ERROR only when a
-  fetching torrent makes no progress for `failure.stall_timeout` (default 10m). Optional
-  absolute `failure.timeout` cap, disabled by default. See Gotchas.
+- Fail on *stall* (not on slowness), with **progress-tiered patience** (2026-07-12):
+  a fetch stalled at 0% fails after `failure.stall_timeout` (default 20m — cheap to
+  abandon, lets Sonarr re-grab); one with real progress gets
+  `failure.progress_stall_timeout` (default 2h — thin swarms recover seeds on a scale
+  of hours, and failing blacklists what is often the only viable release); cached
+  releases get `failure.cached_stall_timeout` (default 30m). While stalled the engine
+  nudges TorBox with `controltorrent reannounce` every `failure.reannounce_interval`
+  (default 5m). Cache check on add stays informational. Optional absolute
+  `failure.timeout` cap, disabled by default. See Gotchas.
 - No auth on the qBittorrent API (LAN trust).
 - Pure-Go stack (no cgo) for easy Unraid Docker builds: `modernc.org/sqlite`,
   `anacrolix/torrent/metainfo` for infohash, stdlib `net/http`+`slog`.
@@ -70,11 +76,15 @@ headless, download-to-disk. Runs as one Docker container on the user's **Unraid*
 - COMPLETE must be reported as `pausedUP` (an "UP" state). Never `pausedDL` — Sonarr treats
   `*DL` as not-done.
 - A fetching torrent is failed (→ ERROR, so Sonarr blacklists the release) only when it
-  *stalls*: no bytes moving and progress not climbing for `failure.stall_timeout` (default
-  10m). It is never failed just for being slow — a download still moving bytes keeps resetting
-  the stall clock (tracked via `torrents.progress_at`). `failure.timeout` is an optional
-  absolute cap from active_since, disabled by default. Both clocks run only while
-  TORBOX_ACTIVE, not while waiting in our own queue.
+  *stalls*: no bytes moving and progress not climbing for its tier's grace —
+  `failure.stall_timeout` (default 20m) at 0% progress, `failure.progress_stall_timeout`
+  (default 2h) once it has real progress, `failure.cached_stall_timeout` (default 30m) for
+  cached. It is never failed just for being slow — a download still moving bytes keeps
+  resetting the stall clock (tracked via `torrents.progress_at`). Stalled fetches get a
+  TorBox `reannounce` nudge every `failure.reannounce_interval` (default 5m; throttled via
+  the engine's in-memory `lastReannounce`). `failure.timeout` is an optional absolute cap
+  from active_since, disabled by default. All these clocks run only while TORBOX_ACTIVE,
+  not while waiting in our own queue.
 - TorBox may **queue** a `createtorrent` (returns a queued id, not a torrent id) when the
   account's active slots are full. We no longer adopt that queue: we gate submissions on real
   slot occupancy so it shouldn't happen, and if it does we `controlqueued`-delete the entry and

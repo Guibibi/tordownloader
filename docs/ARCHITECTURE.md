@@ -75,8 +75,14 @@ from it (see API_REFERENCE.md §3 for the exact mapping).
 - **QUEUED**: accepted from Sonarr, waiting for a TorBox slot. Reported as in-progress
   (e.g. `stalledDL`/`metaDL`). The stall clock is **not** running here.
 - **TORBOX_ACTIVE**: submitted via `createtorrent`; TorBox is fetching/caching. The stall
-  detector runs (fail only when no progress for `stall_timeout`, never for slowness).
-  Progress = TorBox progress mapped to the first half of the bar.
+  detector runs (fail only on no-progress, never for slowness) with tiered patience: a
+  fetch stalled at 0% is failed after `stall_timeout` (default 20m — abandoning it costs
+  nothing and lets Sonarr re-grab sooner), one with real progress gets
+  `progress_stall_timeout` (default 2h — thin swarms lose their seeds and recover on a
+  scale of hours; killing a partial fetch blacklists a release that would likely finish),
+  and a cached release gets `cached_stall_timeout` (default 30m). While stalled, TorBox is
+  nudged with a `reannounce` every `reannounce_interval` (default 5m) so returning seeds
+  are picked up promptly. Progress = TorBox progress mapped to the first half of the bar.
 - **LOCAL_QUEUED / LOCAL_DOWNLOAD**: TorBox has the files; we are downloading them to disk.
   Progress = second half of the bar.
 - **COMPLETE**: all files on disk; reported as `pausedUP` with a valid `content_path`.
@@ -100,8 +106,10 @@ from it (see API_REFERENCE.md §3 for the exact mapping).
   keep `mylist` tidy (hygiene; with seeding off a cached torrent is already inactive and
   holds no slot, so this isn't slot recovery) — then (b) updates each
   TORBOX_ACTIVE torrent's `torbox_state`, `progress`, `download_present`, file list, driving
-  TORBOX_ACTIVE → LOCAL_QUEUED and failing torrents that stall (no forward progress for
-  `stall_timeout`) or exceed the optional absolute `timeout` cap.
+  TORBOX_ACTIVE → LOCAL_QUEUED and failing torrents that stall (no forward progress for the
+  tier's grace — `stall_timeout` at 0%, `progress_stall_timeout` once progressed,
+  `cached_stall_timeout` for cached) or exceed the optional absolute `timeout` cap; stalled
+  fetches get a `reannounce` nudge every `reannounce_interval` while they wait.
 - **Downloader**: pulls LOCAL_QUEUED torrents, enumerates files, requests `requestdl` per file,
   downloads with bounded concurrency into an incomplete dir, atomically moves into the save
   path, then → COMPLETE. Re-requests expired links; resumes partial files via Range on restart.
@@ -193,7 +201,7 @@ categories(
 
 | Situation | Behavior |
 |---|---|
-| Stalled while active (no progress for `stall_timeout`, default 10m) | → ERROR (Sonarr blacklists, re-grabs). Slow-but-moving fetches are not failed. Any failure of a submitted torrent also best-effort deletes it from TorBox so failed grabs don't pile up. |
+| Stalled while active (no forward progress) | → ERROR after the tier's grace: `stall_timeout` (default 20m) at 0%, `progress_stall_timeout` (default 2h) once the fetch has real progress, `cached_stall_timeout` (default 30m) for cached releases. Sonarr blacklists, re-grabs. Slow-but-moving fetches are not failed. While stalled, TorBox gets a `reannounce` nudge every `reannounce_interval` (default 5m). Any failure of a submitted torrent also best-effort deletes it from TorBox so failed grabs don't pile up. |
 | Exceeds optional absolute `timeout` cap (disabled by default) | → ERROR. |
 | TorBox rejects >200GB | → ERROR immediately. |
 | `createtorrent` rate-limited (429) | Pause submissions for a cooldown (hourly quota), stay QUEUED. |

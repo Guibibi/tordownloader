@@ -61,16 +61,29 @@ type FailureConfig struct {
 	// scarce TorBox slot.
 	Timeout Duration `yaml:"timeout"`
 	// StallTimeout fails a torrent that makes no forward progress (no bytes moving
-	// and progress not climbing) for this long — a dead or unseeded release. A
-	// slow but advancing download keeps resetting the clock and is never failed for
-	// being slow. A non-positive value disables stall detection.
+	// and progress not climbing) for this long while still at 0% — a dead or
+	// unseeded release, where abandoning costs nothing and lets Sonarr/Radarr try
+	// another release sooner. A slow but advancing download keeps resetting the
+	// clock and is never failed for being slow. A non-positive value disables
+	// stall detection for zero-progress torrents.
 	StallTimeout Duration `yaml:"stall_timeout"`
+	// ProgressStallTimeout is the stall grace for a torrent that has already made
+	// real progress (>0%). Thin swarms lose their seeds for a while and recover on
+	// a scale of hours, and failing a partial fetch blacklists a release that
+	// would likely have finished — so it gets far more patience than a 0% one. A
+	// non-positive value disables stall-failing for torrents with progress.
+	ProgressStallTimeout Duration `yaml:"progress_stall_timeout"`
 	// CachedStallTimeout is the stall grace for a release TorBox reported as cached.
 	// Such a release sits at 0% only while TorBox materialises bytes it already has,
 	// not because peers are dead, so it gets a longer grace than StallTimeout — but
 	// still bounded, as a safety net if the hand-off is genuinely broken. A
 	// non-positive value disables stall-failing for cached releases.
 	CachedStallTimeout Duration `yaml:"cached_stall_timeout"`
+	// ReannounceInterval is how often a stalled (non-cached) fetch is nudged with a
+	// TorBox reannounce so its client re-contacts trackers — stalls are often
+	// transient (seeds drop off and return) and a nudge can pick recovered peers up
+	// sooner than passively waiting. A non-positive value disables nudging.
+	ReannounceInterval Duration `yaml:"reannounce_interval"`
 }
 
 // LogConfig configures structured logging.
@@ -96,8 +109,14 @@ func Default() *Config {
 			ParallelFiles:    4,
 		},
 		Database: DatabaseConfig{Path: "data/tordownloader.db"},
-		Failure:  FailureConfig{Timeout: 0, StallTimeout: Duration(10 * time.Minute), CachedStallTimeout: Duration(30 * time.Minute)},
-		Log:      LogConfig{Level: "info", Format: "text"},
+		Failure: FailureConfig{
+			Timeout:              0,
+			StallTimeout:         Duration(20 * time.Minute),
+			ProgressStallTimeout: Duration(2 * time.Hour),
+			CachedStallTimeout:   Duration(30 * time.Minute),
+			ReannounceInterval:   Duration(5 * time.Minute),
+		},
+		Log: LogConfig{Level: "info", Format: "text"},
 	}
 }
 

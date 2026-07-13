@@ -92,13 +92,19 @@ done/seeding → importable. So COMPLETE must report an "UP" state (`pausedUP`).
 | ERROR | stall (no progress) / TorBox fail / >200GB / dl fail | `error` | **failed → blacklist & re-grab** |
 
 > A TORBOX_ACTIVE torrent is failed only when it **stalls** — no bytes moving and
-> progress not climbing — for `failure.stall_timeout` (default 10m). It is never
-> failed just for being slow: a download still moving bytes keeps resetting the
-> stall clock (tracked via `torrents.progress_at`), so a legitimately slow,
-> uncached fetch runs as long as it needs. `failure.timeout` is an optional
+> progress not climbing — for its tier's grace: `failure.stall_timeout` (default
+> 20m) while still at 0%, the much longer `failure.progress_stall_timeout`
+> (default 2h) once it has made real progress (thin swarms lose their seeds and
+> recover on a scale of hours), or `failure.cached_stall_timeout` (default 30m)
+> for a cached release waiting on TorBox itself. It is never failed just for
+> being slow: a download still moving bytes keeps resetting the stall clock
+> (tracked via `torrents.progress_at`), so a legitimately slow, uncached fetch
+> runs as long as it needs. While stalled, the engine nudges TorBox with a
+> `controltorrent reannounce` every `failure.reannounce_interval` (default 5m) so
+> returning seeds are picked up promptly. `failure.timeout` is an optional
 > absolute cap from when it became active, **disabled by default** (set it to bound
-> how long a perpetually-slow torrent may hold a scarce TorBox slot). Set
-> `stall_timeout` ≤ 0 to disable stall detection.
+> how long a perpetually-slow torrent may hold a scarce TorBox slot). Set any
+> stall timeout ≤ 0 to disable stall detection for that tier.
 
 > Never report `pausedDL` for a finished item — Sonarr treats `*DL` states as not-done.
 > Use `pausedUP` (an "UP" state) to signal completion.

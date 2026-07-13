@@ -22,7 +22,7 @@ download-to-disk** (no mount-based streaming).
 - **Real downloads to disk** — pulls finished files from TorBox to `/<root>/<category>/<name>/…`, preserving folder structure. No mount, no streaming.
 - **Safe imports** — downloads into a `.incomplete` staging dir, then atomic-moves into place, so Sonarr/Radarr never import a half-written file.
 - **Plan-aware** — respects TorBox's concurrent-slot limit (3 on Essential), queues the rest, and paces API calls to stay under TorBox's rate limit.
-- **Fails on stalls, not slowness** — a dead/unseeded release is errored so Sonarr blacklists it and grabs another, but a slow-but-moving download is left to finish.
+- **Fails on stalls, not slowness** — a dead/unseeded release is errored so Sonarr blacklists it and grabs another, but a slow-but-moving download is left to finish. Patience is tiered: a fetch stuck at 0% fails quickly, one with real progress gets hours (thin swarms recover their seeds), and stalled fetches are periodically nudged with a tracker reannounce.
 - **Clean teardown** — when Sonarr/Radarr remove a download, it's deleted from TorBox and local disk too.
 - **Status dashboard** — a built-in web page shows live per-torrent and per-file progress.
 - **Headless & light** — YAML/env config, SQLite state, structured logs; a single static binary, no cgo.

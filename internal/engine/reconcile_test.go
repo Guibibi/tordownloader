@@ -232,6 +232,134 @@ func TestReconcileStallFail(t *testing.T) {
 	}
 }
 
+// setProgress backdates a torrent's stored torbox_progress so a live mylist
+// entry reporting the same value doesn't count as "advancing".
+func setProgress(t *testing.T, st *store.Store, id int64, progress float64) {
+	t.Helper()
+	if _, err := st.DB().ExecContext(context.Background(),
+		`UPDATE torrents SET torbox_progress = ? WHERE id = ?`, progress, id); err != nil {
+		t.Fatalf("set torbox_progress: %v", err)
+	}
+}
+
+func TestReconcileProgressStallUsesLongerWindow(t *testing.T) {
+	st := newStore(t)
+	hash := "5151515151515151515151515151515151515151"
+	// Stalled at 24% for 30m: past the 5m zero-progress window, but a fetch with
+	// real progress gets the 2h grace — its swarm may recover — so it must NOT be
+	// failed.
+	tr := seedActive(t, st, hash, 51, "/downloads/tv", 30*time.Minute)
+	setProgress(t, st, tr.ID, 0.24)
+
+	tb := &fakeTB{list: func() ([]torbox.Torrent, error) {
+		return []torbox.Torrent{{
+			ID: 51, DownloadState: "stalled (no seeds)", Active: true, Seeds: 0, Peers: 9,
+			Progress: 0.24, DownloadSpeed: 0,
+		}}, nil
+	}}
+	e := New(st, tb, Config{MaxSlots: 3, StallTimeout: 5 * time.Minute, ProgressStallTimeout: 2 * time.Hour}, nil)
+	if err := e.reconcilePass(context.Background()); err != nil {
+		t.Fatalf("reconcilePass: %v", err)
+	}
+	if tr := getTorrent(t, st, hash); tr.State != store.StateTorBoxActive {
+		t.Fatalf("state = %q, want TORBOX_ACTIVE (has progress, within longer window)", tr.State)
+	}
+}
+
+func TestReconcileProgressStallFailPastWindow(t *testing.T) {
+	st := newStore(t)
+	hash := "5252525252525252525252525252525252525252"
+	// Stalled at 24% for 3h, past even the 2h with-progress grace: the swarm is
+	// not coming back, fail it so Sonarr can try another release.
+	tr := seedActive(t, st, hash, 52, "/downloads/tv", 3*time.Hour)
+	setProgress(t, st, tr.ID, 0.24)
+
+	tb := &fakeTB{list: func() ([]torbox.Torrent, error) {
+		return []torbox.Torrent{{
+			ID: 52, DownloadState: "stalled (no seeds)", Active: true, Seeds: 0, Peers: 2,
+			Progress: 0.24, DownloadSpeed: 0,
+		}}, nil
+	}}
+	e := New(st, tb, Config{MaxSlots: 3, StallTimeout: 5 * time.Minute, ProgressStallTimeout: 2 * time.Hour}, nil)
+	if err := e.reconcilePass(context.Background()); err != nil {
+		t.Fatalf("reconcilePass: %v", err)
+	}
+	if tr := getTorrent(t, st, hash); tr.State != store.StateError {
+		t.Fatalf("state = %q, want ERROR (stalled past with-progress window)", tr.State)
+	}
+}
+
+func TestReconcileStalledNudgesReannounce(t *testing.T) {
+	st := newStore(t)
+	hash := "5353535353535353535353535353535353535353"
+	// Stalled at 24% for 10m with a 2h with-progress grace: not failed, but past
+	// the 5m reannounce interval — TorBox is nudged to re-contact trackers once,
+	// and a second pass inside the same interval does not nudge again.
+	tr := seedActive(t, st, hash, 53, "/downloads/tv", 10*time.Minute)
+	setProgress(t, st, tr.ID, 0.24)
+
+	var ops []torbox.Operation
+	tb := &fakeTB{
+		list: func() ([]torbox.Torrent, error) {
+			return []torbox.Torrent{{
+				ID: 53, DownloadState: "stalled (no seeds)", Active: true, Seeds: 0, Peers: 9,
+				Progress: 0.24, DownloadSpeed: 0,
+			}}, nil
+		},
+		ctl: func(id int, op torbox.Operation) error {
+			if id != 53 {
+				t.Errorf("ControlTorrent id = %d, want 53", id)
+			}
+			ops = append(ops, op)
+			return nil
+		},
+	}
+	e := New(st, tb, Config{
+		MaxSlots: 3, StallTimeout: 5 * time.Minute,
+		ProgressStallTimeout: 2 * time.Hour, ReannounceInterval: 5 * time.Minute,
+	}, nil)
+	for i := 0; i < 2; i++ {
+		if err := e.reconcilePass(context.Background()); err != nil {
+			t.Fatalf("reconcilePass #%d: %v", i+1, err)
+		}
+	}
+	if len(ops) != 1 || ops[0] != torbox.OpReannounce {
+		t.Errorf("ControlTorrent ops = %v, want exactly one reannounce", ops)
+	}
+	if tr := getTorrent(t, st, hash); tr.State != store.StateTorBoxActive {
+		t.Errorf("state = %q, want still TORBOX_ACTIVE", tr.State)
+	}
+}
+
+func TestReconcileReannounceDisabled(t *testing.T) {
+	st := newStore(t)
+	hash := "5454545454545454545454545454545454545454"
+	// Same stall, but nudging disabled (negative interval): no control calls at all.
+	tr := seedActive(t, st, hash, 54, "/downloads/tv", 10*time.Minute)
+	setProgress(t, st, tr.ID, 0.24)
+
+	calls := 0
+	tb := &fakeTB{
+		list: func() ([]torbox.Torrent, error) {
+			return []torbox.Torrent{{
+				ID: 54, DownloadState: "stalled (no seeds)", Active: true,
+				Progress: 0.24, DownloadSpeed: 0,
+			}}, nil
+		},
+		ctl: func(int, torbox.Operation) error { calls++; return nil },
+	}
+	e := New(st, tb, Config{
+		MaxSlots: 3, StallTimeout: 5 * time.Minute,
+		ProgressStallTimeout: 2 * time.Hour, ReannounceInterval: -1,
+	}, nil)
+	if err := e.reconcilePass(context.Background()); err != nil {
+		t.Fatalf("reconcilePass: %v", err)
+	}
+	if calls != 0 {
+		t.Errorf("ControlTorrent calls = %d, want 0 (reannounce disabled)", calls)
+	}
+}
+
 func TestReconcileCachedUsesLongerStallWindow(t *testing.T) {
 	st := newStore(t)
 	hash := "9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a"

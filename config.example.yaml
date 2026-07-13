@@ -24,8 +24,15 @@ database:
 failure:
   # A torrent is abandoned with an error (so Sonarr/Radarr blacklists the release
   # and grabs another) only when it makes no headway — never just for being slow.
-  stall_timeout: 10m               # ERROR after this long with no progress (no bytes moving, progress not climbing). <=0 disables
-  cached_stall_timeout: 30m        # longer grace for cached releases (they only wait for TorBox to surface bytes it already has); <=0 disables for cached
+  # How long a stall is tolerated depends on what's at stake: a fetch still at 0%
+  # is cheap to abandon, but one with real progress usually finishes once its thin
+  # swarm recovers a seed (often a matter of hours), so it gets far more patience.
+  # While stalled, TorBox is periodically nudged to reannounce so returning seeds
+  # are picked up promptly.
+  stall_timeout: 20m               # ERROR after this long stalled at 0% (no bytes moving, progress not climbing). <=0 disables
+  progress_stall_timeout: 2h       # much longer grace once a fetch has made real progress (>0%); <=0 disables for those
+  cached_stall_timeout: 30m        # grace for cached releases (they only wait for TorBox to surface bytes it already has); <=0 disables for cached
+  reannounce_interval: 5m          # nudge a stalled fetch with a TorBox reannounce this often; <=0 disables
   timeout: 0                       # optional absolute cap from when it becomes TorBox-active; 0 disables (bounds slow torrents holding a slot)
 
 log:
