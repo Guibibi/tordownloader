@@ -35,6 +35,23 @@ failure:
   reannounce_interval: 5m          # nudge a stalled fetch with a TorBox reannounce this often; <=0 disables
   timeout: 0                       # optional absolute cap from when it becomes TorBox-active; 0 disables (bounds slow torrents holding a slot)
 
+# Sonarr/Radarr failure push-back (strongly recommended). Sonarr never runs
+# failed-download handling from qBittorrent states — a torrent we report as
+# "error" only shows a warning in its queue and sits there forever; the release
+# is not blocklisted and no alternative is grabbed. With instances configured
+# here, tordownloader closes the loop itself: on failure it removes the queue
+# item via the *arr's own API with blocklist=true, which makes the *arr
+# blocklist the release, delete the torrent, and search for a replacement.
+# Instead of this section you can also set TD_SONARR_URL + TD_SONARR_API_KEY
+# and/or TD_RADARR_URL + TD_RADARR_API_KEY.
+# arr:
+#   - name: sonarr
+#     url: "http://sonarr:8989"    # base path OK, e.g. http://host:8989/sonarr
+#     api_key: "your-sonarr-key"   # Sonarr → Settings → General → API Key
+#   - name: radarr
+#     url: "http://radarr:7878"
+#     api_key: "your-radarr-key"
+
 log:
   level: "info"                    # debug | info | warn | error
   format: "text"                   # text | json

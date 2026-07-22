@@ -18,6 +18,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/guibibi/tordownloader/internal/arr"
 	"github.com/guibibi/tordownloader/internal/config"
 	"github.com/guibibi/tordownloader/internal/engine"
 	"github.com/guibibi/tordownloader/internal/qbit"
@@ -85,6 +86,27 @@ func run() error {
 	tbClient := torbox.New(cfg.TorBox.APIKey,
 		torbox.WithBaseURL(cfg.TorBox.BaseURL),
 		torbox.WithRateLimit(cfg.TorBox.MaxRequestsPerMin))
+
+	// Optional Sonarr/Radarr failure push-back: without it a failed download is
+	// never blocklisted or replaced (Sonarr ignores qBittorrent error states for
+	// failed-download handling), so warn when it's not configured.
+	var arrNotifier engine.ArrNotifier
+	if len(cfg.Arr) > 0 {
+		instances := make([]arr.Instance, 0, len(cfg.Arr))
+		for _, in := range cfg.Arr {
+			instances = append(instances, arr.Instance{Name: in.Name, URL: in.URL, APIKey: in.APIKey})
+			slog.Info("arr failure push-back enabled", "instance", in.Name, "url", in.URL)
+		}
+		notifier := arr.New(instances, slog.Default())
+		// Probe each instance in the background so a down/misconfigured *arr is
+		// reported in the log right away without delaying startup.
+		go notifier.VerifyConnections(ctx)
+		arrNotifier = notifier
+	} else {
+		slog.Warn("no arr instances configured: failed downloads will not be blocklisted/re-searched " +
+			"in Sonarr/Radarr (set arr: in config.yaml or TD_SONARR_URL/TD_SONARR_API_KEY)")
+	}
+
 	eng := engine.New(st, tbClient, engine.Config{
 		MaxSlots:             cfg.TorBox.MaxActiveSlots,
 		PollInterval:         cfg.TorBox.PollInterval.Std(),
@@ -96,6 +118,7 @@ func run() error {
 		ParallelFiles:        cfg.Download.ParallelFiles,
 		IncompleteSubdir:     cfg.Download.IncompleteSubdir,
 		CacheCheck:           cfg.TorBox.CacheCheck,
+		Arr:                  arrNotifier,
 	}, slog.Default())
 	go eng.Run(ctx)
 

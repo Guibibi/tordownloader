@@ -378,6 +378,42 @@ func (s *Store) MarkError(ctx context.Context, id int64, reason string) error {
 	return nil
 }
 
+// ListArrUnnotified returns ERROR torrents whose failure has not yet been
+// reported to Sonarr/Radarr (arr_notified = 0), oldest failure first. The
+// engine's arr pass works through these until each is blocklisted in its *arr
+// (or given up on) and marked notified.
+func (s *Store) ListArrUnnotified(ctx context.Context) ([]Torrent, error) {
+	rows, err := s.db.QueryContext(ctx, fmt.Sprintf(`
+		SELECT %s FROM torrents WHERE state = ? AND arr_notified = 0
+		ORDER BY updated_at, id`, torrentColumns), StateError)
+	if err != nil {
+		return nil, fmt.Errorf("list arr unnotified: %w", err)
+	}
+	defer rows.Close()
+	var out []Torrent
+	for rows.Next() {
+		t, err := scanTorrent(rows)
+		if err != nil {
+			return nil, fmt.Errorf("scan torrent: %w", err)
+		}
+		out = append(out, t)
+	}
+	return out, rows.Err()
+}
+
+// MarkArrNotified records that a failed torrent's *arr has been told (its queue
+// item removed with blocklist), or that no *arr tracks it and we stopped
+// trying. Either way the arr pass is done with the row.
+func (s *Store) MarkArrNotified(ctx context.Context, id int64) error {
+	_, err := s.db.ExecContext(ctx, `
+		UPDATE torrents SET arr_notified = 1, updated_at = ? WHERE id = ?`,
+		time.Now().Unix(), id)
+	if err != nil {
+		return fmt.Errorf("mark arr notified %d: %w", id, err)
+	}
+	return nil
+}
+
 // DeleteByHashes removes the torrents with the given infohashes (files cascade)
 // and returns how many rows were deleted. M3 only drops local rows; TorBox-side
 // deletion and local file removal are added in M6.

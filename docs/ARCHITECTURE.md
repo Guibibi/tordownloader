@@ -86,7 +86,12 @@ from it (see API_REFERENCE.md §3 for the exact mapping).
 - **LOCAL_QUEUED / LOCAL_DOWNLOAD**: TorBox has the files; we are downloading them to disk.
   Progress = second half of the bar.
 - **COMPLETE**: all files on disk; reported as `pausedUP` with a valid `content_path`.
-- **ERROR**: reported as `error` so Sonarr blacklists and grabs another release.
+- **ERROR**: reported as `error` (informational — Sonarr treats every qBittorrent
+  state as at most a warning and never triggers failed-download handling from it).
+  The actual blocklist-and-replace is pushed by us: the reconcile loop's arr pass
+  removes the matching *arr queue item via its API with `blocklist=true` +
+  `removeFromClient=true`, so the *arr blocklists the release, deletes the torrent
+  from us, and searches for an alternative (see `internal/arr`, config `arr:`).
 
 ## 4. Engine loops
 
@@ -201,7 +206,7 @@ categories(
 
 | Situation | Behavior |
 |---|---|
-| Stalled while active (no forward progress) | → ERROR after the tier's grace: `stall_timeout` (default 20m) at 0%, `progress_stall_timeout` (default 2h) once the fetch has real progress, `cached_stall_timeout` (default 30m) for cached releases. Sonarr blacklists, re-grabs. Slow-but-moving fetches are not failed. While stalled, TorBox gets a `reannounce` nudge every `reannounce_interval` (default 5m). Any failure of a submitted torrent also best-effort deletes it from TorBox so failed grabs don't pile up. |
+| Stalled while active (no forward progress) | → ERROR after the tier's grace: `stall_timeout` (default 20m) at 0%, `progress_stall_timeout` (default 2h) once the fetch has real progress, `cached_stall_timeout` (default 30m) for cached releases. The arr pass then pushes the failure to Sonarr/Radarr (blocklist + replacement search). Slow-but-moving fetches are not failed. While stalled, TorBox gets a `reannounce` nudge every `reannounce_interval` (default 5m). Any failure of a submitted torrent also best-effort deletes it from TorBox so failed grabs don't pile up. |
 | Exceeds optional absolute `timeout` cap (disabled by default) | → ERROR. |
 | TorBox rejects >200GB | → ERROR immediately. |
 | `createtorrent` rate-limited (429) | Pause submissions for a cooldown (hourly quota), stay QUEUED. |

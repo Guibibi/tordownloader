@@ -19,7 +19,20 @@ type Config struct {
 	Download DownloadConfig `yaml:"download"`
 	Database DatabaseConfig `yaml:"database"`
 	Failure  FailureConfig  `yaml:"failure"`
+	Arr      []ArrInstance  `yaml:"arr"`
 	Log      LogConfig      `yaml:"log"`
+}
+
+// ArrInstance is one Sonarr/Radarr endpoint to notify when a download fails
+// for good. Sonarr never triggers failed-download handling from qBittorrent
+// states (state=error is only a warning), so without this the *arr never
+// blocklists a failed release or grabs an alternative — the item just sits in
+// its queue. With an instance configured, tordownloader removes the failed
+// item via the *arr's own API with blocklist + redownload, closing the loop.
+type ArrInstance struct {
+	Name   string `yaml:"name"`    // label for logs; defaults to the URL
+	URL    string `yaml:"url"`     // e.g. http://sonarr:8989 (base path ok)
+	APIKey string `yaml:"api_key"` // Settings → General → API Key
 }
 
 // ServerConfig configures the qBittorrent-emulation HTTP API.
@@ -166,6 +179,26 @@ func (c *Config) applyEnv() {
 	if v := os.Getenv("TD_LOG_FORMAT"); v != "" {
 		c.Log.Format = v
 	}
+	// Docker-friendly shorthand for the common one-Sonarr / one-Radarr setup;
+	// appended to (not replacing) any instances from the YAML file.
+	c.applyArrEnv("sonarr", "TD_SONARR_URL", "TD_SONARR_API_KEY")
+	c.applyArrEnv("radarr", "TD_RADARR_URL", "TD_RADARR_API_KEY")
+}
+
+// applyArrEnv appends an *arr instance from a URL+key env pair, unless an
+// instance with that URL is already configured (env then overrides its key).
+func (c *Config) applyArrEnv(name, urlEnv, keyEnv string) {
+	url, key := os.Getenv(urlEnv), os.Getenv(keyEnv)
+	if url == "" || key == "" {
+		return
+	}
+	for i := range c.Arr {
+		if strings.TrimRight(c.Arr[i].URL, "/") == strings.TrimRight(url, "/") {
+			c.Arr[i].APIKey = key
+			return
+		}
+	}
+	c.Arr = append(c.Arr, ArrInstance{Name: name, URL: url, APIKey: key})
 }
 
 // Validate checks invariants the rest of the app relies on. Note: the TorBox
@@ -189,6 +222,21 @@ func (c *Config) Validate() error {
 	}
 	if c.TorBox.PollInterval.Std() <= 0 {
 		return errors.New("torbox.poll_interval must be > 0")
+	}
+	for i := range c.Arr {
+		in := &c.Arr[i]
+		if in.URL == "" {
+			return fmt.Errorf("arr[%d]: url is required", i)
+		}
+		if !strings.HasPrefix(in.URL, "http://") && !strings.HasPrefix(in.URL, "https://") {
+			return fmt.Errorf("arr[%d]: url %q must start with http:// or https://", i, in.URL)
+		}
+		if in.APIKey == "" {
+			return fmt.Errorf("arr[%d] (%s): api_key is required", i, in.URL)
+		}
+		if in.Name == "" {
+			in.Name = in.URL
+		}
 	}
 	switch strings.ToLower(c.Log.Level) {
 	case "debug", "info", "warn", "error":

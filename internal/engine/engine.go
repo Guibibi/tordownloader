@@ -47,6 +47,17 @@ const (
 // quota that won't recover for a while; this backs off without stalling forever.
 const createRateLimitCooldown = 2 * time.Minute
 
+// arrNotifyInterval throttles per-torrent failure notifications to the *arrs:
+// while an instance is unreachable (or hasn't listed the grab yet) the row is
+// retried once per interval, not on every reconcile tick.
+const arrNotifyInterval = time.Minute
+
+// arrNotFoundGrace is how long a failed torrent keeps being looked for in the
+// *arr queues before we accept that nothing tracks it and stop asking. A grab
+// that fails within seconds (e.g. a >200GB TorBox reject) can beat the *arr's
+// own queue refresh, so a single clean "not found" is not proof.
+const arrNotFoundGrace = 10 * time.Minute
+
 // TorBoxAPI is the slice of the TorBox client the engine needs: submitting
 // releases (submitter), polling account state (reconciler), requesting CDN
 // links (downloader), and deleting torrents (cleanup). The concrete
@@ -61,6 +72,16 @@ type TorBoxAPI interface {
 	CheckCached(ctx context.Context, hashes []string, listFiles bool) (map[string]torbox.CachedInfo, error)
 }
 
+// ArrNotifier reports a permanently failed torrent back to Sonarr/Radarr so the
+// release is blocklisted and a replacement search starts. Sonarr never runs
+// failed-download handling off qBittorrent states (state=error only shows a
+// warning), so without this push the failed item would sit in its queue
+// forever. Implemented by *arr.Notifier; tests substitute a fake. The bool is
+// true when some instance tracked the hash and was told.
+type ArrNotifier interface {
+	NotifyFailed(ctx context.Context, infohash, name string) (bool, error)
+}
+
 // Config tunes the engine's background workers.
 type Config struct {
 	MaxSlots             int           // TorBox concurrent-slot limit (default 1)
@@ -73,6 +94,7 @@ type Config struct {
 	ParallelFiles        int           // concurrent file downloads per torrent (default 4)
 	IncompleteSubdir     string        // staging dir under the save path (default .incomplete)
 	CacheCheck           bool          // log TorBox cache status on submit (informational)
+	Arr                  ArrNotifier   // optional: push failures to Sonarr/Radarr (nil = off)
 }
 
 // activeDownload tracks the currently in-flight download so a delete can
@@ -97,6 +119,7 @@ type Engine struct {
 	parallel           int
 	incomplete         string
 	cacheCheck         bool
+	arr                ArrNotifier
 	httpClient         *http.Client
 	log                *slog.Logger
 
@@ -118,6 +141,20 @@ type Engine struct {
 	// Touched only by the single reconcile goroutine; no lock needed. Entries are
 	// pruned each pass for torrents no longer active.
 	lastReannounce map[int64]time.Time
+
+	// arrAttempts tracks, per unnotified ERROR row, when we first and last tried
+	// to report it to the *arrs — throttling retries to arrNotifyInterval and
+	// bounding how long a clean "no *arr tracks this" keeps being re-checked
+	// (arrNotFoundGrace). Touched only by the reconcile goroutine; pruned when a
+	// row stops needing notification.
+	arrAttempts map[int64]arrAttempt
+}
+
+// arrAttempt is the retry bookkeeping for one failed torrent's *arr
+// notification.
+type arrAttempt struct {
+	first time.Time // first attempt (starts the not-found grace clock)
+	last  time.Time // last attempt (throttles retries)
 }
 
 // New builds an Engine from cfg, clamping unset/invalid fields to defaults.
@@ -172,7 +209,9 @@ func New(st *store.Store, tb TorBoxAPI, cfg Config, log *slog.Logger) *Engine {
 		parallel:           cfg.ParallelFiles,
 		incomplete:         cfg.IncompleteSubdir,
 		cacheCheck:         cfg.CacheCheck,
+		arr:                cfg.Arr,
 		lastReannounce:     make(map[int64]time.Time),
+		arrAttempts:        make(map[int64]arrAttempt),
 		// No client timeout: downloads can be long; cancellation is via ctx.
 		httpClient: &http.Client{},
 		log:        log,

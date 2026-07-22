@@ -37,6 +37,7 @@ CREATE TABLE IF NOT EXISTS torrents (
   eta             INTEGER NOT NULL DEFAULT 0,   -- TorBox-side seconds remaining (fetching phase)
   cached          INTEGER NOT NULL DEFAULT 0,   -- 1 = already on TorBox at submit (instant hit)
   error           TEXT    NOT NULL DEFAULT '',
+  arr_notified    INTEGER NOT NULL DEFAULT 0,   -- 1 = Sonarr/Radarr told of failure (or given up)
   added_on        INTEGER NOT NULL DEFAULT 0,
   active_since    INTEGER NOT NULL DEFAULT 0,   -- when it entered TORBOX_ACTIVE
   progress_at     INTEGER NOT NULL DEFAULT 0,   -- last time TorBox progress advanced (stall clock)
@@ -130,6 +131,7 @@ func (s *Store) migrate(ctx context.Context) error {
 		{"torrents", "peers", "INTEGER NOT NULL DEFAULT 0"},
 		{"torrents", "eta", "INTEGER NOT NULL DEFAULT 0"},
 		{"torrents", "cached", "INTEGER NOT NULL DEFAULT 0"},
+		{"torrents", "arr_notified", "INTEGER NOT NULL DEFAULT 0"},
 	}
 	for _, c := range cols {
 		if err := s.ensureColumn(ctx, c.table, c.column, c.ddl); err != nil {

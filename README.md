@@ -22,7 +22,8 @@ download-to-disk** (no mount-based streaming).
 - **Real downloads to disk** — pulls finished files from TorBox to `/<root>/<category>/<name>/…`, preserving folder structure. No mount, no streaming.
 - **Safe imports** — downloads into a `.incomplete` staging dir, then atomic-moves into place, so Sonarr/Radarr never import a half-written file.
 - **Plan-aware** — respects TorBox's concurrent-slot limit (3 on Essential), queues the rest, and paces API calls to stay under TorBox's rate limit.
-- **Fails on stalls, not slowness** — a dead/unseeded release is errored so Sonarr blacklists it and grabs another, but a slow-but-moving download is left to finish. Patience is tiered: a fetch stuck at 0% fails quickly, one with real progress gets hours (thin swarms recover their seeds), and stalled fetches are periodically nudged with a tracker reannounce.
+- **Fails on stalls, not slowness** — a dead/unseeded release is errored, but a slow-but-moving download is left to finish. Patience is tiered: a fetch stuck at 0% fails quickly, one with real progress gets hours (thin swarms recover their seeds), and stalled fetches are periodically nudged with a tracker reannounce.
+- **Failed downloads actually get replaced** — Sonarr/Radarr ignore qBittorrent error states for failed-download handling, so with a configured `arr:` instance tordownloader pushes the failure back through the *arr's own API: the queue item is removed with blocklist on, and the *arr immediately searches for an alternative release.
 - **Clean teardown** — when Sonarr/Radarr remove a download, it's deleted from TorBox and local disk too.
 - **Status dashboard** — a built-in web page shows live per-torrent and per-file progress.
 - **Headless & light** — YAML/env config, SQLite state, structured logs; a single static binary, no cgo.
@@ -151,6 +152,14 @@ full set of knobs (see [`config.example.yaml`](config.example.yaml), which docum
 | `TD_DB_PATH` | `/data/tordownloader.db` | SQLite database path |
 | `TD_LOG_LEVEL` | `info` | `debug` \| `info` \| `warn` \| `error` |
 | `TD_LOG_FORMAT` | `text` | `text` \| `json` |
+| `TD_SONARR_URL` + `TD_SONARR_API_KEY` | *(unset)* | Sonarr base URL + API key for failure push-back (blocklist + re-search) |
+| `TD_RADARR_URL` + `TD_RADARR_API_KEY` | *(unset)* | Same for Radarr |
+
+> [!IMPORTANT]
+> Configure the Sonarr/Radarr push-back (env vars above, or the `arr:` section in
+> `config.yaml`). Sonarr/Radarr never treat a qBittorrent error as a failed download,
+> so without it a failed release is neither blocklisted nor replaced — it just sits in
+> the queue until removed by hand.
 
 > [!TIP]
 > Finer controls — TorBox slot count, stall timeouts, API rate cap, poll interval — live in

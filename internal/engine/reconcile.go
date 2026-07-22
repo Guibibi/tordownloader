@@ -18,11 +18,14 @@ import (
 // failing (confirmPresent).
 const vanishGrace = 2 * time.Minute
 
-// reconcilePass polls TorBox once per cadence and does two things against the
-// single mylist read: reaps torrents that are finished with TorBox but still
-// holding a slot (reapPass), and advances every TORBOX_ACTIVE torrent (refresh
-// progress, hand content off to the downloader, fail vanished/stalled ones).
+// reconcilePass polls TorBox once per cadence and does three things: reports
+// unnotified failures back to Sonarr/Radarr (arrPass), reaps torrents that are
+// finished with TorBox but still on the account (reapPass), and advances every
+// TORBOX_ACTIVE torrent against a single mylist read (refresh progress, hand
+// content off to the downloader, fail vanished/stalled ones).
 func (e *Engine) reconcilePass(ctx context.Context) error {
+	e.arrPass(ctx)
+
 	active, err := e.store.ListByState(ctx, store.StateTorBoxActive)
 	if err != nil {
 		return err
@@ -260,6 +263,87 @@ func (e *Engine) maybeReannounce(ctx context.Context, t store.Torrent, tb torbox
 		"infohash", t.Infohash, "stalled_for", stalledFor.Round(time.Second),
 		"progress", fmt.Sprintf("%.0f%%", clamp01(tb.Progress)*100),
 		"seeds", tb.Seeds, "peers", tb.Peers)
+}
+
+// arrPass pushes each unreported ERROR torrent's failure to Sonarr/Radarr:
+// the *arr that grabbed it removes its queue item, blocklists the release, and
+// searches for a replacement — the failure loop qBittorrent state reporting
+// alone can never close, because Sonarr maps qBit's "error" to a mere warning
+// with failed-download handling deliberately not triggered. With
+// removeFromClient=true the *arr then deletes the torrent from us too, so the
+// ERROR row and any partial files clean themselves up.
+//
+// Per row: a notify error (instance unreachable) retries every
+// arrNotifyInterval; a clean "no instance tracks this hash" retries until
+// arrNotFoundGrace has passed since the first attempt (a near-instant failure
+// can beat the *arr's queue refresh), then the row is marked notified so we
+// stop asking — it stays visible as ERROR until deleted. Runs on the reconcile
+// goroutine only.
+func (e *Engine) arrPass(ctx context.Context) {
+	if e.arr == nil {
+		return
+	}
+	pending, err := e.store.ListArrUnnotified(ctx)
+	if err != nil {
+		e.log.Error("list unnotified failures", "err", err)
+		return
+	}
+	now := time.Now()
+	e.pruneArrAttempts(pending)
+	for _, t := range pending {
+		if ctx.Err() != nil {
+			return
+		}
+		at, tried := e.arrAttempts[t.ID]
+		if tried && now.Sub(at.last) < arrNotifyInterval {
+			continue
+		}
+		if !tried {
+			at.first = now
+		}
+		at.last = now
+		e.arrAttempts[t.ID] = at
+
+		handled, nerr := e.arr.NotifyFailed(ctx, t.Infohash, t.Name)
+		switch {
+		case handled:
+			// Blocklisted + replacement search triggered; the *arr's follow-up
+			// delete will clear the row.
+			if err := e.store.MarkArrNotified(ctx, t.ID); err != nil {
+				e.log.Error("mark arr notified", "infohash", t.Infohash, "err", err)
+			}
+			delete(e.arrAttempts, t.ID)
+		case nerr != nil:
+			// Some instance couldn't be checked; NotifyFailed already logged the
+			// detail. Retry next interval.
+		case now.Sub(at.first) >= arrNotFoundGrace:
+			// Every instance answered and none tracks this hash — not an *arr grab
+			// (or its queue item is already gone). Stop asking.
+			e.log.Info("failed torrent not tracked by any *arr; leaving as ERROR",
+				"infohash", t.Infohash, "name", t.Name)
+			if err := e.store.MarkArrNotified(ctx, t.ID); err != nil {
+				e.log.Error("mark arr notified", "infohash", t.Infohash, "err", err)
+			}
+			delete(e.arrAttempts, t.ID)
+		}
+	}
+}
+
+// pruneArrAttempts drops notify bookkeeping for rows no longer pending (marked
+// notified, or deleted), mirroring pruneReannounce. Reconcile goroutine only.
+func (e *Engine) pruneArrAttempts(pending []store.Torrent) {
+	if len(e.arrAttempts) == 0 {
+		return
+	}
+	keep := make(map[int64]bool, len(pending))
+	for _, t := range pending {
+		keep[t.ID] = true
+	}
+	for id := range e.arrAttempts {
+		if !keep[id] {
+			delete(e.arrAttempts, id)
+		}
+	}
 }
 
 // pruneReannounce drops reannounce bookkeeping for torrents that are no longer

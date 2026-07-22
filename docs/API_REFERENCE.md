@@ -89,7 +89,20 @@ done/seeding → importable. So COMPLETE must report an "UP" state (`pausedUP`).
 | TORBOX_ACTIVE | TorBox fetching, no seeds | `stalledDL` | downloading |
 | LOCAL_QUEUED / LOCAL_DOWNLOAD | pulling files to disk | `downloading` | downloading |
 | COMPLETE | all files on disk | `pausedUP` | **done → import** |
-| ERROR | stall (no progress) / TorBox fail / >200GB / dl fail | `error` | **failed → blacklist & re-grab** |
+| ERROR | stall (no progress) / TorBox fail / >200GB / dl fail | `error` | warning only — see below |
+
+> **Sonarr never fails a qBittorrent download.** Every qBittorrent state maps to
+> at most a *Warning* in Sonarr — its `error` case is literally commented
+> *"warning so failed download handling isn't triggered"* — so reporting
+> `error` alone never blocklists the release or grabs an alternative; the item
+> just sits in the queue. The failure loop is closed by the **arr push-back**
+> instead (`internal/arr`, configured under `arr:`): on ERROR, tordownloader
+> finds the queue record whose `downloadId` matches the infohash via
+> `GET /api/v3/queue` and removes it with
+> `DELETE /api/v3/queue/{id}?removeFromClient=true&blocklist=true&skipRedownload=false`
+> (auth via `X-Api-Key`) — the *arr blocklists the release, deletes the torrent
+> from us (clearing the ERROR row and partial files), and searches for a
+> replacement.
 
 > A TORBOX_ACTIVE torrent is failed only when it **stalls** — no bytes moving and
 > progress not climbing — for its tier's grace: `failure.stall_timeout` (default

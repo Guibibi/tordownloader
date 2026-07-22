@@ -61,6 +61,19 @@ headless, download-to-disk. Runs as one Docker container on the user's **Unraid*
   nudges TorBox with `controltorrent reannounce` every `failure.reannounce_interval`
   (default 5m). Cache check on add stays informational. Optional absolute
   `failure.timeout` cap, disabled by default. See Gotchas.
+- **Failed-download push-back via the *arr API (2026-07-21).** Sonarr *never* runs
+  failed-download handling off qBittorrent states — its `error` case is commented
+  "warning so failed download handling isn't triggered" — so reporting `state=error`
+  alone leaves the item stuck in Sonarr's queue with no blocklist/re-grab (the
+  original "so Sonarr blacklists" assumption was wrong). Fix: `internal/arr` +
+  config `arr:` (or `TD_SONARR_URL`/`TD_SONARR_API_KEY`, `TD_RADARR_URL`/
+  `TD_RADARR_API_KEY`). The reconcile loop's arrPass takes ERROR rows with
+  `arr_notified=0`, finds the *arr queue record by `downloadId` == infohash, and
+  `DELETE /api/v3/queue/{id}?removeFromClient=true&blocklist=true&skipRedownload=false`
+  → the *arr blocklists, deletes the torrent from us (row + partial files), and
+  searches for a replacement. Retries: unreachable *arr → every 1m; clean
+  not-found → retried for 10m (a fast fail can beat the *arr queue refresh),
+  then marked notified and left as ERROR.
 - No auth on the qBittorrent API (LAN trust).
 - Pure-Go stack (no cgo) for easy Unraid Docker builds: `modernc.org/sqlite`,
   `anacrolix/torrent/metainfo` for infohash, stdlib `net/http`+`slog`.
@@ -75,7 +88,9 @@ headless, download-to-disk. Runs as one Docker container on the user's **Unraid*
 ## Gotchas
 - COMPLETE must be reported as `pausedUP` (an "UP" state). Never `pausedDL` — Sonarr treats
   `*DL` as not-done.
-- A fetching torrent is failed (→ ERROR, so Sonarr blacklists the release) only when it
+- A fetching torrent is failed (→ ERROR; the arr push-back then makes Sonarr blocklist
+  the release and grab another — the reported `error` state alone does *nothing* in
+  Sonarr) only when it
   *stalls*: no bytes moving and progress not climbing for its tier's grace —
   `failure.stall_timeout` (default 20m) at 0% progress, `failure.progress_stall_timeout`
   (default 2h) once it has real progress, `failure.cached_stall_timeout` (default 30m) for

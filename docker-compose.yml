@@ -29,6 +29,12 @@ services:
       # - TD_DB_PATH=/data/tordownloader.db
       # - TD_LOG_LEVEL=info
       # - TD_LOG_FORMAT=text
+      # Failure push-back: lets a failed download be blocklisted + re-searched in
+      # the *arrs (they never do this off qBittorrent error states on their own).
+      # - TD_SONARR_URL=http://sonarr:8989
+      # - TD_SONARR_API_KEY=your-sonarr-api-key
+      # - TD_RADARR_URL=http://radarr:7878
+      # - TD_RADARR_API_KEY=your-radarr-api-key
 
     volumes:
       # Persistent state (SQLite DB). Host path; keep it safe.
