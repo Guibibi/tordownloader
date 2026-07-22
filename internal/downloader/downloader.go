@@ -87,13 +87,17 @@ func Download(ctx context.Context, files []File, link LinkFunc, opts Options) er
 	}
 
 	// Seed the counter with bytes already on disk so resumed downloads report
-	// accurate progress; fetch only adds the bytes it newly writes.
+	// accurate progress; fetch only adds the bytes it newly writes. An
+	// oversize/corrupt partial is deleted here rather than counted, so that from
+	// this point every on-disk byte is reflected in the counter — which lets
+	// discard subtract exactly what it removes.
 	var downloaded int64
 	for _, f := range files {
 		if fi, err := os.Stat(f.Dest); err == nil {
 			s := fi.Size()
 			if f.Size > 0 && s > f.Size {
-				s = 0 // oversize/corrupt: will be re-fetched from scratch
+				_ = os.Remove(f.Dest)
+				continue
 			}
 			downloaded += s
 		}
@@ -249,7 +253,7 @@ func downloadOnce(ctx context.Context, client *http.Client, url string, f File, 
 	if fi, err := os.Stat(f.Dest); err == nil {
 		start = fi.Size()
 		if f.Size > 0 && start > f.Size {
-			_ = os.Remove(f.Dest)
+			discard(f.Dest, start, downloaded)
 			start = 0
 		}
 	}
@@ -269,14 +273,19 @@ func downloadOnce(ctx context.Context, client *http.Client, url string, f File, 
 
 	switch {
 	case resp.StatusCode == http.StatusOK:
-		start = 0 // server ignored Range (or none asked): full body, rewrite
+		// Server ignored the Range (or none asked): full body, rewrite. The
+		// already-counted partial bytes are about to be truncated away.
+		if start > 0 {
+			atomic.AddInt64(downloaded, -start)
+		}
+		start = 0
 	case resp.StatusCode == http.StatusPartialContent:
 		// resuming as requested
 	case resp.StatusCode == http.StatusRequestedRangeNotSatisfiable:
 		if f.Size > 0 && start >= f.Size {
 			return nil // server says nothing more to send and we have it all
 		}
-		_ = os.Remove(f.Dest)
+		discard(f.Dest, start, downloaded)
 		return errRangeReset
 	case isExpiredStatus(resp.StatusCode):
 		return errExpiredLink
@@ -300,7 +309,11 @@ func downloadOnce(ctx context.Context, client *http.Client, url string, f File, 
 	_, copyErr := io.Copy(cw, resp.Body)
 	closeErr := out.Close()
 	if copyErr != nil {
-		return copyErr // partial bytes are kept; a later attempt resumes via Range
+		// A dropped connection mid-body. Partial bytes are kept and counted, so
+		// treat it as transient: the next attempt backs off and resumes via Range
+		// instead of failing the whole torrent on one broken transfer. (A
+		// cancelled ctx surfaces at the top of the retry loop instead.)
+		return fmt.Errorf("%w: %v", errTransient, copyErr)
 	}
 	if closeErr != nil {
 		return closeErr
@@ -312,10 +325,26 @@ func downloadOnce(ctx context.Context, client *http.Client, url string, f File, 
 			return err
 		}
 		if fi.Size() != f.Size {
-			return fmt.Errorf("size mismatch: got %d, want %d", fi.Size(), f.Size)
+			// Truncated/corrupt transfer (e.g. a CDN connection that ended early with
+			// a clean EOF). Retryable within the attempt budget: drop the bad bytes
+			// and re-fetch from scratch rather than failing the whole torrent over
+			// one bad transfer.
+			discard(f.Dest, fi.Size(), downloaded)
+			return fmt.Errorf("size mismatch: got %d, want %d: %w", fi.Size(), f.Size, errRangeReset)
 		}
 	}
 	return nil
+}
+
+// discard removes a partial file and subtracts its bytes from the aggregate
+// progress counter. Every on-disk byte was previously counted (seeded at
+// Download start or written through countWriter), so dropping a file without
+// the subtraction would leave reported progress overshooting reality.
+func discard(dest string, n int64, downloaded *int64) {
+	_ = os.Remove(dest)
+	if n > 0 {
+		atomic.AddInt64(downloaded, -n)
+	}
 }
 
 // Finalize atomically moves the staged content into savePath and returns the

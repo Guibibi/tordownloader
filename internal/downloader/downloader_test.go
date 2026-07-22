@@ -332,3 +332,106 @@ func mustWrite(t *testing.T, path string, data []byte) {
 		t.Fatal(err)
 	}
 }
+
+func TestDownloadTruncatedTransferRetries(t *testing.T) {
+	data := bytes.Repeat([]byte("x"), 100)
+	calls := 0
+	mux := http.NewServeMux()
+	mux.HandleFunc("/f", func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		if calls == 1 {
+			// Clean 200 but only half the bytes: a truncated transfer the size
+			// verification must catch and retry, not fail the torrent over.
+			_, _ = w.Write(data[:50])
+			return
+		}
+		http.ServeContent(w, r, "file", time.Time{}, bytes.NewReader(data))
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	dir := t.TempDir()
+	dest := filepath.Join(dir, "f.bin")
+	var lastProgress int64
+	err := Download(context.Background(),
+		[]File{{Dest: dest, Size: int64(len(data))}},
+		staticLink(srv.URL+"/f"),
+		Options{Progress: func(n int64) { lastProgress = n }})
+	if err != nil {
+		t.Fatalf("Download: %v", err)
+	}
+	assertFile(t, dest, data)
+	if calls < 2 {
+		t.Errorf("server calls = %d, want a retry after the truncated transfer", calls)
+	}
+	// The discarded 50 bytes must have been subtracted, not left inflating the total.
+	if lastProgress != int64(len(data)) {
+		t.Errorf("final progress = %d, want %d", lastProgress, len(data))
+	}
+}
+
+func TestDownloadOversizePartialProgressNotInflated(t *testing.T) {
+	data := bytes.Repeat([]byte("y"), 100)
+	srv := contentServer(map[string][]byte{"/f": data})
+	defer srv.Close()
+
+	dir := t.TempDir()
+	dest := filepath.Join(dir, "f.bin")
+	// Oversize/corrupt leftover from a previous run: must be discarded, never counted.
+	if err := os.WriteFile(dest, bytes.Repeat([]byte("junk"), 100), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	var lastProgress int64
+	err := Download(context.Background(),
+		[]File{{Dest: dest, Size: int64(len(data))}},
+		staticLink(srv.URL+"/f"),
+		Options{Progress: func(n int64) { lastProgress = n }})
+	if err != nil {
+		t.Fatalf("Download: %v", err)
+	}
+	assertFile(t, dest, data)
+	if lastProgress != int64(len(data)) {
+		t.Errorf("final progress = %d, want %d", lastProgress, len(data))
+	}
+}
+
+func TestDownloadDroppedConnectionResumes(t *testing.T) {
+	data := bytes.Repeat([]byte("r"), 4000)
+	restoreDelays := func(base, max time.Duration) { retryBaseDelay, retryMaxDelay = base, max }
+	defer restoreDelays(retryBaseDelay, retryMaxDelay)
+	retryBaseDelay, retryMaxDelay = time.Millisecond, time.Millisecond
+
+	calls := 0
+	mux := http.NewServeMux()
+	mux.HandleFunc("/f", func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		if calls == 1 {
+			// Advertise the full length but drop the connection halfway: the client
+			// sees an unexpected EOF mid-body.
+			w.Header().Set("Content-Length", "4000")
+			_, _ = w.Write(data[:2000])
+			if f, ok := w.(http.Flusher); ok {
+				f.Flush()
+			}
+			panic(http.ErrAbortHandler)
+		}
+		http.ServeContent(w, r, "file", time.Time{}, bytes.NewReader(data))
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	dir := t.TempDir()
+	dest := filepath.Join(dir, "f.bin")
+	err := Download(context.Background(),
+		[]File{{Dest: dest, Size: int64(len(data))}},
+		staticLink(srv.URL+"/f"),
+		Options{})
+	if err != nil {
+		t.Fatalf("Download: %v", err)
+	}
+	assertFile(t, dest, data)
+	if calls < 2 {
+		t.Errorf("server calls = %d, want a resume after the dropped connection", calls)
+	}
+}
