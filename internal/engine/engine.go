@@ -39,7 +39,9 @@ const (
 	defaultCachedStallTimeout   = 30 * time.Minute
 	defaultReannounceInterval   = 5 * time.Minute
 	defaultParallelFiles        = 4
+	defaultParallelTorrents     = 3
 	defaultIncompleteSubdir     = ".incomplete"
+	defaultErrorRetention       = 168 * time.Hour
 )
 
 // createRateLimitCooldown is how long to pause createtorrent submissions after a
@@ -91,18 +93,12 @@ type Config struct {
 	ProgressStallTimeout time.Duration // stall grace once a fetch has made real progress (default 2h; <0 disables)
 	CachedStallTimeout   time.Duration // stall grace for cached releases waiting on TorBox (default 30m; <0 disables)
 	ReannounceInterval   time.Duration // nudge a stalled fetch with a TorBox reannounce this often (default 5m; <0 disables)
+	ErrorRetention       time.Duration // prune settled ERROR rows after this long (default 168h; <0 disables)
 	ParallelFiles        int           // concurrent file downloads per torrent (default 4)
+	ParallelTorrents     int           // concurrent torrents pulled to local disk (default 3)
 	IncompleteSubdir     string        // staging dir under the save path (default .incomplete)
 	CacheCheck           bool          // log TorBox cache status on submit (informational)
 	Arr                  ArrNotifier   // optional: push failures to Sonarr/Radarr (nil = off)
-}
-
-// activeDownload tracks the currently in-flight download so a delete can
-// cancel it before cleaning up local files.
-type activeDownload struct {
-	cancel    context.CancelFunc
-	infohash  string
-	torrentID int64
 }
 
 // Engine runs the background workers.
@@ -116,15 +112,23 @@ type Engine struct {
 	progressStallAfter time.Duration
 	cachedStallAfter   time.Duration
 	reannounceEvery    time.Duration
+	errorRetention     time.Duration
 	parallel           int
+	parallelTorrents   int
 	incomplete         string
 	cacheCheck         bool
 	arr                ArrNotifier
 	httpClient         *http.Client
 	log                *slog.Logger
 
-	mu             sync.Mutex
-	activeDownload *activeDownload
+	// activeDownloads maps the infohash of each torrent currently being pulled
+	// to disk to its cancel function. Membership bounds download concurrency to
+	// parallelTorrents (and keeps the 2s pass cadence from double-starting a
+	// torrent); the cancel lets DeleteTorrent abort just that download. Guarded
+	// by mu. dlWG tracks the download goroutines so Run can wait them out.
+	mu              sync.Mutex
+	activeDownloads map[string]context.CancelFunc
+	dlWG            sync.WaitGroup
 
 	// slotWaitLogged remembers that we've already logged the current
 	// "all slots busy, work waiting" episode, so the message isn't repeated every
@@ -190,8 +194,15 @@ func New(st *store.Store, tb TorBoxAPI, cfg Config, log *slog.Logger) *Engine {
 	if cfg.ReannounceInterval == 0 {
 		cfg.ReannounceInterval = defaultReannounceInterval
 	}
+	// And for error retention: 0 = unset → default; negative disables pruning.
+	if cfg.ErrorRetention == 0 {
+		cfg.ErrorRetention = defaultErrorRetention
+	}
 	if cfg.ParallelFiles < 1 {
 		cfg.ParallelFiles = defaultParallelFiles
+	}
+	if cfg.ParallelTorrents < 1 {
+		cfg.ParallelTorrents = defaultParallelTorrents
 	}
 	if cfg.IncompleteSubdir == "" {
 		cfg.IncompleteSubdir = defaultIncompleteSubdir
@@ -206,10 +217,13 @@ func New(st *store.Store, tb TorBoxAPI, cfg Config, log *slog.Logger) *Engine {
 		progressStallAfter: cfg.ProgressStallTimeout,
 		cachedStallAfter:   cfg.CachedStallTimeout,
 		reannounceEvery:    cfg.ReannounceInterval,
+		errorRetention:     cfg.ErrorRetention,
 		parallel:           cfg.ParallelFiles,
+		parallelTorrents:   cfg.ParallelTorrents,
 		incomplete:         cfg.IncompleteSubdir,
 		cacheCheck:         cfg.CacheCheck,
 		arr:                cfg.Arr,
+		activeDownloads:    make(map[string]context.CancelFunc),
 		lastReannounce:     make(map[int64]time.Time),
 		arrAttempts:        make(map[int64]arrAttempt),
 		// No client timeout: downloads can be long; cancellation is via ctx.
@@ -226,7 +240,8 @@ func (e *Engine) Run(ctx context.Context) {
 		"max_active_slots", e.maxSlots, "poll_interval", e.pollEvery,
 		"stall_timeout", e.stallAfter, "progress_stall_timeout", e.progressStallAfter,
 		"cached_stall_timeout", e.cachedStallAfter, "reannounce_interval", e.reannounceEvery,
-		"fail_timeout", e.failAfter, "parallel_files", e.parallel)
+		"error_retention", e.errorRetention, "fail_timeout", e.failAfter,
+		"parallel_files", e.parallel, "parallel_torrents", e.parallelTorrents)
 
 	// Rebuild in-memory state from SQLite + TorBox: re-sync active torrents
 	// and recover any content already finalized on disk.
@@ -240,6 +255,9 @@ func (e *Engine) Run(ctx context.Context) {
 	go func() { defer wg.Done(); e.loop(ctx, "reconcile", e.pollEvery, e.reconcilePass) }()
 	go func() { defer wg.Done(); e.loop(ctx, "download", downloadInterval, e.downloadPass) }()
 	wg.Wait()
+	// Download goroutines outlive the pass that spawned them; wait for them to
+	// observe the cancellation before declaring the engine stopped.
+	e.dlWG.Wait()
 	e.log.Info("engine stopped")
 }
 
@@ -496,8 +514,8 @@ type DeleteFunc func(ctx context.Context, infohash string, deleteFiles bool) err
 func (e *Engine) DeleteTorrent(ctx context.Context, infohash string, deleteFiles bool) error {
 	// 1. Cancel the in-flight download if this torrent is currently being pulled.
 	e.mu.Lock()
-	if e.activeDownload != nil && e.activeDownload.infohash == infohash {
-		e.activeDownload.cancel()
+	if cancel, ok := e.activeDownloads[infohash]; ok {
+		cancel()
 	}
 	e.mu.Unlock()
 

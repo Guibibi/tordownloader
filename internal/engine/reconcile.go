@@ -25,6 +25,7 @@ const vanishGrace = 2 * time.Minute
 // content off to the downloader, fail vanished/stalled ones).
 func (e *Engine) reconcilePass(ctx context.Context) error {
 	e.arrPass(ctx)
+	e.prunePass(ctx)
 
 	active, err := e.store.ListByState(ctx, store.StateTorBoxActive)
 	if err != nil {
@@ -325,6 +326,35 @@ func (e *Engine) arrPass(ctx context.Context) {
 				e.log.Error("mark arr notified", "infohash", t.Infohash, "err", err)
 			}
 			delete(e.arrAttempts, t.ID)
+		}
+	}
+}
+
+// prunePass deletes ERROR torrents that have sat unchanged past the retention
+// window and whose *arr notification is settled — reported (and the *arr's
+// removeFromClient delete somehow never arrived), or given up on, or *arr
+// push-back isn't configured at all. Without this, terminal failures linger in
+// torrents/info forever on a long-running box, along with their partial files.
+// A row still awaiting notification (arr configured, arr_notified = 0) is never
+// pruned: deleting it would lose the blocklist push. Reuses DeleteTorrent so
+// TorBox leftovers, staging files, and the DB row all go together.
+func (e *Engine) prunePass(ctx context.Context) {
+	if e.errorRetention <= 0 {
+		return
+	}
+	expired, err := e.store.ListExpiredErrors(ctx, time.Now().Add(-e.errorRetention), e.arr != nil)
+	if err != nil {
+		e.log.Error("list expired errors", "err", err)
+		return
+	}
+	for _, t := range expired {
+		if ctx.Err() != nil {
+			return
+		}
+		e.log.Info("pruning failed torrent past retention",
+			"infohash", t.Infohash, "name", t.Name, "error", t.Error, "retention", e.errorRetention)
+		if err := e.DeleteTorrent(ctx, t.Infohash, true); err != nil {
+			e.log.Warn("prune failed torrent (continuing)", "infohash", t.Infohash, "err", err)
 		}
 	}
 }

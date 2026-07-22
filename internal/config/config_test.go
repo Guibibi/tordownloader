@@ -3,6 +3,7 @@ package config
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -82,5 +83,24 @@ arr:
 	}
 	if cfg.Arr[0].APIKey != "newkey" || cfg.Arr[0].Name != "mysonarr" {
 		t.Fatalf("merged instance = %+v", cfg.Arr[0])
+	}
+}
+
+func TestArrEnvPartialPairWarns(t *testing.T) {
+	t.Setenv("TD_RADARR_URL", "http://radarr:7878")
+	t.Setenv("TD_RADARR_API_KEY", "")
+
+	cfg, err := Load(filepath.Join(t.TempDir(), "missing.yaml"))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if len(cfg.Arr) != 0 {
+		t.Fatalf("half-set pair must not register an instance, got %+v", cfg.Arr)
+	}
+	if len(cfg.Warnings) != 1 {
+		t.Fatalf("expected 1 warning, got %v", cfg.Warnings)
+	}
+	if want := "TD_RADARR_API_KEY"; !strings.Contains(cfg.Warnings[0], want) {
+		t.Errorf("warning %q should name the missing var %s", cfg.Warnings[0], want)
 	}
 }

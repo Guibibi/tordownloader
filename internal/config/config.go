@@ -21,6 +21,10 @@ type Config struct {
 	Failure  FailureConfig  `yaml:"failure"`
 	Arr      []ArrInstance  `yaml:"arr"`
 	Log      LogConfig      `yaml:"log"`
+
+	// Warnings collects non-fatal configuration problems found during Load
+	// (e.g. a half-set env-var pair) for the caller to log once logging is up.
+	Warnings []string `yaml:"-"`
 }
 
 // ArrInstance is one Sonarr/Radarr endpoint to notify when a download fails
@@ -58,6 +62,11 @@ type DownloadConfig struct {
 	Root             string `yaml:"root"`
 	IncompleteSubdir string `yaml:"incomplete_subdir"`
 	ParallelFiles    int    `yaml:"parallel_files"`
+	// ParallelTorrents is how many torrents are pulled to local disk at once, so
+	// one huge download doesn't hold already-cached content hostage behind it.
+	// Total concurrent connections are bounded by parallel_torrents ×
+	// parallel_files.
+	ParallelTorrents int `yaml:"parallel_torrents"`
 }
 
 // DatabaseConfig configures the SQLite state store.
@@ -97,6 +106,13 @@ type FailureConfig struct {
 	// transient (seeds drop off and return) and a nudge can pick recovered peers up
 	// sooner than passively waiting. A non-positive value disables nudging.
 	ReannounceInterval Duration `yaml:"reannounce_interval"`
+	// ErrorRetention prunes terminal failures: an ERROR torrent whose *arr
+	// notification is settled (reported, or given up on — or *arr push-back is
+	// not configured at all) is deleted outright (row + partial files + TorBox
+	// leftovers) once it has sat unchanged this long, so failures don't
+	// accumulate forever on a long-running box. A negative value disables
+	// pruning; 0 means the default (168h).
+	ErrorRetention Duration `yaml:"error_retention"`
 }
 
 // LogConfig configures structured logging.
@@ -120,6 +136,7 @@ func Default() *Config {
 			Root:             "/downloads",
 			IncompleteSubdir: ".incomplete",
 			ParallelFiles:    4,
+			ParallelTorrents: 3,
 		},
 		Database: DatabaseConfig{Path: "data/tordownloader.db"},
 		Failure: FailureConfig{
@@ -128,6 +145,7 @@ func Default() *Config {
 			ProgressStallTimeout: Duration(2 * time.Hour),
 			CachedStallTimeout:   Duration(30 * time.Minute),
 			ReannounceInterval:   Duration(5 * time.Minute),
+			ErrorRetention:       Duration(168 * time.Hour),
 		},
 		Log: LogConfig{Level: "info", Format: "text"},
 	}
@@ -187,9 +205,20 @@ func (c *Config) applyEnv() {
 
 // applyArrEnv appends an *arr instance from a URL+key env pair, unless an
 // instance with that URL is already configured (env then overrides its key).
+// A half-set pair is almost always a typo in the container config, so it is
+// surfaced as a warning instead of silently ignored.
 func (c *Config) applyArrEnv(name, urlEnv, keyEnv string) {
 	url, key := os.Getenv(urlEnv), os.Getenv(keyEnv)
-	if url == "" || key == "" {
+	switch {
+	case url == "" && key == "":
+		return
+	case url == "":
+		c.Warnings = append(c.Warnings, fmt.Sprintf(
+			"%s is set but %s is empty/unset; %s failure push-back disabled", keyEnv, urlEnv, name))
+		return
+	case key == "":
+		c.Warnings = append(c.Warnings, fmt.Sprintf(
+			"%s is set but %s is empty/unset; %s failure push-back disabled", urlEnv, keyEnv, name))
 		return
 	}
 	for i := range c.Arr {
@@ -213,6 +242,9 @@ func (c *Config) Validate() error {
 	}
 	if c.Download.ParallelFiles < 1 {
 		return errors.New("download.parallel_files must be >= 1")
+	}
+	if c.Download.ParallelTorrents < 1 {
+		return errors.New("download.parallel_torrents must be >= 1")
 	}
 	if c.Database.Path == "" {
 		return errors.New("database.path is required")

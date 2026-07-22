@@ -401,6 +401,36 @@ func (s *Store) ListArrUnnotified(ctx context.Context) ([]Torrent, error) {
 	return out, rows.Err()
 }
 
+// ListExpiredErrors returns ERROR torrents that last changed before the cutoff
+// and whose *arr notification is settled — candidates for retention pruning so
+// terminal failures don't accumulate forever. When requireNotified is true only
+// rows with arr_notified = 1 qualify (a pending notification must not be lost
+// to pruning); pass false when no *arr push-back is configured, since
+// arr_notified then never gets set.
+func (s *Store) ListExpiredErrors(ctx context.Context, before time.Time, requireNotified bool) ([]Torrent, error) {
+	notified := 0
+	if requireNotified {
+		notified = 1
+	}
+	rows, err := s.db.QueryContext(ctx, fmt.Sprintf(`
+		SELECT %s FROM torrents
+		WHERE state = ? AND updated_at < ? AND (arr_notified = 1 OR ? = 0)
+		ORDER BY updated_at, id`, torrentColumns), StateError, before.Unix(), notified)
+	if err != nil {
+		return nil, fmt.Errorf("list expired errors: %w", err)
+	}
+	defer rows.Close()
+	var out []Torrent
+	for rows.Next() {
+		t, err := scanTorrent(rows)
+		if err != nil {
+			return nil, fmt.Errorf("scan torrent: %w", err)
+		}
+		out = append(out, t)
+	}
+	return out, rows.Err()
+}
+
 // MarkArrNotified records that a failed torrent's *arr has been told (its queue
 // item removed with blocklist), or that no *arr tracks it and we stopped
 // trying. Either way the arr pass is done with the row.

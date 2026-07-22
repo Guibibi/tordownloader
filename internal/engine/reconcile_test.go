@@ -689,3 +689,79 @@ func TestReconcileMyListErrorIsTransient(t *testing.T) {
 		t.Errorf("state = %q, want still TORBOX_ACTIVE", tr.State)
 	}
 }
+
+// backdateUpdatedAt moves a torrent's updated_at into the past so retention
+// pruning can be exercised without waiting.
+func backdateUpdatedAt(t *testing.T, st *store.Store, id int64, age time.Duration) {
+	t.Helper()
+	if _, err := st.DB().ExecContext(context.Background(),
+		`UPDATE torrents SET updated_at = ? WHERE id = ?`, time.Now().Add(-age).Unix(), id); err != nil {
+		t.Fatalf("backdate updated_at: %v", err)
+	}
+}
+
+func TestPrunePassDeletesExpiredErrors(t *testing.T) {
+	st := newStore(t)
+	tor := seedError(t, st, "cccccccccccccccccccccccccccccccccccccccc")
+	backdateUpdatedAt(t, st, tor.ID, 8*24*time.Hour)
+
+	// No arr configured: arr_notified stays 0 forever, so pruning must not
+	// require it.
+	e := New(st, &fakeTB{}, Config{MaxSlots: 1}, nil)
+	e.prunePass(context.Background())
+
+	if _, ok, err := st.GetTorrent(context.Background(), tor.Infohash); err != nil || ok {
+		t.Fatalf("expected expired ERROR row pruned, ok=%v err=%v", ok, err)
+	}
+}
+
+func TestPrunePassKeepsRecentErrors(t *testing.T) {
+	st := newStore(t)
+	tor := seedError(t, st, "dddddddddddddddddddddddddddddddddddddddd")
+	backdateUpdatedAt(t, st, tor.ID, time.Hour) // well within the 168h default
+
+	e := New(st, &fakeTB{}, Config{MaxSlots: 1}, nil)
+	e.prunePass(context.Background())
+
+	if _, ok, err := st.GetTorrent(context.Background(), tor.Infohash); err != nil || !ok {
+		t.Fatalf("recent ERROR row should be kept, ok=%v err=%v", ok, err)
+	}
+}
+
+func TestPrunePassKeepsUnnotifiedWhenArrConfigured(t *testing.T) {
+	st := newStore(t)
+	tor := seedError(t, st, "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee")
+	backdateUpdatedAt(t, st, tor.ID, 8*24*time.Hour)
+
+	// Arr configured and the row not yet notified: pruning would lose the
+	// blocklist push, so the row must survive.
+	e := New(st, &fakeTB{}, Config{MaxSlots: 1, Arr: &fakeArr{}}, nil)
+	e.prunePass(context.Background())
+
+	if _, ok, err := st.GetTorrent(context.Background(), tor.Infohash); err != nil || !ok {
+		t.Fatalf("unnotified ERROR row should be kept while arr is configured, ok=%v err=%v", ok, err)
+	}
+
+	// Once notified, the same row becomes prunable.
+	if err := st.MarkArrNotified(context.Background(), tor.ID); err != nil {
+		t.Fatalf("mark notified: %v", err)
+	}
+	backdateUpdatedAt(t, st, tor.ID, 8*24*time.Hour)
+	e.prunePass(context.Background())
+	if _, ok, err := st.GetTorrent(context.Background(), tor.Infohash); err != nil || ok {
+		t.Fatalf("notified expired ERROR row should be pruned, ok=%v err=%v", ok, err)
+	}
+}
+
+func TestPrunePassDisabled(t *testing.T) {
+	st := newStore(t)
+	tor := seedError(t, st, "ffffffffffffffffffffffffffffffffffffffff")
+	backdateUpdatedAt(t, st, tor.ID, 30*24*time.Hour)
+
+	e := New(st, &fakeTB{}, Config{MaxSlots: 1, ErrorRetention: -1}, nil)
+	e.prunePass(context.Background())
+
+	if _, ok, err := st.GetTorrent(context.Background(), tor.Infohash); err != nil || !ok {
+		t.Fatalf("pruning disabled: ERROR row should be kept, ok=%v err=%v", ok, err)
+	}
+}

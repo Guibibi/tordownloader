@@ -49,6 +49,9 @@ func run() error {
 	slog.SetDefault(newLogger(cfg.Log))
 
 	slog.Info("starting tordownloader", "version", version, "listen", cfg.Server.ListenAddr)
+	for _, w := range cfg.Warnings {
+		slog.Warn("config: " + w)
+	}
 	if cfg.TorBox.APIKey == "" {
 		slog.Warn("TorBox API key not set; TorBox features will fail until provided (set TORBOX_API_KEY)")
 	}
@@ -115,7 +118,9 @@ func run() error {
 		ProgressStallTimeout: cfg.Failure.ProgressStallTimeout.Std(),
 		CachedStallTimeout:   cfg.Failure.CachedStallTimeout.Std(),
 		ReannounceInterval:   cfg.Failure.ReannounceInterval.Std(),
+		ErrorRetention:       cfg.Failure.ErrorRetention.Std(),
 		ParallelFiles:        cfg.Download.ParallelFiles,
+		ParallelTorrents:     cfg.Download.ParallelTorrents,
 		IncompleteSubdir:     cfg.Download.IncompleteSubdir,
 		CacheCheck:           cfg.TorBox.CacheCheck,
 		Arr:                  arrNotifier,

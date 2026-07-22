@@ -38,14 +38,11 @@ headless, download-to-disk. Runs as one Docker container on the user's **Unraid*
   nothing "starves the queue" if a delete is missed. (Local files + DB row stay,
   reported `pausedUP`, so Sonarr can still import; the later Sonarr delete just clears
   local state.)
-- **Slot accounting.** True occupancy = torrents **actively caching** (`active==true`),
-  not the count still carrying a `torbox_id`. ⚠️ **Known gap:** the submitter currently
-  gates on `CountOnTorBox` (`store/writes.go` — rows with a non-null
-  `torbox_id`/`torbox_queued_id`), which **over-counts**: it includes cached `LOCAL_*`
-  and un-reaped COMPLETE rows that aren't active on TorBox. Safe (it can't over-submit
-  past 3) but it **throttles the queue** — e.g. while pulling two large cached torrents
-  to disk it behaves as if 2 slots are busy though TorBox sees 0 active. The correct
-  gate counts only active/caching torrents; left conservative for now.
+- **Slot accounting (gap fixed).** True occupancy = torrents **actively caching**, and
+  that is what the submitter gates on: `CountActiveSlots` (`store/writes.go`) counts only
+  `TORBOX_ACTIVE` rows. Cached `LOCAL_*`, COMPLETE, and ERROR rows hold no slot and are
+  excluded even while they still carry a `torbox_id`. (The old `CountOnTorBox` gate that
+  over-counted those rows — a "known gap" in earlier revisions of this file — is gone.)
 - **Don't use TorBox's own queue.** Our QUEUED state is the single queue. Because we
   gate on real occupancy, `createtorrent` shouldn't be queued by TorBox; if it is
   (an orphan torrent we don't track holds a slot), cancel the queued entry via
@@ -74,6 +71,18 @@ headless, download-to-disk. Runs as one Docker container on the user's **Unraid*
   searches for a replacement. Retries: unreachable *arr → every 1m; clean
   not-found → retried for 10m (a fast fail can beat the *arr queue refresh),
   then marked notified and left as ERROR.
+- **ERROR retention (2026-07-21).** Settled ERROR rows (notified — or *arr push-back not
+  configured) that sit unchanged for `failure.error_retention` (default 168h; negative
+  disables) are pruned via `DeleteTorrent` (TorBox leftovers + partial files + row), so
+  terminal failures don't accumulate forever. Rows still awaiting *arr notification are
+  never pruned.
+- `/healthz` (DB-backed liveness; runs `SELECT 1`) is what the Dockerfile/compose
+  healthchecks hit — `app/version` is static and stays green even with a wedged store.
+- **Parallel local downloads (2026-07-21).** Up to `download.parallel_torrents`
+  (default 3) torrents are pulled to disk concurrently, each in its own goroutine
+  bounded by `download.parallel_files` — one huge grab no longer blocks cached
+  episodes behind it. Concurrency/dup-start gating and per-torrent delete
+  cancellation live in `Engine.activeDownloads` (infohash → cancel).
 - No auth on the qBittorrent API (LAN trust).
 - Pure-Go stack (no cgo) for easy Unraid Docker builds: `modernc.org/sqlite`,
   `anacrolix/torrent/metainfo` for infohash, stdlib `net/http`+`slog`.

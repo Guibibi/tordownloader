@@ -155,6 +155,11 @@ full set of knobs (see [`config.example.yaml`](config.example.yaml), which docum
 | `TD_SONARR_URL` + `TD_SONARR_API_KEY` | *(unset)* | Sonarr base URL + API key for failure push-back (blocklist + re-search) |
 | `TD_RADARR_URL` + `TD_RADARR_API_KEY` | *(unset)* | Same for Radarr |
 
+Each `*arr` pair needs **both** variables; a half-set pair is skipped with a warning in the
+startup log. `GET /healthz` answers `200 ok` while the service and its database are healthy
+(the bundled Docker healthcheck uses it). Failed torrents that are fully handled are pruned
+automatically after `failure.error_retention` (default 7 days, `config.yaml`).
+
 > [!IMPORTANT]
 > Configure the Sonarr/Radarr push-back (env vars above, or the `arr:` section in
 > `config.yaml`). Sonarr/Radarr never treat a qBittorrent error as a failed download,

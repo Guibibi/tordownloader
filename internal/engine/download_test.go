@@ -75,6 +75,8 @@ func TestDownloadPassCompletes(t *testing.T) {
 	if err := e.downloadPass(context.Background()); err != nil {
 		t.Fatalf("downloadPass: %v", err)
 	}
+	e.dlWG.Wait() // downloads run in goroutines; wait before asserting
+
 
 	tr, _, _ := st.GetTorrent(context.Background(), hash)
 	if tr.State != store.StateComplete {
@@ -131,6 +133,8 @@ func TestDownloadPassDeletesFromTorBoxOnComplete(t *testing.T) {
 	if err := e.downloadPass(context.Background()); err != nil {
 		t.Fatalf("downloadPass: %v", err)
 	}
+	e.dlWG.Wait() // downloads run in goroutines; wait before asserting
+
 
 	tr, _, _ := st.GetTorrent(context.Background(), hash)
 	if tr.State != store.StateComplete {
@@ -159,6 +163,8 @@ func TestDownloadPassFailsOnLinkError(t *testing.T) {
 	if err := e.downloadPass(context.Background()); err != nil {
 		t.Fatalf("downloadPass: %v", err)
 	}
+	e.dlWG.Wait() // downloads run in goroutines; wait before asserting
+
 	if tr, _, _ := st.GetTorrent(context.Background(), hash); tr.State != store.StateError {
 		t.Errorf("state = %q, want ERROR", tr.State)
 	}
@@ -172,5 +178,70 @@ func assertBytes(t *testing.T, path string, want []byte) {
 	}
 	if !bytes.Equal(got, want) {
 		t.Errorf("%s = %d bytes, want %d", path, len(got), len(want))
+	}
+}
+
+// TestDownloadPassParallelTorrents asserts that up to parallel_torrents
+// downloads run concurrently, no torrent is double-started by repeated passes,
+// and torrents beyond the limit wait for a free slot.
+func TestDownloadPassParallelTorrents(t *testing.T) {
+	release := make(chan struct{})
+	body := bytes.Repeat([]byte("p"), 64)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		<-release // hold every download open until the test releases them
+		http.ServeContent(w, r, "f", time.Time{}, bytes.NewReader(body))
+	}))
+	defer srv.Close()
+
+	st := newStore(t)
+	save := filepath.Join(t.TempDir(), "tv")
+	hashes := []string{
+		"1111111111111111111111111111111111111111",
+		"2222222222222222222222222222222222222222",
+		"3333333333333333333333333333333333333333",
+		"4444444444444444444444444444444444444444",
+	}
+	for _, h := range hashes {
+		seedLocalQueued(t, st, h, save, []store.FileInput{
+			{TorBoxFileID: 0, RelPath: "show-" + h[:4] + "/e01.mkv", ShortName: "e01.mkv", Size: int64(len(body))},
+		})
+	}
+
+	tb := &fakeTB{dl: func(torbox.RequestDLParams) (string, error) { return srv.URL, nil }}
+	e := New(st, tb, Config{ParallelTorrents: 3, ParallelFiles: 1, IncompleteSubdir: ".incomplete"}, nil)
+
+	countActive := func() int {
+		e.mu.Lock()
+		defer e.mu.Unlock()
+		return len(e.activeDownloads)
+	}
+
+	// Two passes back to back: the limit must hold and nothing double-starts.
+	for i := 0; i < 2; i++ {
+		if err := e.downloadPass(context.Background()); err != nil {
+			t.Fatalf("downloadPass: %v", err)
+		}
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for countActive() != 3 && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if got := countActive(); got != 3 {
+		t.Fatalf("active downloads = %d, want 3 (the limit)", got)
+	}
+
+	close(release)
+	e.dlWG.Wait()
+
+	// Three done, the fourth still waiting its turn; another pass finishes it.
+	if n := countState(t, st, store.StateComplete); n != 3 {
+		t.Fatalf("complete after first wave = %d, want 3", n)
+	}
+	if err := e.downloadPass(context.Background()); err != nil {
+		t.Fatalf("downloadPass: %v", err)
+	}
+	e.dlWG.Wait()
+	if n := countState(t, st, store.StateComplete); n != 4 {
+		t.Fatalf("complete after second wave = %d, want 4", n)
 	}
 }

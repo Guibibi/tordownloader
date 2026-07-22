@@ -16,7 +16,8 @@ torbox:
 download:
   root: "/downloads"               # shared with Sonarr/Radarr, mapped identically across containers
   incomplete_subdir: ".incomplete" # partial downloads land here, then atomic-move into place
-  parallel_files: 4                # concurrent file downloads to disk
+  parallel_files: 4                # concurrent file downloads within one torrent
+  parallel_torrents: 3             # torrents pulled to disk at once (one huge grab won't block cached episodes behind it)
 
 database:
   path: "data/tordownloader.db"    # SQLite state file
@@ -34,6 +35,7 @@ failure:
   cached_stall_timeout: 30m        # grace for cached releases (they only wait for TorBox to surface bytes it already has); <=0 disables for cached
   reannounce_interval: 5m          # nudge a stalled fetch with a TorBox reannounce this often; <=0 disables
   timeout: 0                       # optional absolute cap from when it becomes TorBox-active; 0 disables (bounds slow torrents holding a slot)
+  error_retention: 168h            # delete settled ERROR torrents (row + partial files) after sitting this long; negative disables
 
 # Sonarr/Radarr failure push-back (strongly recommended). Sonarr never runs
 # failed-download handling from qBittorrent states — a torrent we report as

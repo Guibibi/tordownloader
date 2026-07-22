@@ -10,10 +10,13 @@ import (
 	"github.com/guibibi/tordownloader/internal/torbox"
 )
 
-// downloadPass pulls every torrent whose content is present on TorBox to local
-// disk. It resumes in-flight downloads (LOCAL_DOWNLOAD) before starting newly
-// ready ones (LOCAL_QUEUED), and processes them one at a time so total
-// connection use stays bounded by parallel-files within a single torrent.
+// downloadPass launches downloads for every torrent whose content is present
+// on TorBox, up to parallelTorrents at once. In-flight downloads
+// (LOCAL_DOWNLOAD) get their slots before newly ready ones (LOCAL_QUEUED), so
+// resumes aren't starved. Each torrent downloads in its own goroutine — bounded
+// within itself by parallel_files — so one huge torrent no longer holds
+// already-cached content hostage behind it. The pass only spawns and returns;
+// completion is observed via the store.
 func (e *Engine) downloadPass(ctx context.Context) error {
 	resuming, err := e.store.ListByState(ctx, store.StateLocalDload)
 	if err != nil {
@@ -27,30 +30,46 @@ func (e *Engine) downloadPass(ctx context.Context) error {
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
-		e.downloadOne(ctx, t)
+		e.maybeStartDownload(ctx, t)
 	}
 	return nil
+}
+
+// maybeStartDownload spawns downloadOne for t unless it is already being
+// downloaded or all parallelTorrents slots are busy. Registration in
+// activeDownloads both bounds concurrency and lets DeleteTorrent cancel the
+// right download; a torrent stays registered until its goroutine exits, so the
+// short pass cadence can never double-start one.
+func (e *Engine) maybeStartDownload(ctx context.Context, t store.Torrent) {
+	e.mu.Lock()
+	if _, running := e.activeDownloads[t.Infohash]; running || len(e.activeDownloads) >= e.parallelTorrents {
+		e.mu.Unlock()
+		return
+	}
+	// Cancellable sub-context so a concurrent delete can abort just this
+	// download without tearing down the rest of the engine.
+	dlCtx, cancel := context.WithCancel(ctx)
+	e.activeDownloads[t.Infohash] = cancel
+	e.mu.Unlock()
+
+	e.dlWG.Add(1)
+	go func() {
+		defer e.dlWG.Done()
+		defer func() {
+			cancel()
+			e.mu.Lock()
+			delete(e.activeDownloads, t.Infohash)
+			e.mu.Unlock()
+		}()
+		e.downloadOne(ctx, dlCtx, t)
+	}()
 }
 
 // downloadOne fetches all of a torrent's files into a staging tree, atomically
 // moves the content into place, and marks the torrent COMPLETE. Any hard failure
 // moves it to ERROR; a shutdown (ctx cancelled) or per-torrent cancellation
-// (via Engine.DeleteTorrent) leaves it for a later resume.
-func (e *Engine) downloadOne(ctx context.Context, t store.Torrent) {
-	// Create a cancellable sub-context so a concurrent delete can cancel just
-	// this download without tearing down the rest of the engine.
-	dlCtx, cancel := context.WithCancel(ctx)
-	e.mu.Lock()
-	e.activeDownload = &activeDownload{cancel: cancel, infohash: t.Infohash, torrentID: t.ID}
-	e.mu.Unlock()
-	defer func() {
-		cancel()
-		e.mu.Lock()
-		if e.activeDownload != nil && e.activeDownload.infohash == t.Infohash {
-			e.activeDownload = nil
-		}
-		e.mu.Unlock()
-	}()
+// (dlCtx cancelled via Engine.DeleteTorrent) leaves it for a later resume.
+func (e *Engine) downloadOne(ctx, dlCtx context.Context, t store.Torrent) {
 	if !t.TorBoxID.Valid {
 		e.fail(ctx, t, "no TorBox id for download")
 		return

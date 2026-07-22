@@ -820,11 +820,7 @@ func TestDeleteTorrentCancelsActiveDownload(t *testing.T) {
 	e := New(st, &fakeTB{}, Config{MaxSlots: 1}, nil)
 	e.mu.Lock()
 	_, cancel := context.WithCancel(context.Background())
-	e.activeDownload = &activeDownload{
-		cancel:    func() { canceled = true; cancel() },
-		infohash:  hash,
-		torrentID: 1,
-	}
+	e.activeDownloads[hash] = func() { canceled = true; cancel() }
 	e.mu.Unlock()
 
 	if err := e.DeleteTorrent(context.Background(), hash, true); err != nil {
