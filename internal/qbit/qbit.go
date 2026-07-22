@@ -119,6 +119,11 @@ func (h *Handler) Routes() http.Handler {
 	// Transfer.
 	mux.HandleFunc("/api/v2/transfer/info", h.transferInfo)
 
+	// Liveness for Docker/Unraid healthchecks. Unlike app/version (a static
+	// string), this exercises the SQLite store, so a wedged database turns the
+	// container unhealthy.
+	mux.HandleFunc("/healthz", h.healthz)
+
 	// Status dashboard (simple read-only UI). "/" also acts as the catch-all,
 	// so uiIndex 404s anything that isn't exactly "/".
 	mux.HandleFunc("/", h.uiIndex)

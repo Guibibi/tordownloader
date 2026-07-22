@@ -116,6 +116,16 @@ func (s *Store) DB() *sql.DB { return s.db }
 // Close closes the database connection.
 func (s *Store) Close() error { return s.db.Close() }
 
+// Ping verifies the database can actually answer a query (used by /healthz).
+// A trivial SELECT rather than sql.DB.Ping, which can be a no-op for SQLite.
+func (s *Store) Ping(ctx context.Context) error {
+	var one int
+	if err := s.db.QueryRowContext(ctx, `SELECT 1`).Scan(&one); err != nil {
+		return fmt.Errorf("ping: %w", err)
+	}
+	return nil
+}
+
 func (s *Store) migrate(ctx context.Context) error {
 	if _, err := s.db.ExecContext(ctx, schema); err != nil {
 		return err

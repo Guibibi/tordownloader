@@ -226,3 +226,14 @@ func TestTransferInfo(t *testing.T) {
 		t.Errorf("dl_info_speed = %v, want 1500", info["dl_info_speed"])
 	}
 }
+
+func TestHealthz(t *testing.T) {
+	srv, _ := newTestServer(t)
+	resp, body := get(t, srv, "/healthz")
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	}
+	if body != "ok" {
+		t.Errorf("body = %q, want ok", body)
+	}
+}

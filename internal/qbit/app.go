@@ -1,6 +1,10 @@
 package qbit
 
-import "net/http"
+import (
+	"context"
+	"net/http"
+	"time"
+)
 
 // login accepts any credentials (LAN trust, no real auth) and sets a SID cookie
 // because Sonarr expects one. Body is "Ok." as the real WebUI returns.
@@ -45,6 +49,19 @@ func (h *Handler) appBuildInfo(w http.ResponseWriter, r *http.Request) {
 		"openssl":    "1.1.1f",
 		"bitness":    64,
 	})
+}
+
+// healthz answers 200 "ok" when the store can run a trivial query, 503
+// otherwise. Bounded so a wedged database fails the check instead of hanging it.
+func (h *Handler) healthz(w http.ResponseWriter, r *http.Request) {
+	ctx, cancel := context.WithTimeout(r.Context(), 3*time.Second)
+	defer cancel()
+	if err := h.store.Ping(ctx); err != nil {
+		h.log.Error("healthz: store ping", "err", err)
+		http.Error(w, "unhealthy: store unreachable", http.StatusServiceUnavailable)
+		return
+	}
+	h.writeText(w, "ok")
 }
 
 // appPreferences returns the few preferences Sonarr reads. save_path is the real

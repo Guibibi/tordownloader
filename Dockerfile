@@ -42,8 +42,8 @@ ENV PGID=100
 VOLUME ["/data", "/downloads"]
 EXPOSE 6500
 
-HEALTHCHECK --interval=30s --timeout=3s --start-period=15s --retries=3 \
-  CMD wget -qO- --timeout=2 http://localhost:6500/api/v2/app/version >/dev/null 2>&1 || exit 1
+HEALTHCHECK --interval=30s --timeout=5s --start-period=15s --retries=3 \
+  CMD wget -qO- --timeout=3 http://localhost:6500/healthz >/dev/null 2>&1 || exit 1
 
 ENTRYPOINT ["/entrypoint.sh"]
 CMD ["tordownloader"]
