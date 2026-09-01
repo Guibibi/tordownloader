@@ -37,6 +37,7 @@ const (
 	defaultStallTimeout         = 20 * time.Minute
 	defaultProgressStallTimeout = 2 * time.Hour
 	defaultCachedStallTimeout   = 30 * time.Minute
+	defaultSlowWindow           = 15 * time.Minute
 	defaultReannounceInterval   = 5 * time.Minute
 	defaultParallelFiles        = 4
 	defaultParallelTorrents     = 3
@@ -93,6 +94,9 @@ type Config struct {
 	ProgressStallTimeout time.Duration // stall grace once a fetch has made real progress (default 2h; <0 disables)
 	CachedStallTimeout   time.Duration // stall grace for cached releases waiting on TorBox (default 30m; <0 disables)
 	ReannounceInterval   time.Duration // nudge a stalled fetch with a TorBox reannounce this often (default 5m; <0 disables)
+	MinSpeed             int64         // average bytes/s a moving fetch must sustain over SlowWindow (0 = check disabled)
+	SlowWindow           time.Duration // averaging window for MinSpeed (default 15m; <0 disables)
+	IdleTimeout          time.Duration // abort a local CDN transfer silent this long, then retry it (0 = disabled)
 	ErrorRetention       time.Duration // prune settled ERROR rows after this long (default 168h; <0 disables)
 	ParallelFiles        int           // concurrent file downloads per torrent (default 4)
 	ParallelTorrents     int           // concurrent torrents pulled to local disk (default 3)
@@ -112,6 +116,9 @@ type Engine struct {
 	progressStallAfter time.Duration
 	cachedStallAfter   time.Duration
 	reannounceEvery    time.Duration
+	minSpeed           int64
+	slowWindow         time.Duration
+	idleTimeout        time.Duration
 	errorRetention     time.Duration
 	parallel           int
 	parallelTorrents   int
@@ -194,6 +201,16 @@ func New(st *store.Store, tb TorBoxAPI, cfg Config, log *slog.Logger) *Engine {
 	if cfg.ReannounceInterval == 0 {
 		cfg.ReannounceInterval = defaultReannounceInterval
 	}
+	// The averaging window follows the same convention: 0 = unset → default;
+	// negative disables it. MinSpeed does not — a floor of "0 bytes/s" reads
+	// naturally as "no floor", so an explicit 0 turns the slow check off rather
+	// than restoring a default the user just removed.
+	if cfg.SlowWindow == 0 {
+		cfg.SlowWindow = defaultSlowWindow
+	}
+	if cfg.MinSpeed < 0 {
+		cfg.MinSpeed = 0
+	}
 	// And for error retention: 0 = unset → default; negative disables pruning.
 	if cfg.ErrorRetention == 0 {
 		cfg.ErrorRetention = defaultErrorRetention
@@ -217,6 +234,9 @@ func New(st *store.Store, tb TorBoxAPI, cfg Config, log *slog.Logger) *Engine {
 		progressStallAfter: cfg.ProgressStallTimeout,
 		cachedStallAfter:   cfg.CachedStallTimeout,
 		reannounceEvery:    cfg.ReannounceInterval,
+		minSpeed:           cfg.MinSpeed,
+		slowWindow:         cfg.SlowWindow,
+		idleTimeout:        cfg.IdleTimeout,
 		errorRetention:     cfg.ErrorRetention,
 		parallel:           cfg.ParallelFiles,
 		parallelTorrents:   cfg.ParallelTorrents,
@@ -226,8 +246,14 @@ func New(st *store.Store, tb TorBoxAPI, cfg Config, log *slog.Logger) *Engine {
 		activeDownloads:    make(map[string]context.CancelFunc),
 		lastReannounce:     make(map[int64]time.Time),
 		arrAttempts:        make(map[int64]arrAttempt),
-		// No client timeout: downloads can be long; cancellation is via ctx.
-		httpClient: &http.Client{},
+		// No overall client timeout: a legitimate download can run for hours, so a
+		// deadline on the whole request would cut healthy transfers. Silence is what
+		// we bound instead — the downloader's per-transfer idle watchdog
+		// (download.idle_timeout) aborts a connection that stops delivering bytes,
+		// and the transfer resumes from disk on the next attempt. The transport
+		// timeouts below still bound the phases before the body starts, where no
+		// legitimate wait is long.
+		httpClient: &http.Client{Transport: downloadTransport()},
 		log:        log,
 	}
 }
@@ -240,8 +266,10 @@ func (e *Engine) Run(ctx context.Context) {
 		"max_active_slots", e.maxSlots, "poll_interval", e.pollEvery,
 		"stall_timeout", e.stallAfter, "progress_stall_timeout", e.progressStallAfter,
 		"cached_stall_timeout", e.cachedStallAfter, "reannounce_interval", e.reannounceEvery,
+		"min_speed", e.minSpeed, "slow_window", e.slowWindow,
 		"error_retention", e.errorRetention, "fail_timeout", e.failAfter,
-		"parallel_files", e.parallel, "parallel_torrents", e.parallelTorrents)
+		"parallel_files", e.parallel, "parallel_torrents", e.parallelTorrents,
+		"idle_timeout", e.idleTimeout)
 
 	// Rebuild in-memory state from SQLite + TorBox: re-sync active torrents
 	// and recover any content already finalized on disk.
@@ -572,4 +600,20 @@ func (e *Engine) DeleteTorrent(ctx context.Context, infohash string, deleteFiles
 	}
 	e.log.Info("torrent deleted", "infohash", infohash, "delete_files", deleteFiles)
 	return nil
+}
+
+// downloadTransport builds the HTTP transport used for CDN file transfers. It
+// bounds every phase that precedes the response body — dial, TLS handshake,
+// waiting for response headers — where a stuck connection has no legitimate
+// reason to hang, while leaving the body read unbounded (a large file takes as
+// long as it takes; the downloader's idle watchdog covers silence there).
+// Connections are also capped per host so a wide fan-out of parallel file
+// downloads reuses sockets instead of opening one per request.
+func downloadTransport() *http.Transport {
+	t := http.DefaultTransport.(*http.Transport).Clone()
+	t.ResponseHeaderTimeout = 60 * time.Second
+	t.TLSHandshakeTimeout = 20 * time.Second
+	t.ExpectContinueTimeout = 5 * time.Second
+	t.MaxIdleConnsPerHost = 16
+	return t
 }

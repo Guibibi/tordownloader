@@ -89,7 +89,7 @@ done/seeding → importable. So COMPLETE must report an "UP" state (`pausedUP`).
 | TORBOX_ACTIVE | TorBox fetching, no seeds | `stalledDL` | downloading |
 | LOCAL_QUEUED / LOCAL_DOWNLOAD | pulling files to disk | `downloading` | downloading |
 | COMPLETE | all files on disk | `pausedUP` | **done → import** |
-| ERROR | stall (no progress) / TorBox fail / >200GB / dl fail | `error` | warning only — see below |
+| ERROR | stall (no progress) / too slow to finish / TorBox fail / >200GB / dl fail | `error` | warning only — see below |
 
 > **Sonarr never fails a qBittorrent download.** Every qBittorrent state maps to
 > at most a *Warning* in Sonarr — its `error` case is literally commented
@@ -104,20 +104,34 @@ done/seeding → importable. So COMPLETE must report an "UP" state (`pausedUP`).
 > from us (clearing the ERROR row and partial files), and searches for a
 > replacement.
 
-> A TORBOX_ACTIVE torrent is failed only when it **stalls** — no bytes moving and
-> progress not climbing — for its tier's grace: `failure.stall_timeout` (default
-> 20m) while still at 0%, the much longer `failure.progress_stall_timeout`
-> (default 2h) once it has made real progress (thin swarms lose their seeds and
-> recover on a scale of hours), or `failure.cached_stall_timeout` (default 30m)
-> for a cached release waiting on TorBox itself. It is never failed just for
-> being slow: a download still moving bytes keeps resetting the stall clock
-> (tracked via `torrents.progress_at`), so a legitimately slow, uncached fetch
-> runs as long as it needs. While stalled, the engine nudges TorBox with a
+> A TORBOX_ACTIVE torrent is failed on two independent counts.
+>
+> **It stalls** — no bytes moving and progress not climbing — for its tier's
+> grace: `failure.stall_timeout` (default 20m) while still at 0%, the much longer
+> `failure.progress_stall_timeout` (default 2h) once it has made real progress
+> (thin swarms lose their seeds and recover on a scale of hours), or
+> `failure.cached_stall_timeout` (default 30m) for a cached release *still at 0%*,
+> waiting on TorBox itself. The stall clock is tracked via `torrents.progress_at`
+> and reset by any real headway. While stalled, the engine nudges TorBox with a
 > `controltorrent reannounce` every `failure.reannounce_interval` (default 5m) so
-> returning seeds are picked up promptly. `failure.timeout` is an optional
-> absolute cap from when it became active, **disabled by default** (set it to bound
-> how long a perpetually-slow torrent may hold a scarce TorBox slot). Set any
-> stall timeout ≤ 0 to disable stall detection for that tier.
+> returning seeds are picked up promptly.
+>
+> **Or it is too slow to ever finish.** Once a fetch has delivered its first byte
+> it must average at least `failure.min_speed` (default 50KB/s) over each full
+> `failure.slow_window` (default 15m), tracked via `torrents.speed_at` /
+> `speed_bytes`. A trickle never registers as stalled — progress climbs every
+> tick — but it cannot finish inside any window Sonarr cares about while holding
+> one of three scarce slots. The average is computed from real bytes
+> (`progress × size`), not TorBox's reported `download_speed`, so a torrent that
+> reports movement while delivering nothing is caught too. Only whole closed
+> windows are judged, so no momentary dip can fail a healthy download, and the
+> window does not open until the first byte arrives — a fetch still at 0% belongs
+> to the stall tiers, which are tier-aware in a way a flat floor is not.
+>
+> `failure.min_speed: 0` disables the speed check, restoring the older
+> fail-only-on-stalls policy. `failure.timeout` is an optional absolute cap from
+> when it became active, **disabled by default**. Set any stall timeout ≤ 0 to
+> disable stall detection for that tier.
 
 > Never report `pausedDL` for a finished item — Sonarr treats `*DL` states as not-done.
 > Use `pausedUP` (an "UP" state) to signal completion.

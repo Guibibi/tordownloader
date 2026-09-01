@@ -49,15 +49,24 @@ headless, download-to-disk. Runs as one Docker container on the user's **Unraid*
   `controlqueued` and retry from our own queue. The old "adopt the queued_id, re-match
   by infohash on activation" path was removed — it was a fragile second namespace.
 - Headless: YAML/env config, SQLite state, logs (no Web UI in v1).
-- Fail on *stall* (not on slowness), with **progress-tiered patience** (2026-07-12):
-  a fetch stalled at 0% fails after `failure.stall_timeout` (default 20m — cheap to
-  abandon, lets Sonarr re-grab); one with real progress gets
-  `failure.progress_stall_timeout` (default 2h — thin swarms recover seeds on a scale
-  of hours, and failing blacklists what is often the only viable release); cached
-  releases get `failure.cached_stall_timeout` (default 30m). While stalled the engine
-  nudges TorBox with `controltorrent reannounce` every `failure.reannounce_interval`
-  (default 5m). Cache check on add stays informational. Optional absolute
-  `failure.timeout` cap, disabled by default. See Gotchas.
+- **Two failure detectors, not one (revised 2026-09-01).** The old rule was "fail on
+  *stall*, never on slowness". That left a hole: a torrent trickling at a few KB/s is
+  never stalled — progress climbs every tick, resetting the clock forever — so it held
+  one of three slots indefinitely while having no chance of finishing. Now:
+  - **Stall** (unchanged, progress-tiered, 2026-07-12): a fetch stalled at 0% fails after
+    `failure.stall_timeout` (default 20m — cheap to abandon, lets Sonarr re-grab); one
+    with real progress gets `failure.progress_stall_timeout` (default 2h — thin swarms
+    recover seeds on a scale of hours, and failing blacklists what is often the only
+    viable release); a cached release **still at 0%** gets
+    `failure.cached_stall_timeout` (default 30m). While stalled the engine nudges TorBox
+    with `controltorrent reannounce` every `failure.reannounce_interval` (default 5m).
+  - **Sustained speed** (new): once a fetch has delivered its first byte it must average
+    ≥ `failure.min_speed` (default `50KB`/s) over each full `failure.slow_window`
+    (default 15m) or it is failed. `min_speed: 0` disables it and restores the old
+    policy exactly.
+
+  Cache check on add stays informational. Optional absolute `failure.timeout` cap,
+  disabled by default. See Gotchas.
 - **Failed-download push-back via the *arr API (2026-07-21).** Sonarr *never* runs
   failed-download handling off qBittorrent states — its `error` case is commented
   "warning so failed download handling isn't triggered" — so reporting `state=error`
@@ -99,16 +108,35 @@ headless, download-to-disk. Runs as one Docker container on the user's **Unraid*
   `*DL` as not-done.
 - A fetching torrent is failed (→ ERROR; the arr push-back then makes Sonarr blocklist
   the release and grab another — the reported `error` state alone does *nothing* in
-  Sonarr) only when it
-  *stalls*: no bytes moving and progress not climbing for its tier's grace —
-  `failure.stall_timeout` (default 20m) at 0% progress, `failure.progress_stall_timeout`
-  (default 2h) once it has real progress, `failure.cached_stall_timeout` (default 30m) for
-  cached. It is never failed just for being slow — a download still moving bytes keeps
-  resetting the stall clock (tracked via `torrents.progress_at`). Stalled fetches get a
-  TorBox `reannounce` nudge every `failure.reannounce_interval` (default 5m; throttled via
-  the engine's in-memory `lastReannounce`). `failure.timeout` is an optional absolute cap
-  from active_since, disabled by default. All these clocks run only while TORBOX_ACTIVE,
-  not while waiting in our own queue.
+  Sonarr) when it either **stalls** or is **too slow to finish**:
+  - *Stalls*: no bytes moving and progress not climbing for its tier's grace —
+    `failure.stall_timeout` (default 20m) at 0% progress, `failure.progress_stall_timeout`
+    (default 2h) once it has real progress, `failure.cached_stall_timeout` (default 30m)
+    for cached **and still at 0%** — the `cached` flag is a submit-time reading, so a
+    torrent that has visibly started fetching gets the peer-fetch tier instead of being
+    killed early on a stale label. Clock tracked via `torrents.progress_at`. Stalled
+    fetches get a TorBox `reannounce` nudge every `failure.reannounce_interval` (default
+    5m; throttled via the engine's in-memory `lastReannounce`).
+  - *Too slow*: once it has delivered its first byte, it must average
+    ≥ `failure.min_speed` (default 50KB/s) over each full `failure.slow_window` (default
+    15m). The window is anchored in `torrents.speed_at` / `speed_bytes` (so it survives
+    restarts) and re-anchored each time a window closes above the floor. The average is
+    computed from **real bytes** (`progress × size`), never from TorBox's reported
+    `download_speed` — that field is also why `advancing` only counts reported speed at
+    or above the same floor, so a permanent trickle can't reset the stall clock forever.
+    Only whole closed windows are judged (no dip can fail a healthy torrent), and the
+    window doesn't open until the first byte lands, leaving 0% fetches to the stall tiers.
+    `failure.min_speed: 0` turns the whole check off.
+
+  `failure.timeout` is an optional absolute cap from active_since, disabled by default.
+  All these clocks run only while TORBOX_ACTIVE, not while waiting in our own queue.
+- Local (CDN → disk) transfers have their own watchdog: `download.idle_timeout` (default
+  2m) aborts a connection that stays open but stops delivering bytes, and the file is
+  retried with a fresh link, resuming from disk. This is the *only* bound on a transfer —
+  the engine's `http.Client` deliberately has no overall `Timeout` (a real download runs
+  for hours), and its transport bounds only the pre-body phases (dial/TLS/response
+  headers). Without it a hung CDN read blocked one of `download.parallel_torrents` slots
+  forever while still reporting `downloading` to Sonarr.
 - TorBox may **queue** a `createtorrent` (returns a queued id, not a torrent id) when the
   account's active slots are full. We no longer adopt that queue: we gate submissions on real
   slot occupancy so it shouldn't happen, and if it does we `controlqueued`-delete the entry and

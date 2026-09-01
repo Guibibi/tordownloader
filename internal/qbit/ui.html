@@ -140,6 +140,8 @@ function bar(t) {
 let stallTimeout = 0;
 let progressStallTimeout = 0;
 let cachedStallTimeout = 0;
+let minSpeed = 0;
+let slowWindow = 0;
 
 // Hashes whose per-file breakdown is expanded, and a cache of the last rendered
 // file list per hash so re-renders (every poll) don't flash a loading state.
@@ -173,13 +175,30 @@ async function loadFiles(hash) {
 // or just-advanced torrents.
 function stallRemaining(t) {
   if (t.phase !== "torbox") return null;
-  const timeout = t.cached ? cachedStallTimeout
+  // Mirrors the engine's tiers: the cached grace applies only while a cached
+  // release is still at 0%; anything with real progress is a peer-fetch.
+  const timeout = (t.cached && !(t.torbox_progress > 0)) ? cachedStallTimeout
                 : (t.torbox_progress > 0 ? progressStallTimeout : stallTimeout);
   if (timeout <= 0) return null;
   if (t.torbox_state === "queued" || t.dlspeed > 0 || !t.progress_at) return null;
   const elapsed = Math.floor(Date.now()/1000) - t.progress_at;
   if (elapsed < 60) return null;
   return timeout - elapsed;
+}
+
+// slowAverage returns the average bytes/s over the currently open speed window,
+// the same figure the engine will judge the torrent on when the window closes,
+// or null when there is nothing to judge yet (check disabled, not fetching, size
+// unknown, no bytes in yet, or less than a third of a window elapsed — too short
+// a sample to mean anything).
+function slowAverage(t) {
+  if (minSpeed <= 0 || slowWindow <= 0) return null;
+  if (t.phase !== "torbox" || !t.speed_at || !t.size) return null;
+  const bytes = Math.floor(t.torbox_progress * t.size);
+  if (bytes <= 0) return null;
+  const elapsed = Math.floor(Date.now()/1000) - t.speed_at;
+  if (elapsed < slowWindow/3) return null;
+  return Math.floor(Math.max(0, bytes - (t.speed_bytes || 0)) / elapsed);
 }
 
 function card(t) {
@@ -196,9 +215,18 @@ function card(t) {
   }
   const age = fmtAge(t.added_on);
   const stall = stallRemaining(t);
-  const stallMsg = stall === null ? ""
+  const avg = slowAverage(t);
+  let stallMsg = stall === null ? ""
     : (stall <= 0 ? "⚠ no progress — failing…"
                   : `⚠ no progress — fails in ${fmtEta(stall)}`);
+  // A torrent moving too slowly to finish isn't stalled, so it gets its own
+  // warning rather than sharing the stall line.
+  if (!stallMsg && avg !== null && avg < minSpeed) {
+    // fmtSpeed renders 0 as an em dash, which reads wrong mid-sentence; a zero
+    // average is the "reports movement, delivers nothing" case worth spelling out.
+    const rate = avg > 0 ? fmtSpeed(avg) : "0 B/s";
+    stallMsg = `⚠ averaging ${rate} — below the ${fmtSpeed(minSpeed)} floor`;
+  }
   // Files exist once content is on TorBox and we've recorded them (local/done).
   const expandable = t.phase === "local" || t.phase === "done";
   const isOpen = expanded.has(t.hash);
@@ -265,6 +293,8 @@ async function tick() {
     stallTimeout = d.stall_timeout || 0;
     progressStallTimeout = d.progress_stall_timeout || 0;
     cachedStallTimeout = d.cached_stall_timeout || 0;
+    minSpeed = d.min_speed || 0;
+    slowWindow = d.slow_window || 0;
     const ts = d.torrents || [];
     const active = ts.filter(t => t.phase === "torbox" || t.phase === "local").length;
     const done = ts.filter(t => t.phase === "done").length;

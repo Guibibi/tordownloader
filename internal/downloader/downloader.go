@@ -25,6 +25,12 @@ const (
 	// still fails within ~1-2 minutes.
 	maxLinkRetries          = 5
 	defaultProgressInterval = time.Second
+	// defaultIdleTimeout is how long a transfer may deliver nothing before it is
+	// abandoned and retried. It has to be generous — a CDN can legitimately pause
+	// while it seeks or re-buffers — but finite, because the alternative is a
+	// transfer that hangs forever: the HTTP client has no overall deadline (a real
+	// download runs for hours), so silence is the only thing safe to measure.
+	defaultIdleTimeout = 2 * time.Minute
 )
 
 // retryBaseDelay/retryMaxDelay shape the exponential backoff between attempts on
@@ -47,6 +53,13 @@ var (
 	errTransient   = errors.New("transient download error")
 )
 
+// ErrIdle reports that a transfer was aborted because it stopped delivering
+// bytes for the idle timeout. It is wrapped in errTransient, so the retry loop
+// treats it like any other transient CDN failure: back off, request a fresh
+// link, and resume from the bytes already on disk. Exported so callers can
+// recognise the cause in a failure message.
+var ErrIdle = errors.New("no data received")
+
 // LinkFunc returns a fresh, time-limited CDN URL for the given TorBox file id.
 // The downloader calls it again whenever a link is rejected as expired.
 type LinkFunc func(ctx context.Context, torboxFileID int) (string, error)
@@ -68,6 +81,13 @@ type Options struct {
 	Progress         func(downloaded int64)        // aggregate bytes so far, called periodically
 	FileDone         func(rowID int64, size int64) // a file finished & verified (may be concurrent)
 	ProgressInterval time.Duration                 // Progress cadence (default 1s)
+	// IdleTimeout aborts a transfer that has delivered no bytes for this long,
+	// covering the whole request: connect, headers, and body. The attempt fails as
+	// transient, so it is retried with a fresh link and resumed from disk — a trip
+	// costs one backoff, not the torrent. Default 2m; negative disables the
+	// watchdog entirely (a hung transfer then blocks its slot until the torrent is
+	// deleted or the process restarts).
+	IdleTimeout time.Duration
 }
 
 // Download fetches every file with bounded concurrency. It returns the first
@@ -84,6 +104,11 @@ func Download(ctx context.Context, files []File, link LinkFunc, opts Options) er
 	interval := opts.ProgressInterval
 	if interval <= 0 {
 		interval = defaultProgressInterval
+	}
+	// 0 means "unset" → the default; a negative value disables the watchdog.
+	idle := opts.IdleTimeout
+	if idle == 0 {
+		idle = defaultIdleTimeout
 	}
 
 	// Seed the counter with bytes already on disk so resumed downloads report
@@ -142,7 +167,7 @@ func Download(ctx context.Context, files []File, link LinkFunc, opts Options) er
 			}
 			defer func() { <-sem }()
 
-			if err := fetch(ctx, client, f, link, &downloaded); err != nil {
+			if err := fetch(ctx, client, f, link, &downloaded, idle); err != nil {
 				errs <- fmt.Errorf("%s: %w", filepath.Base(f.Dest), err)
 				return
 			}
@@ -171,7 +196,7 @@ func Download(ctx context.Context, files []File, link LinkFunc, opts Options) er
 
 // fetch downloads one file, re-requesting a fresh link on expiry and resuming
 // from any bytes already on disk.
-func fetch(ctx context.Context, client *http.Client, f File, link LinkFunc, downloaded *int64) error {
+func fetch(ctx context.Context, client *http.Client, f File, link LinkFunc, downloaded *int64, idle time.Duration) error {
 	if f.Size > 0 {
 		if fi, err := os.Stat(f.Dest); err == nil && fi.Size() == f.Size {
 			return nil // already complete from a previous run
@@ -205,7 +230,7 @@ func fetch(ctx context.Context, client *http.Client, f File, link LinkFunc, down
 			}
 			continue
 		}
-		err = downloadOnce(ctx, client, url, f, downloaded)
+		err = downloadOnce(ctx, client, url, f, downloaded, idle)
 		switch {
 		case err == nil:
 			return nil
@@ -248,7 +273,7 @@ func backoff(ctx context.Context, attempt int) error {
 
 // downloadOnce performs a single GET, resuming via Range from the current
 // on-disk size, and verifies the final size.
-func downloadOnce(ctx context.Context, client *http.Client, url string, f File, downloaded *int64) error {
+func downloadOnce(ctx context.Context, client *http.Client, url string, f File, downloaded *int64, idle time.Duration) error {
 	var start int64
 	if fi, err := os.Stat(f.Dest); err == nil {
 		start = fi.Size()
@@ -258,7 +283,13 @@ func downloadOnce(ctx context.Context, client *http.Client, url string, f File, 
 		}
 	}
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	// The watchdog owns this request's context, so a silence anywhere in it —
+	// connect, headers, or mid-body — aborts the attempt instead of hanging. It is
+	// armed before Do and rearmed on every body read that returns.
+	reqCtx, watchdog := newIdleWatchdog(ctx, idle)
+	defer watchdog.stop()
+
+	req, err := http.NewRequestWithContext(reqCtx, http.MethodGet, url, nil)
 	if err != nil {
 		return err
 	}
@@ -267,7 +298,7 @@ func downloadOnce(ctx context.Context, client *http.Client, url string, f File, 
 	}
 	resp, err := client.Do(req)
 	if err != nil {
-		return err
+		return watchdog.classify(ctx, err)
 	}
 	defer resp.Body.Close()
 
@@ -306,14 +337,15 @@ func downloadOnce(ctx context.Context, client *http.Client, url string, f File, 
 		return err
 	}
 	cw := &countWriter{w: out, total: downloaded}
-	_, copyErr := io.Copy(cw, resp.Body)
+	_, copyErr := io.Copy(cw, watchdog.wrap(resp.Body))
 	closeErr := out.Close()
 	if copyErr != nil {
-		// A dropped connection mid-body. Partial bytes are kept and counted, so
-		// treat it as transient: the next attempt backs off and resumes via Range
-		// instead of failing the whole torrent on one broken transfer. (A
-		// cancelled ctx surfaces at the top of the retry loop instead.)
-		return fmt.Errorf("%w: %v", errTransient, copyErr)
+		// A dropped connection mid-body, or a transfer the watchdog gave up on.
+		// Partial bytes are kept and counted, so treat it as transient: the next
+		// attempt backs off and resumes via Range instead of failing the whole
+		// torrent on one broken transfer. (A cancelled parent ctx surfaces at the
+		// top of the retry loop instead.)
+		return watchdog.classify(ctx, copyErr)
 	}
 	if closeErr != nil {
 		return closeErr
@@ -412,4 +444,87 @@ func (c *countWriter) Write(p []byte) (int, error) {
 	n, err := c.w.Write(p)
 	atomic.AddInt64(c.total, int64(n))
 	return n, err
+}
+
+// idleWatchdog aborts a request that stops delivering bytes. It owns a
+// cancellable child of the caller's context: a timer fires the cancel after
+// idle elapses, and every read that returns rearms the timer. That single
+// mechanism covers the whole request — a dial that never connects, headers that
+// never arrive, and a body that goes quiet mid-transfer — which is what makes it
+// safe to run the download client with no overall timeout, since a legitimate
+// transfer can run for hours but never goes silent for minutes.
+//
+// A zero or negative idle disables it: the watchdog then just passes the
+// caller's context and reader through untouched.
+type idleWatchdog struct {
+	idle    time.Duration
+	timer   *time.Timer
+	cancel  context.CancelFunc
+	expired atomic.Bool // set when the timer fired, to tell our abort from any other
+}
+
+// newIdleWatchdog arms a watchdog over ctx and returns the context requests
+// should use. The caller must call stop when the request is done.
+func newIdleWatchdog(ctx context.Context, idle time.Duration) (context.Context, *idleWatchdog) {
+	w := &idleWatchdog{idle: idle}
+	if idle <= 0 {
+		return ctx, w
+	}
+	reqCtx, cancel := context.WithCancel(ctx)
+	w.cancel = cancel
+	w.timer = time.AfterFunc(idle, func() {
+		w.expired.Store(true)
+		cancel()
+	})
+	return reqCtx, w
+}
+
+// stop releases the watchdog's timer and context. Safe to call more than once.
+func (w *idleWatchdog) stop() {
+	if w.timer != nil {
+		w.timer.Stop()
+	}
+	if w.cancel != nil {
+		w.cancel()
+	}
+}
+
+// wrap returns r with the watchdog rearmed on every read. A disabled watchdog
+// returns r unchanged.
+func (w *idleWatchdog) wrap(r io.Reader) io.Reader {
+	if w.timer == nil {
+		return r
+	}
+	return &idleReader{r: r, w: w}
+}
+
+// classify turns a request error into the error the retry loop should see. A
+// cancelled *parent* context (shutdown, or the torrent being deleted) is
+// returned as-is so the loop stops immediately; a watchdog abort becomes a
+// transient failure so the file is retried with a fresh link and resumed from
+// disk. Anything else passes through as transient, as a dropped connection
+// always did.
+func (w *idleWatchdog) classify(parent context.Context, err error) error {
+	if parent.Err() != nil {
+		return parent.Err()
+	}
+	if w.expired.Load() {
+		return fmt.Errorf("%w: %w for %s", errTransient, ErrIdle, w.idle)
+	}
+	return fmt.Errorf("%w: %v", errTransient, err)
+}
+
+// idleReader rearms the watchdog around each read, so the deadline measures
+// silence rather than total transfer time.
+type idleReader struct {
+	r io.Reader
+	w *idleWatchdog
+}
+
+func (ir *idleReader) Read(p []byte) (int, error) {
+	// Rearm before blocking: the timer must cover the read we are about to make,
+	// not the one that just finished. If it has already fired, the request context
+	// is cancelled and this read returns the error that ends the transfer.
+	ir.w.timer.Reset(ir.w.idle)
+	return ir.r.Read(p)
 }

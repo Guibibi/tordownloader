@@ -155,10 +155,14 @@ func (e *Engine) reconcileOne(ctx context.Context, t store.Torrent, byID map[int
 	}
 
 	// Still fetching: refresh live stats so Sonarr sees progress move. A torrent
-	// is "advancing" when its progress climbs or TorBox is actively moving bytes;
-	// that resets the stall clock so a slow-but-live download is never failed for
-	// being slow.
-	advancing := tb.Progress > t.TorBoxProgress || tb.DownloadSpeed > 0
+	// is "advancing" when its progress climbs or TorBox reports it moving bytes at
+	// a rate worth waiting for; that resets the stall clock, so a download that is
+	// merely slow is never failed by the *stall* detector. TorBox's reported speed
+	// only counts above the same floor the average-speed check uses: a permanent
+	// trickle that never turns into progress must not reset the stall clock
+	// forever (with the check disabled the floor is "any movement at all", the
+	// original behaviour).
+	advancing := tb.Progress > t.TorBoxProgress || tb.DownloadSpeed >= e.advanceFloor()
 	if err := e.store.UpdateTorBoxStatus(ctx, t.ID, store.TorBoxStatus{
 		State:     tb.DownloadState,
 		Progress:  clamp01(tb.Progress),
@@ -212,6 +216,14 @@ func (e *Engine) reconcileOne(ctx context.Context, t store.Torrent, byID map[int
 		e.maybeReannounce(ctx, t, tb, stalledFor)
 	}
 
+	// Sustained-speed check. The stall detector above only asks "is anything
+	// happening"; this asks "is enough happening to ever finish". A fetch
+	// trickling along below the floor keeps resetting the stall clock forever
+	// while holding one of three scarce slots, so it is failed on its average.
+	if e.checkSlow(ctx, t, tb, now) {
+		return
+	}
+
 	// Optional absolute cap from active_since. Disabled by default
 	// (failure.timeout = 0); set it to bound how long a perpetually-slow torrent
 	// may hold a scarce TorBox slot.
@@ -231,12 +243,131 @@ func (e *Engine) reconcileOne(ctx context.Context, t store.Torrent, byID map[int
 // that tier.
 func (e *Engine) stallTimeoutFor(t store.Torrent, hasProgress bool) time.Duration {
 	switch {
-	case t.Cached:
+	case t.Cached && !hasProgress:
+		// Cached and still at 0%: waiting on TorBox to surface bytes it already
+		// has. The cached flag is a submit-time reading, though, so it only decides
+		// this tier while the torrent behaves like a cached one. Once real progress
+		// appears it is being fetched like anything else — from peers, if the cache
+		// reading was wrong — and gets the peer-fetch patience below rather than
+		// being killed early on a stale label.
 		return e.cachedStallAfter
 	case hasProgress:
 		return e.progressStallAfter
 	default:
 		return e.stallAfter
+	}
+}
+
+// advanceFloor is the TorBox-reported speed at or above which a torrent counts
+// as advancing for the stall clock. It tracks the average-speed floor so the two
+// checks agree on what "moving" means; with the average check disabled it falls
+// back to "any reported movement", the behaviour before the floor existed.
+func (e *Engine) advanceFloor() int64 {
+	if e.minSpeed > 0 {
+		return e.minSpeed
+	}
+	return 1
+}
+
+// checkSlow judges a fetching torrent on its *average* speed over a full
+// slowWindow and fails it if that average is below minSpeed, reporting true when
+// it did. This is the counterpart to the stall detector: a torrent moving 5 KB/s
+// is never "stalled" — progress climbs every tick, so the stall clock resets
+// forever — yet it will not finish inside any window Sonarr cares about, and it
+// occupies one of the account's three slots the whole time. Failing it hands the
+// slot back and lets the *arr blocklist the release and grab a better-seeded one.
+//
+// Three properties keep this from killing healthy downloads:
+//
+//   - The average is computed from real bytes (progress × size), not from
+//     TorBox's reported download_speed. A torrent that reports movement while
+//     delivering nothing averages zero and is caught; a torrent whose reported
+//     speed dips to nothing while bytes keep landing is not.
+//   - It judges only a whole closed window. Swarms are lumpy, and no
+//     instantaneous dip — or single fast tick — can decide anything.
+//   - The window does not start until the first byte arrives. A fetch still at
+//     0% is owned by the stall tiers, which are tuned per tier (a cached release
+//     waiting on TorBox must not be judged as a slow peer-fetch).
+func (e *Engine) checkSlow(ctx context.Context, t store.Torrent, tb torbox.Torrent, now time.Time) bool {
+	if e.minSpeed <= 0 || e.slowWindow <= 0 {
+		return false
+	}
+	anchorAt := t.SpeedAt
+	if anchorAt == 0 {
+		// Pre-existing row from before this column existed (or a torrent activated
+		// by an older build): open the window now rather than measuring against a
+		// zero timestamp, which would read as decades of no progress.
+		e.reanchorSpeed(ctx, t, now, fetchedBytes(t, tb))
+		return false
+	}
+	if now.Sub(time.Unix(anchorAt, 0)) < e.slowWindow {
+		return false
+	}
+
+	bytes := fetchedBytes(t, tb)
+	if bytes <= 0 {
+		// Nothing fetched yet — either genuinely still at 0%, or the size is
+		// unknown so we cannot convert progress into bytes at all. Either way there
+		// is nothing to average: slide the window forward so it measures fetching
+		// once fetching starts.
+		e.reanchorSpeed(ctx, t, now, 0)
+		return false
+	}
+
+	elapsed := now.Sub(time.Unix(anchorAt, 0))
+	gained := bytes - t.SpeedBytes
+	if gained < 0 {
+		// Progress went backwards (TorBox restarted the fetch, or the size estimate
+		// changed under us). Treat it as no gain rather than a negative rate.
+		gained = 0
+	}
+	avg := int64(float64(gained) / elapsed.Seconds())
+	if avg < e.minSpeed {
+		e.fail(ctx, t, fmt.Sprintf(
+			"averaged %s/s over %s, below the %s/s floor (progress=%.0f%%, download_state=%q, seeds=%d, peers=%d)",
+			humanBytes(avg), elapsed.Round(time.Second), humanBytes(e.minSpeed),
+			clamp01(tb.Progress)*100, tb.DownloadState, tb.Seeds, tb.Peers))
+		return true
+	}
+	e.reanchorSpeed(ctx, t, now, bytes)
+	return false
+}
+
+// reanchorSpeed opens a new averaging window, logging rather than propagating a
+// store error: a failed re-anchor only means the current window stays open and
+// the next pass measures over a longer span, which is harmless.
+func (e *Engine) reanchorSpeed(ctx context.Context, t store.Torrent, at time.Time, bytes int64) {
+	if err := e.store.ReanchorSpeed(ctx, t.ID, at, bytes); err != nil {
+		e.log.Warn("reanchor speed window (continuing)", "infohash", t.Infohash, "err", err)
+	}
+}
+
+// fetchedBytes converts TorBox's fractional progress into a byte count using the
+// best size we know. It returns 0 when the size is unknown, which callers read
+// as "nothing measurable yet".
+func fetchedBytes(t store.Torrent, tb torbox.Torrent) int64 {
+	size := tb.Size
+	if size <= 0 {
+		size = t.Size
+	}
+	if size <= 0 {
+		return 0
+	}
+	return int64(clamp01(tb.Progress) * float64(size))
+}
+
+// humanBytes renders a byte count for log and error messages, where an operator
+// reading "4.9 MB" understands the situation faster than "5138022".
+func humanBytes(n int64) string {
+	switch {
+	case n >= 1<<30:
+		return fmt.Sprintf("%.1f GB", float64(n)/(1<<30))
+	case n >= 1<<20:
+		return fmt.Sprintf("%.1f MB", float64(n)/(1<<20))
+	case n >= 1<<10:
+		return fmt.Sprintf("%.1f KB", float64(n)/(1<<10))
+	default:
+		return fmt.Sprintf("%d B", n)
 	}
 }
 

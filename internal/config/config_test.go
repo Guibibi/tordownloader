@@ -104,3 +104,67 @@ func TestArrEnvPartialPairWarns(t *testing.T) {
 		t.Errorf("warning %q should name the missing var %s", cfg.Warnings[0], want)
 	}
 }
+
+func TestParseByteSize(t *testing.T) {
+	cases := []struct {
+		in   string
+		want ByteSize
+	}{
+		{"1024", 1024},
+		{"0", 0},
+		{"50KB", 50 * KiB},
+		{"50kb", 50 * KiB},
+		{"50KiB", 50 * KiB},
+		{"1.5MB", ByteSize(1.5 * float64(MiB))},
+		{"2G", 2 * GiB},
+		{" 4MiB ", 4 * MiB},
+		{"900B", 900},
+	}
+	for _, c := range cases {
+		got, err := ParseByteSize(c.in)
+		if err != nil {
+			t.Errorf("ParseByteSize(%q): %v", c.in, err)
+			continue
+		}
+		if got != c.want {
+			t.Errorf("ParseByteSize(%q) = %d, want %d", c.in, got, c.want)
+		}
+	}
+	for _, bad := range []string{"", "fast", "-5MB", "MB"} {
+		if _, err := ParseByteSize(bad); err == nil {
+			t.Errorf("ParseByteSize(%q) = nil error, want a rejection", bad)
+		}
+	}
+}
+
+func TestLoadByteSizeFromYAML(t *testing.T) {
+	// Both spellings must land on the same byte count: a plain integer for
+	// someone scripting the file, a suffixed string for someone reading it.
+	p := writeConfig(t, "failure:\n  min_speed: \"250KB\"\n")
+	cfg, err := Load(p)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.Failure.MinSpeed != 250*KiB {
+		t.Errorf("min_speed = %d, want %d", cfg.Failure.MinSpeed, 250*KiB)
+	}
+
+	p = writeConfig(t, "failure:\n  min_speed: 256000\n")
+	cfg, err = Load(p)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.Failure.MinSpeed != 256000 {
+		t.Errorf("min_speed = %d, want 256000", cfg.Failure.MinSpeed)
+	}
+
+	// An explicit 0 must survive as "no floor" rather than being re-defaulted.
+	p = writeConfig(t, "failure:\n  min_speed: 0\n")
+	cfg, err = Load(p)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.Failure.MinSpeed != 0 {
+		t.Errorf("min_speed = %d, want 0 (check disabled)", cfg.Failure.MinSpeed)
+	}
+}

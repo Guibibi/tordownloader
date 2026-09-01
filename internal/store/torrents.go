@@ -35,9 +35,16 @@ type Torrent struct {
 	AddedOn        int64
 	ActiveSince    int64
 	ProgressAt     int64
-	CompletedOn    int64
-	CreatedAt      int64
-	UpdatedAt      int64
+	// SpeedAt/SpeedBytes anchor the average-speed window: the time the window
+	// opened and the byte count at that moment. The reconciler averages the
+	// bytes gained since over the elapsed time to decide whether a fetch is
+	// sustaining a useful speed, then re-anchors. Persisted so the window
+	// survives a restart.
+	SpeedAt     int64
+	SpeedBytes  int64
+	CompletedOn int64
+	CreatedAt   int64
+	UpdatedAt   int64
 }
 
 // File is a row from the files table.
@@ -65,7 +72,7 @@ type TorrentFilter struct {
 const torrentColumns = `id, infohash, torbox_id, torbox_queued_id, name, category, save_path, content_path,
 	size, state, torbox_state, torbox_progress, local_progress, dlspeed,
 	seeds, peers, eta, cached, error, arr_notified,
-	added_on, active_since, progress_at, completed_on, created_at, updated_at`
+	added_on, active_since, progress_at, speed_at, speed_bytes, completed_on, created_at, updated_at`
 
 func scanTorrent(s interface{ Scan(...any) error }) (Torrent, error) {
 	var t Torrent
@@ -73,7 +80,7 @@ func scanTorrent(s interface{ Scan(...any) error }) (Torrent, error) {
 		&t.ID, &t.Infohash, &t.TorBoxID, &t.TorBoxQueuedID, &t.Name, &t.Category, &t.SavePath, &t.ContentPath,
 		&t.Size, &t.State, &t.TorBoxState, &t.TorBoxProgress, &t.LocalProgress, &t.DLSpeed,
 		&t.Seeds, &t.Peers, &t.ETA, &t.Cached, &t.Error, &t.ArrNotified,
-		&t.AddedOn, &t.ActiveSince, &t.ProgressAt, &t.CompletedOn, &t.CreatedAt, &t.UpdatedAt,
+		&t.AddedOn, &t.ActiveSince, &t.ProgressAt, &t.SpeedAt, &t.SpeedBytes, &t.CompletedOn, &t.CreatedAt, &t.UpdatedAt,
 	)
 	return t, err
 }

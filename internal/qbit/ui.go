@@ -41,6 +41,11 @@ type uiTorrent struct {
 	// dashboard pairs it with StallTimeout to show how long a stalled fetch has
 	// left before it's failed.
 	ProgressAt int64 `json:"progress_at"`
+	// SpeedAt/SpeedBytes are the open average-speed window: when it started and
+	// the byte count it started from. With the live progress the dashboard can
+	// show the same average the engine will judge the torrent on.
+	SpeedAt    int64 `json:"speed_at"`
+	SpeedBytes int64 `json:"speed_bytes"`
 }
 
 // uiResponse is the payload the dashboard polls.
@@ -59,6 +64,13 @@ type uiResponse struct {
 	// CachedStallTimeout is the configured failure.cached_stall_timeout in seconds,
 	// used for the countdown on cached torrents; 0 disables it for them.
 	CachedStallTimeout int64 `json:"cached_stall_timeout"`
+	// MinSpeed is the configured failure.min_speed in bytes/s — the average a
+	// moving TorBox fetch must sustain over SlowWindow before it is abandoned.
+	// 0 means the check is off; the dashboard then shows no speed floor.
+	MinSpeed int64 `json:"min_speed"`
+	// SlowWindow is the configured failure.slow_window in seconds, the window
+	// MinSpeed is averaged over.
+	SlowWindow int64 `json:"slow_window"`
 }
 
 // uiIndex serves the dashboard HTML at /.
@@ -124,6 +136,8 @@ func (h *Handler) uiTorrents(w http.ResponseWriter, r *http.Request) {
 			Category:       t.Category,
 			AddedOn:        t.AddedOn,
 			ProgressAt:     t.ProgressAt,
+			SpeedAt:        t.SpeedAt,
+			SpeedBytes:     t.SpeedBytes,
 		})
 	}
 
@@ -131,9 +145,11 @@ func (h *Handler) uiTorrents(w http.ResponseWriter, r *http.Request) {
 		Torrents:             out,
 		DLSpeed:              totalDL,
 		Version:              appVersion,
-		StallTimeout:         int64(h.stallTimeout / time.Second),
-		ProgressStallTimeout: int64(h.progressStallTimeout / time.Second),
-		CachedStallTimeout:   int64(h.cachedStallTimeout / time.Second),
+		StallTimeout:         int64(h.failure.StallTimeout / time.Second),
+		ProgressStallTimeout: int64(h.failure.ProgressStallTimeout / time.Second),
+		CachedStallTimeout:   int64(h.failure.CachedStallTimeout / time.Second),
+		MinSpeed:             h.failure.MinSpeed,
+		SlowWindow:           int64(h.failure.SlowWindow / time.Second),
 	})
 }
 

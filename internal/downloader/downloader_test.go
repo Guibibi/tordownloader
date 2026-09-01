@@ -435,3 +435,104 @@ func TestDownloadDroppedConnectionResumes(t *testing.T) {
 		t.Errorf("server calls = %d, want a resume after the dropped connection", calls)
 	}
 }
+
+func TestDownloadIdleTransferAbortsAndResumes(t *testing.T) {
+	data := bytes.Repeat([]byte("i"), 4000)
+	restoreDelays := func(base, max time.Duration) { retryBaseDelay, retryMaxDelay = base, max }
+	defer restoreDelays(retryBaseDelay, retryMaxDelay)
+	retryBaseDelay, retryMaxDelay = time.Millisecond, time.Millisecond
+
+	var calls int32
+	released := make(chan struct{})
+	mux := http.NewServeMux()
+	mux.HandleFunc("/f", func(w http.ResponseWriter, r *http.Request) {
+		if atomic.AddInt32(&calls, 1) == 1 {
+			// Send half the body, then go silent with the connection still open —
+			// the failure mode nothing used to catch, because the client has no
+			// overall deadline and the transfer never errors on its own.
+			w.Header().Set("Content-Length", "4000")
+			_, _ = w.Write(data[:2000])
+			if f, ok := w.(http.Flusher); ok {
+				f.Flush()
+			}
+			<-released
+			return
+		}
+		http.ServeContent(w, r, "file", time.Time{}, bytes.NewReader(data))
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+	defer close(released)
+
+	dir := t.TempDir()
+	dest := filepath.Join(dir, "f.bin")
+	err := Download(context.Background(),
+		[]File{{Dest: dest, Size: int64(len(data))}},
+		staticLink(srv.URL+"/f"),
+		Options{IdleTimeout: 100 * time.Millisecond})
+	if err != nil {
+		t.Fatalf("Download: %v", err)
+	}
+	assertFile(t, dest, data)
+	if n := atomic.LoadInt32(&calls); n < 2 {
+		t.Errorf("server calls = %d, want a retry after the idle transfer was aborted", n)
+	}
+}
+
+func TestDownloadIdleTimeoutDoesNotCutSlowButMovingTransfer(t *testing.T) {
+	// Bytes trickle in well inside the idle timeout. The watchdog measures
+	// silence, not throughput, so a slow-but-alive transfer must complete
+	// untouched — the speed policy lives in the engine, not here.
+	data := bytes.Repeat([]byte("s"), 400)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Length", "400")
+		for i := 0; i < 4; i++ {
+			_, _ = w.Write(data[i*100 : (i+1)*100])
+			if f, ok := w.(http.Flusher); ok {
+				f.Flush()
+			}
+			time.Sleep(20 * time.Millisecond)
+		}
+	}))
+	defer srv.Close()
+
+	dir := t.TempDir()
+	dest := filepath.Join(dir, "s.bin")
+	err := Download(context.Background(),
+		[]File{{Dest: dest, Size: int64(len(data))}},
+		staticLink(srv.URL+"/s"),
+		Options{IdleTimeout: 300 * time.Millisecond})
+	if err != nil {
+		t.Fatalf("Download: %v", err)
+	}
+	assertFile(t, dest, data)
+}
+
+func TestDownloadIdleTimeoutHonoursParentCancel(t *testing.T) {
+	// A cancelled parent (engine shutdown, or the torrent being deleted) must
+	// surface as the context error, not be mistaken for an idle abort and retried.
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Length", "4000")
+		_, _ = w.Write(bytes.Repeat([]byte("c"), 100))
+		if f, ok := w.(http.Flusher); ok {
+			f.Flush()
+		}
+		time.Sleep(300 * time.Millisecond)
+	}))
+	defer srv.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() {
+		time.Sleep(50 * time.Millisecond)
+		cancel()
+	}()
+	defer cancel()
+
+	err := Download(ctx,
+		[]File{{Dest: filepath.Join(t.TempDir(), "c.bin"), Size: 4000}},
+		staticLink(srv.URL+"/c"),
+		Options{IdleTimeout: time.Minute})
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("Download err = %v, want context.Canceled", err)
+	}
+}

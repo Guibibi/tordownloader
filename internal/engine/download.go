@@ -149,10 +149,11 @@ func (e *Engine) downloadOne(ctx, dlCtx context.Context, t store.Torrent) {
 
 	e.log.Info("downloading", "infohash", t.Infohash, "name", t.Name, "files", len(files), "size", totalSize)
 	err = downloader.Download(dlCtx, jobs, link, downloader.Options{
-		Parallel:   e.parallel,
-		HTTPClient: e.httpClient,
-		Progress:   progress,
-		FileDone:   fileDone,
+		Parallel:    e.parallel,
+		HTTPClient:  e.httpClient,
+		Progress:    progress,
+		FileDone:    fileDone,
+		IdleTimeout: e.idleTimeout,
 	})
 	if err != nil {
 		if dlCtx.Err() != nil && ctx.Err() == nil {

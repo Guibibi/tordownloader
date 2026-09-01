@@ -14,6 +14,18 @@ import (
 	"github.com/guibibi/tordownloader/internal/store"
 )
 
+// testPolicy is the failure policy handlers are exercised against: the shipped
+// defaults, so the dashboard payload assertions reflect a realistic config.
+func testPolicy() FailurePolicy {
+	return FailurePolicy{
+		StallTimeout:         10 * time.Minute,
+		ProgressStallTimeout: 2 * time.Hour,
+		CachedStallTimeout:   30 * time.Minute,
+		MinSpeed:             50 << 10,
+		SlowWindow:           15 * time.Minute,
+	}
+}
+
 // newTestServer opens a fresh on-disk store in a temp dir and returns an
 // httptest server fronting the qbit routes, plus the store for seeding rows.
 func newTestServer(t *testing.T) (*httptest.Server, *store.Store) {
@@ -25,7 +37,7 @@ func newTestServer(t *testing.T) (*httptest.Server, *store.Store) {
 	}
 	t.Cleanup(func() { _ = st.Close() })
 
-	srv := httptest.NewServer(New(st, "/downloads", 10*time.Minute, 2*time.Hour, 30*time.Minute, nil, nil).Routes())
+	srv := httptest.NewServer(New(st, "/downloads", testPolicy(), nil, nil).Routes())
 	t.Cleanup(srv.Close)
 	return srv, st
 }

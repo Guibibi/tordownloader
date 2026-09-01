@@ -89,15 +89,34 @@ func (s *Store) ListByState(ctx context.Context, state string) ([]Torrent, error
 }
 
 // MarkActive records a successful createtorrent: it stores the TorBox id and
-// transitions the torrent to TORBOX_ACTIVE, seeding both the active_since and
-// progress_at (stall) clocks.
+// transitions the torrent to TORBOX_ACTIVE, seeding the active_since and
+// progress_at (stall) clocks and opening a fresh average-speed window at zero
+// bytes.
 func (s *Store) MarkActive(ctx context.Context, id int64, torboxID int) error {
 	now := time.Now().Unix()
 	_, err := s.db.ExecContext(ctx, `
-		UPDATE torrents SET torbox_id = ?, state = ?, active_since = ?, progress_at = ?, updated_at = ?
-		WHERE id = ?`, torboxID, StateTorBoxActive, now, now, now, id)
+		UPDATE torrents SET torbox_id = ?, state = ?, active_since = ?, progress_at = ?,
+			speed_at = ?, speed_bytes = 0, updated_at = ?
+		WHERE id = ?`, torboxID, StateTorBoxActive, now, now, now, now, id)
 	if err != nil {
 		return fmt.Errorf("mark active %d: %w", id, err)
+	}
+	return nil
+}
+
+// ReanchorSpeed opens a new average-speed window at (at, bytes). The reconciler
+// calls it once a window closes without the torrent falling below the speed
+// floor, and while a fetch has not yet delivered its first byte (so the window
+// measures actual fetching rather than time spent waiting to start — that wait
+// is what the stall tiers are for). Restricted to TORBOX_ACTIVE rows so it can
+// never resurrect clocks on a torrent that has moved on.
+func (s *Store) ReanchorSpeed(ctx context.Context, id int64, at time.Time, bytes int64) error {
+	_, err := s.db.ExecContext(ctx, `
+		UPDATE torrents SET speed_at = ?, speed_bytes = ?, updated_at = ?
+		WHERE id = ? AND state = ?`,
+		at.Unix(), bytes, time.Now().Unix(), id, StateTorBoxActive)
+	if err != nil {
+		return fmt.Errorf("reanchor speed %d: %w", id, err)
 	}
 	return nil
 }

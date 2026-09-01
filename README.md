@@ -22,7 +22,8 @@ download-to-disk** (no mount-based streaming).
 - **Real downloads to disk** — pulls finished files from TorBox to `/<root>/<category>/<name>/…`, preserving folder structure. No mount, no streaming.
 - **Safe imports** — downloads into a `.incomplete` staging dir, then atomic-moves into place, so Sonarr/Radarr never import a half-written file.
 - **Plan-aware** — respects TorBox's concurrent-slot limit (3 on Essential), queues the rest, and paces API calls to stay under TorBox's rate limit.
-- **Fails on stalls, not slowness** — a dead/unseeded release is errored, but a slow-but-moving download is left to finish. Patience is tiered: a fetch stuck at 0% fails quickly, one with real progress gets hours (thin swarms recover their seeds), and stalled fetches are periodically nudged with a tracker reannounce.
+- **Gives up on the right releases** — a fetch is errored when it stalls *or* when it is plainly too slow to finish, and patience is tiered so healthy grabs are left alone: stuck at 0% fails quickly, one with real progress gets hours (thin swarms recover their seeds), and stalled fetches are nudged with a tracker reannounce meanwhile. A release that keeps trickling below a configurable floor (50 KB/s averaged over 15 minutes) is dropped too — it would never finish, and it holds one of your three TorBox slots while it tries. Averages come from bytes that actually landed, so a torrent reporting speed while delivering nothing is caught as well.
+- **Never hangs on a dead transfer** — a CDN connection that stays open but stops sending is aborted and retried with a fresh link, resuming from the bytes already on disk.
 - **Failed downloads actually get replaced** — Sonarr/Radarr ignore qBittorrent error states for failed-download handling, so with a configured `arr:` instance tordownloader pushes the failure back through the *arr's own API: the queue item is removed with blocklist on, and the *arr immediately searches for an alternative release.
 - **Clean teardown** — when Sonarr/Radarr remove a download, it's deleted from TorBox and local disk too.
 - **Status dashboard** — a built-in web page shows live per-torrent and per-file progress.
@@ -167,9 +168,10 @@ automatically after `failure.error_retention` (default 7 days, `config.yaml`).
 > the queue until removed by hand.
 
 > [!TIP]
-> Finer controls — TorBox slot count, stall timeouts, API rate cap, poll interval — live in
-> `config.yaml` only. Mount one and pass `--config /config.yaml`; start from
-> [`config.example.yaml`](config.example.yaml).
+> Finer controls — TorBox slot count, stall timeouts, the slow-download speed floor
+> (`failure.min_speed` / `failure.slow_window`), transfer idle timeout, API rate cap, poll
+> interval — live in `config.yaml` only. Mount one and pass `--config /config.yaml`; start
+> from [`config.example.yaml`](config.example.yaml).
 
 ## Documentation
 

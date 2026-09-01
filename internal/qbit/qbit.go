@@ -32,21 +32,10 @@ type Handler struct {
 	httpClient *http.Client
 	log        *slog.Logger
 
-	// stallTimeout mirrors the engine's failure.stall_timeout: the grace a fetch
-	// stalled at 0% gets. The dashboard uses it to show how long a stalled TorBox
-	// fetch has before it's failed. 0 means stall-failing is disabled for that
-	// tier, and no countdown is shown.
-	stallTimeout time.Duration
-
-	// progressStallTimeout mirrors the engine's failure.progress_stall_timeout:
-	// the longer grace a fetch that has made real progress (>0%) gets. The
-	// dashboard uses it for the countdown on such torrents. 0 disables it for them.
-	progressStallTimeout time.Duration
-
-	// cachedStallTimeout mirrors the engine's failure.cached_stall_timeout: the
-	// longer grace a cached release gets while TorBox surfaces it. The dashboard
-	// uses it for the countdown on cached torrents. 0 disables it for them.
-	cachedStallTimeout time.Duration
+	// failure mirrors the engine's failure policy so the dashboard can show, per
+	// torrent, how much grace it has left and what speed floor it is held to. The
+	// handler never enforces any of it — the engine does — it only reports it.
+	failure FailurePolicy
 
 	// deleteFn is called to remove a torrent end-to-end: TorBox deletion,
 	// local file cleanup, and DB drop. When nil, the handler falls back to
@@ -54,27 +43,44 @@ type Handler struct {
 	deleteFn engine.DeleteFunc
 }
 
+// FailurePolicy mirrors the engine's failure.* settings for display purposes.
+// It is passed as a struct rather than as positional arguments because the
+// policy has grown several near-identical durations that are trivial to
+// transpose at a call site.
+type FailurePolicy struct {
+	// StallTimeout is failure.stall_timeout: the grace a fetch stalled at 0%
+	// gets. 0 means stall-failing is disabled for that tier and no countdown is
+	// shown.
+	StallTimeout time.Duration
+	// ProgressStallTimeout is failure.progress_stall_timeout: the longer grace a
+	// fetch that has made real progress (>0%) gets. 0 disables it for them.
+	ProgressStallTimeout time.Duration
+	// CachedStallTimeout is failure.cached_stall_timeout: the grace a cached
+	// release gets while TorBox surfaces it. 0 disables it for them.
+	CachedStallTimeout time.Duration
+	// MinSpeed is failure.min_speed in bytes/s: the average a moving fetch must
+	// sustain over SlowWindow. 0 means the speed check is off.
+	MinSpeed int64
+	// SlowWindow is failure.slow_window: the averaging window for MinSpeed.
+	SlowWindow time.Duration
+}
+
 // New builds a Handler. root is the download root reported in app/preferences
-// and used as the base for category save paths. stallTimeout,
-// progressStallTimeout and cachedStallTimeout mirror the engine's
-// failure.stall_timeout / failure.progress_stall_timeout /
-// failure.cached_stall_timeout so the dashboard can show the right stall
-// countdown per torrent (0 disables it). deleteFn is the engine's delete
-// function; when nil the handler falls back to store-level DB-only deletion
-// (useful in tests).
-func New(st *store.Store, root string, stallTimeout, progressStallTimeout, cachedStallTimeout time.Duration, deleteFn engine.DeleteFunc, log *slog.Logger) *Handler {
+// and used as the base for category save paths. failure mirrors the engine's
+// failure.* policy so the dashboard can show the right countdown and speed floor
+// per torrent. deleteFn is the engine's delete function; when nil the handler
+// falls back to store-level DB-only deletion (useful in tests).
+func New(st *store.Store, root string, failure FailurePolicy, deleteFn engine.DeleteFunc, log *slog.Logger) *Handler {
 	if log == nil {
 		log = slog.Default()
 	}
 	return &Handler{
-		store:                st,
-		root:                 root,
-		stallTimeout:         stallTimeout,
-		progressStallTimeout: progressStallTimeout,
-		cachedStallTimeout:   cachedStallTimeout,
-		deleteFn:             deleteFn,
-		httpClient:           &http.Client{Timeout: 30 * time.Second},
-		log:                  log,
+		store:      st,
+		root:       root,
+		failure:    failure,
+		deleteFn:   deleteFn,
+		httpClient: &http.Client{Timeout: 30 * time.Second},
+		log:        log,
 	}
 }
 

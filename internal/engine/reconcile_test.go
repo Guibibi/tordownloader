@@ -3,6 +3,7 @@ package engine
 import (
 	"context"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -763,5 +764,232 @@ func TestPrunePassDisabled(t *testing.T) {
 
 	if _, ok, err := st.GetTorrent(context.Background(), tor.Infohash); err != nil || !ok {
 		t.Fatalf("pruning disabled: ERROR row should be kept, ok=%v err=%v", ok, err)
+	}
+}
+
+// setSpeedWindow backdates the average-speed window so a test can present a
+// closed window with a known byte baseline. seedActive opens the window at
+// "now", which is what keeps the slow check out of the way of the stall tests
+// above.
+func setSpeedWindow(t *testing.T, st *store.Store, id int64, age time.Duration, bytes int64) {
+	t.Helper()
+	if _, err := st.DB().ExecContext(context.Background(),
+		`UPDATE torrents SET speed_at = ?, speed_bytes = ? WHERE id = ?`,
+		time.Now().Add(-age).Unix(), bytes, id); err != nil {
+		t.Fatalf("set speed window: %v", err)
+	}
+}
+
+// slowConfig is a policy where only the slow check can fail a torrent: the stall
+// tiers are disabled so a failure is unambiguously attributable to the average.
+func slowConfig(minSpeed int64, window time.Duration) Config {
+	return Config{
+		MaxSlots:             3,
+		StallTimeout:         -1,
+		ProgressStallTimeout: -1,
+		CachedStallTimeout:   -1,
+		MinSpeed:             minSpeed,
+		SlowWindow:           window,
+	}
+}
+
+func TestReconcileSlowFailsBelowFloor(t *testing.T) {
+	st := newStore(t)
+	hash := "a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1"
+	// A 10GB release that has crawled from 20% to 20.05% over a 15m window: about
+	// 5.7 KB/s, far under a 50 KB/s floor. It is not stalled — progress climbs
+	// every tick — but it would need weeks, so the slow check abandons it.
+	tr := seedActive(t, st, hash, 61, "/downloads/tv", time.Hour)
+	setProgress(t, st, tr.ID, 0.2005)
+	const size = int64(10 << 30)
+	setSpeedWindow(t, st, tr.ID, 15*time.Minute, int64(0.20*float64(size)))
+
+	tb := &fakeTB{list: func() ([]torbox.Torrent, error) {
+		return []torbox.Torrent{{
+			ID: 61, DownloadState: "downloading", Active: true, Seeds: 1, Peers: 3,
+			Size: size, Progress: 0.2005, DownloadSpeed: 5800,
+		}}, nil
+	}}
+	e := New(st, tb, slowConfig(50<<10, 15*time.Minute), nil)
+	if err := e.reconcilePass(context.Background()); err != nil {
+		t.Fatalf("reconcilePass: %v", err)
+	}
+	got := getTorrent(t, st, hash)
+	if got.State != store.StateError {
+		t.Fatalf("state = %q, want ERROR (averaged below the speed floor)", got.State)
+	}
+	if !strings.Contains(got.Error, "floor") {
+		t.Fatalf("error = %q, want it to explain the speed floor", got.Error)
+	}
+}
+
+func TestReconcileSlowKeepsTorrentAboveFloor(t *testing.T) {
+	st := newStore(t)
+	hash := "a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2"
+	// Same window, but the torrent gained 10% of a 10GB release (~1.1 MB/s): well
+	// above the floor, so it survives and the window re-anchors at the new byte
+	// count ready for the next 15m.
+	tr := seedActive(t, st, hash, 62, "/downloads/tv", time.Hour)
+	setProgress(t, st, tr.ID, 0.30)
+	const size = int64(10 << 30)
+	setSpeedWindow(t, st, tr.ID, 15*time.Minute, int64(0.20*float64(size)))
+
+	tb := &fakeTB{list: func() ([]torbox.Torrent, error) {
+		return []torbox.Torrent{{
+			ID: 62, DownloadState: "downloading", Active: true, Seeds: 8, Peers: 20,
+			Size: size, Progress: 0.30, DownloadSpeed: 1 << 20,
+		}}, nil
+	}}
+	e := New(st, tb, slowConfig(50<<10, 15*time.Minute), nil)
+	if err := e.reconcilePass(context.Background()); err != nil {
+		t.Fatalf("reconcilePass: %v", err)
+	}
+	got := getTorrent(t, st, hash)
+	if got.State != store.StateTorBoxActive {
+		t.Fatalf("state = %q, want TORBOX_ACTIVE (comfortably above the floor)", got.State)
+	}
+	if want := int64(0.30 * float64(size)); got.SpeedBytes != want {
+		t.Fatalf("speed_bytes = %d, want %d (window re-anchored at current bytes)", got.SpeedBytes, want)
+	}
+	if time.Since(time.Unix(got.SpeedAt, 0)) > time.Minute {
+		t.Fatalf("speed_at = %d, want a window re-anchored at ~now", got.SpeedAt)
+	}
+}
+
+func TestReconcileSlowNeedsFullWindow(t *testing.T) {
+	st := newStore(t)
+	hash := "a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3"
+	// Crawling at the same hopeless rate, but only 5m into a 15m window. A
+	// torrent is judged on a full window and never on a dip, so nothing happens
+	// yet.
+	tr := seedActive(t, st, hash, 63, "/downloads/tv", time.Hour)
+	setProgress(t, st, tr.ID, 0.2005)
+	const size = int64(10 << 30)
+	setSpeedWindow(t, st, tr.ID, 5*time.Minute, int64(0.20*float64(size)))
+
+	tb := &fakeTB{list: func() ([]torbox.Torrent, error) {
+		return []torbox.Torrent{{
+			ID: 63, DownloadState: "downloading", Active: true,
+			Size: size, Progress: 0.2005, DownloadSpeed: 5800,
+		}}, nil
+	}}
+	e := New(st, tb, slowConfig(50<<10, 15*time.Minute), nil)
+	if err := e.reconcilePass(context.Background()); err != nil {
+		t.Fatalf("reconcilePass: %v", err)
+	}
+	if got := getTorrent(t, st, hash); got.State != store.StateTorBoxActive {
+		t.Fatalf("state = %q, want TORBOX_ACTIVE (window not closed yet)", got.State)
+	}
+}
+
+func TestReconcileSlowIgnoresTorrentStillAtZero(t *testing.T) {
+	st := newStore(t)
+	hash := "a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4"
+	// Nothing fetched yet. Averaging zero bytes would fail every torrent that has
+	// not started, so the window slides forward instead — how long a fetch may sit
+	// at 0% is the stall tiers' decision, and they are tier-aware in a way a flat
+	// speed floor is not.
+	tr := seedActive(t, st, hash, 64, "/downloads/tv", time.Hour)
+	setSpeedWindow(t, st, tr.ID, 20*time.Minute, 0)
+
+	tb := &fakeTB{list: func() ([]torbox.Torrent, error) {
+		return []torbox.Torrent{{
+			ID: 64, DownloadState: "downloading", Active: true,
+			Size: 10 << 30, Progress: 0, DownloadSpeed: 0,
+		}}, nil
+	}}
+	e := New(st, tb, slowConfig(50<<10, 15*time.Minute), nil)
+	if err := e.reconcilePass(context.Background()); err != nil {
+		t.Fatalf("reconcilePass: %v", err)
+	}
+	got := getTorrent(t, st, hash)
+	if got.State != store.StateTorBoxActive {
+		t.Fatalf("state = %q, want TORBOX_ACTIVE (nothing fetched yet to average)", got.State)
+	}
+	if time.Since(time.Unix(got.SpeedAt, 0)) > time.Minute {
+		t.Fatalf("speed_at = %d, want the window slid forward to ~now", got.SpeedAt)
+	}
+}
+
+func TestReconcileSlowJudgesBytesNotReportedSpeed(t *testing.T) {
+	st := newStore(t)
+	hash := "a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5"
+	// TorBox claims a healthy 5 MB/s while progress has not moved a byte in 15m.
+	// Reported speed alone used to keep such a torrent alive forever (it counted
+	// as "advancing", resetting the stall clock every tick); the average is taken
+	// from real bytes, so the claim does not save it.
+	tr := seedActive(t, st, hash, 65, "/downloads/tv", time.Hour)
+	setProgress(t, st, tr.ID, 0.40)
+	const size = int64(10 << 30)
+	setSpeedWindow(t, st, tr.ID, 15*time.Minute, int64(0.40*float64(size)))
+
+	tb := &fakeTB{list: func() ([]torbox.Torrent, error) {
+		return []torbox.Torrent{{
+			ID: 65, DownloadState: "downloading", Active: true, Seeds: 5, Peers: 5,
+			Size: size, Progress: 0.40, DownloadSpeed: 5 << 20,
+		}}, nil
+	}}
+	e := New(st, tb, slowConfig(50<<10, 15*time.Minute), nil)
+	if err := e.reconcilePass(context.Background()); err != nil {
+		t.Fatalf("reconcilePass: %v", err)
+	}
+	if got := getTorrent(t, st, hash); got.State != store.StateError {
+		t.Fatalf("state = %q, want ERROR (reported speed, but no bytes arrived)", got.State)
+	}
+}
+
+func TestReconcileSlowDisabled(t *testing.T) {
+	st := newStore(t)
+	hash := "a6a6a6a6a6a6a6a6a6a6a6a6a6a6a6a6a6a6a6a6"
+	// min_speed = 0 restores the older policy: a torrent is failed for stalling,
+	// never for being slow, however hopeless the rate.
+	tr := seedActive(t, st, hash, 66, "/downloads/tv", time.Hour)
+	setProgress(t, st, tr.ID, 0.2005)
+	const size = int64(10 << 30)
+	setSpeedWindow(t, st, tr.ID, time.Hour, int64(0.20*float64(size)))
+
+	tb := &fakeTB{list: func() ([]torbox.Torrent, error) {
+		return []torbox.Torrent{{
+			ID: 66, DownloadState: "downloading", Active: true,
+			Size: size, Progress: 0.2005, DownloadSpeed: 5800,
+		}}, nil
+	}}
+	e := New(st, tb, slowConfig(0, 15*time.Minute), nil)
+	if err := e.reconcilePass(context.Background()); err != nil {
+		t.Fatalf("reconcilePass: %v", err)
+	}
+	if got := getTorrent(t, st, hash); got.State != store.StateTorBoxActive {
+		t.Fatalf("state = %q, want TORBOX_ACTIVE (slow check disabled)", got.State)
+	}
+}
+
+func TestReconcileCachedWithProgressGetsFetchWindow(t *testing.T) {
+	st := newStore(t)
+	hash := "a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7"
+	// Flagged cached at submit, but it is plainly being fetched: it reached 24%
+	// and then stalled 40m ago. The cached flag is a stale reading, so it must get
+	// the 2h peer-fetch patience rather than being killed on the 30m cached grace
+	// — a wrong label should not blacklist a release that is likely to finish.
+	tr := seedActive(t, st, hash, 67, "/downloads/tv", 40*time.Minute)
+	setProgress(t, st, tr.ID, 0.24)
+	if err := st.SetTorBoxCached(context.Background(), tr.ID, true); err != nil {
+		t.Fatalf("set cached: %v", err)
+	}
+
+	tb := &fakeTB{list: func() ([]torbox.Torrent, error) {
+		return []torbox.Torrent{{
+			ID: 67, DownloadState: "stalled (no seeds)", Active: true, Cached: true,
+			Progress: 0.24, DownloadSpeed: 0,
+		}}, nil
+	}}
+	e := New(st, tb, Config{
+		MaxSlots: 3, StallTimeout: 5 * time.Minute,
+		ProgressStallTimeout: 2 * time.Hour, CachedStallTimeout: 30 * time.Minute,
+	}, nil)
+	if err := e.reconcilePass(context.Background()); err != nil {
+		t.Fatalf("reconcilePass: %v", err)
+	}
+	if got := getTorrent(t, st, hash); got.State != store.StateTorBoxActive {
+		t.Fatalf("state = %q, want TORBOX_ACTIVE (has progress → peer-fetch window)", got.State)
 	}
 }

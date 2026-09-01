@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 
@@ -67,6 +68,14 @@ type DownloadConfig struct {
 	// Total concurrent connections are bounded by parallel_torrents ×
 	// parallel_files.
 	ParallelTorrents int `yaml:"parallel_torrents"`
+	// IdleTimeout aborts a CDN transfer that goes silent — connection still open,
+	// no bytes arriving — for this long. Without it a hung transfer blocks
+	// forever: the HTTP client deliberately has no overall timeout (a legitimate
+	// download can run for hours), so silence is the only thing we can safely
+	// measure. An aborted transfer is retried with a fresh link and resumed from
+	// the bytes already on disk, so this is cheap to trip. A non-positive value
+	// disables the watchdog.
+	IdleTimeout Duration `yaml:"idle_timeout"`
 }
 
 // DatabaseConfig configures the SQLite state store.
@@ -106,6 +115,23 @@ type FailureConfig struct {
 	// transient (seeds drop off and return) and a nudge can pick recovered peers up
 	// sooner than passively waiting. A non-positive value disables nudging.
 	ReannounceInterval Duration `yaml:"reannounce_interval"`
+	// MinSpeed is the average download speed, in bytes per second, a TorBox fetch
+	// must sustain over SlowWindow once it has started moving bytes. A fetch
+	// averaging less than this is abandoned (ERROR → the *arr blocklists the
+	// release and grabs another): at a trickle it would not finish inside any
+	// useful window, and meanwhile it holds one of the account's scarce slots.
+	// The average is measured from real progress (progress × size), not from
+	// TorBox's reported speed, so a torrent that reports movement while
+	// delivering nothing is caught too. 0 disables the check, restoring the
+	// older "never fail for slowness, only for a full stall" behaviour.
+	MinSpeed ByteSize `yaml:"min_speed"`
+	// SlowWindow is the averaging window for MinSpeed. It is deliberately long:
+	// swarms are lumpy, and a torrent is only judged on a sustained average, never
+	// on an instantaneous dip. The check needs a full window of data before it can
+	// fail anything, and the window only starts once the first bytes arrive — a
+	// fetch still at 0% is owned by the stall tiers below. A non-positive value
+	// disables the check; 0 means the default (15m).
+	SlowWindow Duration `yaml:"slow_window"`
 	// ErrorRetention prunes terminal failures: an ERROR torrent whose *arr
 	// notification is settled (reported, or given up on — or *arr push-back is
 	// not configured at all) is deleted outright (row + partial files + TorBox
@@ -137,6 +163,7 @@ func Default() *Config {
 			IncompleteSubdir: ".incomplete",
 			ParallelFiles:    4,
 			ParallelTorrents: 3,
+			IdleTimeout:      Duration(2 * time.Minute),
 		},
 		Database: DatabaseConfig{Path: "data/tordownloader.db"},
 		Failure: FailureConfig{
@@ -145,6 +172,8 @@ func Default() *Config {
 			ProgressStallTimeout: Duration(2 * time.Hour),
 			CachedStallTimeout:   Duration(30 * time.Minute),
 			ReannounceInterval:   Duration(5 * time.Minute),
+			MinSpeed:             50 * KiB,
+			SlowWindow:           Duration(15 * time.Minute),
 			ErrorRetention:       Duration(168 * time.Hour),
 		},
 		Log: LogConfig{Level: "info", Format: "text"},
@@ -302,4 +331,94 @@ func (d *Duration) UnmarshalYAML(value *yaml.Node) error {
 	}
 	*d = Duration(parsed)
 	return nil
+}
+
+// Byte-size units for ByteSize values. Binary (1024-based), matching how disk
+// and transfer sizes are usually quoted in this domain.
+const (
+	KiB ByteSize = 1 << 10
+	MiB ByteSize = 1 << 20
+	GiB ByteSize = 1 << 30
+)
+
+// byteSizeUnits maps the accepted suffixes to their multiplier. "KB" and "KiB"
+// are both 1024: a config file is not the place to litigate SI vs binary, and
+// treating them alike avoids a silently-3%-off threshold.
+var byteSizeUnits = []struct {
+	suffix string
+	mult   ByteSize
+}{
+	{"KIB", KiB}, {"MIB", MiB}, {"GIB", GiB},
+	{"KB", KiB}, {"MB", MiB}, {"GB", GiB},
+	{"K", KiB}, {"M", MiB}, {"G", GiB},
+	{"B", 1},
+}
+
+// ByteSize is a byte count that unmarshals from either a plain YAML integer
+// (bytes) or a human string with a unit suffix, e.g. "50KB", "1.5MiB", "2G".
+type ByteSize int64
+
+// Bytes returns the size as a plain byte count.
+func (b ByteSize) Bytes() int64 { return int64(b) }
+
+// String renders the size in the largest unit that divides it evenly, so a
+// value round-trips readably in logs.
+func (b ByteSize) String() string {
+	switch {
+	case b == 0:
+		return "0B"
+	case b%GiB == 0:
+		return fmt.Sprintf("%dGiB", b/GiB)
+	case b%MiB == 0:
+		return fmt.Sprintf("%dMiB", b/MiB)
+	case b%KiB == 0:
+		return fmt.Sprintf("%dKiB", b/KiB)
+	default:
+		return fmt.Sprintf("%dB", int64(b))
+	}
+}
+
+// UnmarshalYAML parses a byte size from an integer or a suffixed string.
+func (b *ByteSize) UnmarshalYAML(value *yaml.Node) error {
+	var n int64
+	if err := value.Decode(&n); err == nil {
+		*b = ByteSize(n)
+		return nil
+	}
+	var s string
+	if err := value.Decode(&s); err != nil {
+		return fmt.Errorf("size must be a number of bytes or a string like \"50KB\": %w", err)
+	}
+	parsed, err := ParseByteSize(s)
+	if err != nil {
+		return err
+	}
+	*b = parsed
+	return nil
+}
+
+// ParseByteSize parses a byte size such as "50KB", "1.5MiB", "2G" or "1024".
+// The number may be fractional; the result is truncated to whole bytes.
+func ParseByteSize(s string) (ByteSize, error) {
+	trimmed := strings.TrimSpace(s)
+	if trimmed == "" {
+		return 0, errors.New("empty size")
+	}
+	upper := strings.ToUpper(trimmed)
+	mult := ByteSize(1)
+	for _, u := range byteSizeUnits {
+		if strings.HasSuffix(upper, u.suffix) {
+			mult = u.mult
+			upper = strings.TrimSpace(strings.TrimSuffix(upper, u.suffix))
+			break
+		}
+	}
+	n, err := strconv.ParseFloat(upper, 64)
+	if err != nil {
+		return 0, fmt.Errorf("invalid size %q: want a number of bytes or a value like \"50KB\"", s)
+	}
+	if n < 0 {
+		return 0, fmt.Errorf("invalid size %q: must not be negative", s)
+	}
+	return ByteSize(n * float64(mult)), nil
 }

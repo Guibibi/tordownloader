@@ -18,13 +18,17 @@ download:
   incomplete_subdir: ".incomplete" # partial downloads land here, then atomic-move into place
   parallel_files: 4                # concurrent file downloads within one torrent
   parallel_torrents: 3             # torrents pulled to disk at once (one huge grab won't block cached episodes behind it)
+  idle_timeout: 2m                 # abort a CDN transfer that delivers no bytes for this long, then retry it with a fresh link
+                                   # (resumes from disk; the HTTP client has no overall deadline, so silence is what's bounded). <=0 disables
 
 database:
   path: "data/tordownloader.db"    # SQLite state file
 
 failure:
   # A torrent is abandoned with an error (so Sonarr/Radarr blacklists the release
-  # and grabs another) only when it makes no headway — never just for being slow.
+  # and grabs another) on two counts: it makes no headway at all (a stall), or it
+  # makes headway too slowly to ever finish (min_speed below).
+  #
   # How long a stall is tolerated depends on what's at stake: a fetch still at 0%
   # is cheap to abandon, but one with real progress usually finishes once its thin
   # swarm recovers a seed (often a matter of hours), so it gets far more patience.
@@ -32,8 +36,20 @@ failure:
   # are picked up promptly.
   stall_timeout: 20m               # ERROR after this long stalled at 0% (no bytes moving, progress not climbing). <=0 disables
   progress_stall_timeout: 2h       # much longer grace once a fetch has made real progress (>0%); <=0 disables for those
-  cached_stall_timeout: 30m        # grace for cached releases (they only wait for TorBox to surface bytes it already has); <=0 disables for cached
+  cached_stall_timeout: 30m        # grace for a cached release still at 0% (it only waits for TorBox to surface bytes it already has); <=0 disables
   reannounce_interval: 5m          # nudge a stalled fetch with a TorBox reannounce this often; <=0 disables
+
+  # Sustained-speed floor. A trickling torrent is never "stalled" — progress
+  # climbs every tick, resetting the stall clock forever — yet it will not finish
+  # in any window Sonarr cares about while it holds one of three scarce slots. So
+  # a fetch that has started moving bytes is also judged on its *average* over a
+  # full slow_window, measured from real progress rather than TorBox's reported
+  # speed (a torrent that claims movement while delivering nothing is caught too).
+  # Only whole closed windows count, so no momentary dip can fail anything, and a
+  # fetch still at 0% is left to the stall tiers above. Set min_speed: 0 to turn
+  # the check off and fail only on stalls.
+  min_speed: 50KB                  # average bytes/s a moving fetch must sustain (accepts 51200, "50KB", "1.5MiB"); 0 disables
+  slow_window: 15m                 # window the average is taken over; <=0 disables
   timeout: 0                       # optional absolute cap from when it becomes TorBox-active; 0 disables (bounds slow torrents holding a slot)
   error_retention: 168h            # delete settled ERROR torrents (row + partial files) after sitting this long; negative disables
 

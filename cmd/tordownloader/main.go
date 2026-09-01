@@ -118,6 +118,9 @@ func run() error {
 		ProgressStallTimeout: cfg.Failure.ProgressStallTimeout.Std(),
 		CachedStallTimeout:   cfg.Failure.CachedStallTimeout.Std(),
 		ReannounceInterval:   cfg.Failure.ReannounceInterval.Std(),
+		MinSpeed:             cfg.Failure.MinSpeed.Bytes(),
+		SlowWindow:           cfg.Failure.SlowWindow.Std(),
+		IdleTimeout:          cfg.Download.IdleTimeout.Std(),
 		ErrorRetention:       cfg.Failure.ErrorRetention.Std(),
 		ParallelFiles:        cfg.Download.ParallelFiles,
 		ParallelTorrents:     cfg.Download.ParallelTorrents,
@@ -128,8 +131,14 @@ func run() error {
 	go eng.Run(ctx)
 
 	srv := &http.Server{
-		Addr:    cfg.Server.ListenAddr,
-		Handler: qbit.New(st, cfg.Download.Root, cfg.Failure.StallTimeout.Std(), cfg.Failure.ProgressStallTimeout.Std(), cfg.Failure.CachedStallTimeout.Std(), eng.DeleteTorrent, slog.Default()).Routes(),
+		Addr: cfg.Server.ListenAddr,
+		Handler: qbit.New(st, cfg.Download.Root, qbit.FailurePolicy{
+			StallTimeout:         cfg.Failure.StallTimeout.Std(),
+			ProgressStallTimeout: cfg.Failure.ProgressStallTimeout.Std(),
+			CachedStallTimeout:   cfg.Failure.CachedStallTimeout.Std(),
+			MinSpeed:             cfg.Failure.MinSpeed.Bytes(),
+			SlowWindow:           cfg.Failure.SlowWindow.Std(),
+		}, eng.DeleteTorrent, slog.Default()).Routes(),
 		// Bound the header-read phase so a slow/stalled client can't pin a
 		// connection open indefinitely (Slowloris). Handlers themselves are
 		// quick, so no ReadTimeout/WriteTimeout that could truncate a response.
