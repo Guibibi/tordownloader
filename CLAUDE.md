@@ -98,7 +98,8 @@ headless, download-to-disk. Runs as one Docker container on the user's **Unraid*
 
 ## Hard constraints
 - TorBox Essential plan: **3 concurrent slots**, **200GB max per download**, no Usenet,
-  `createtorrent` **60/hour**, general 300/min, `requestdl` links valid ~3h.
+  `createtorrent` **60/hour for uncached** releases (cached: 300/min), general 300/min,
+  `requestdl` links valid ~3h.
 - The reported `hash` must be the exact v1 infohash Sonarr computed, or Sonarr loses the
   download. Whole-series packs may exceed 200GB → expect TorBox reject → report `error`
   (correct behavior; Sonarr falls back to a season pack).
@@ -140,10 +141,30 @@ headless, download-to-disk. Runs as one Docker container on the user's **Unraid*
 - TorBox may **queue** a `createtorrent` (returns a queued id, not a torrent id) when the
   account's active slots are full. We no longer adopt that queue: we gate submissions on real
   slot occupancy so it shouldn't happen, and if it does we `controlqueued`-delete the entry and
-  leave the torrent in our own QUEUED to retry. (With seeding disabled a torrent goes inactive
-  once cached and stops counting toward the cap on its own; reaping is just cleanup.) On 429 the submitter pauses for a cooldown
-  (hourly quota). A torrent absent from `mylist` is failed only after a grace window **and** a
-  direct id lookup confirms it's gone.
+  leave the torrent in our own QUEUED to retry, pausing submissions for 10m (otherwise every 2s
+  pass re-submits and the hourly quota is gone in a minute). (With seeding disabled a torrent goes
+  inactive once cached and stops counting toward the cap on its own; reaping is just cleanup.)
+- `createtorrent` errors are classified (`torbox.APIError.IsTransient`): 429/401/403/5xx and
+  account/service codes (`BAD_TOKEN`, `ACTIVE_LIMIT`, `MONTHLY_LIMIT`, `DOWNLOAD_SERVER_ERROR`, ...)
+  leave the torrent QUEUED and pause submissions — failing them would blocklist good releases in
+  Sonarr (all of them at once during an outage or with an expired key). Only verdicts on the
+  release (`DOWNLOAD_TOO_LARGE`, malformed torrent, ...) fail it. `DUPLICATE_ITEM` adopts the
+  existing TorBox torrent by infohash.
+- A torrent absent from `mylist` is failed only after a grace window **and** a direct id lookup
+  confirms it's gone. TorBox answers a deleted id with **HTTP 404 / `ITEM_NOT_FOUND`** — that
+  confirms; any other lookup error defers. `mylist?id=` may return an object *or* a one-element
+  array; `GetTorrent` accepts both.
+- **Local download failures retry, they don't fail.** Once TorBox has the content, a failed
+  CDN transfer/finalize is almost never the release's fault, so the torrent stays LOCAL_* and is
+  retried with backoff (1m doubling to 30m; failed after 8 attempts — counted in memory, so a
+  restart resets the budget). Full/read-only disk
+  (`ENOSPC`/`EROFS`) retries without spending the budget. The retry reason shows in the `error`
+  column (dashboard) and is cleared on COMPLETE.
+- Every torrent reports `ratio_limit: 0`. Sonarr/Radarr's "Remove Completed" only removes a
+  download that is paused **and** has hit a seed limit; without the field (→ -2, "use global")
+  and with no global limit in `app/preferences`, they never remove anything and `/downloads`
+  fills up. Don't set a global ratio in preferences instead — Sonarr's connection test warns
+  when qBit is configured to remove torrents on ratio.
 - Download into an incomplete dir, then atomic move, so Sonarr never imports partial files.
 - Some TorBox JSON field names in API_REFERENCE.md come from secondary sources — **verify
   against the live API in M1** before depending on them.

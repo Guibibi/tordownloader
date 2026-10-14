@@ -2,6 +2,7 @@ package engine
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"path/filepath"
 	"strings"
@@ -292,25 +293,27 @@ func (e *Engine) checkSlow(ctx context.Context, t store.Torrent, tb torbox.Torre
 	if e.minSpeed <= 0 || e.slowWindow <= 0 {
 		return false
 	}
+	bytes := fetchedBytes(t, tb)
+	if bytes <= 0 {
+		// Nothing fetched yet — either genuinely still at 0%, or the size is
+		// unknown so we cannot convert progress into bytes at all. Either way there
+		// is nothing to average: slide the window to now on *every* pass, so that
+		// when the first byte lands the window starts at most one poll before it.
+		// Sliding only when a window closes would let pre-start waiting count
+		// against the average: a fetch that found peers 12m into its window and
+		// then ran at 4x the floor would still average under it and be failed.
+		e.reanchorSpeed(ctx, t, now, 0)
+		return false
+	}
 	anchorAt := t.SpeedAt
 	if anchorAt == 0 {
 		// Pre-existing row from before this column existed (or a torrent activated
 		// by an older build): open the window now rather than measuring against a
 		// zero timestamp, which would read as decades of no progress.
-		e.reanchorSpeed(ctx, t, now, fetchedBytes(t, tb))
+		e.reanchorSpeed(ctx, t, now, bytes)
 		return false
 	}
 	if now.Sub(time.Unix(anchorAt, 0)) < e.slowWindow {
-		return false
-	}
-
-	bytes := fetchedBytes(t, tb)
-	if bytes <= 0 {
-		// Nothing fetched yet — either genuinely still at 0%, or the size is
-		// unknown so we cannot convert progress into bytes at all. Either way there
-		// is nothing to average: slide the window forward so it measures fetching
-		// once fetching starts.
-		e.reanchorSpeed(ctx, t, now, 0)
 		return false
 	}
 
@@ -546,13 +549,19 @@ func lookupTorBox(t store.Torrent, byID map[int]torbox.Torrent, byHash map[strin
 // confirmPresent does a direct id lookup to check a torrent really is gone before
 // failing it as vanished. A lookup error (transient/rate limit) is treated as
 // "present" so a flaky call never costs us a torrent; only a clean "not found"
-// (no error, empty result) confirms it vanished.
+// confirms it vanished — an empty result, or TorBox's 404 / ITEM_NOT_FOUND
+// answer for a deleted id. (Treating that 404 as a lookup failure would keep a
+// vanished torrent TORBOX_ACTIVE forever, holding one of our slots.)
 func (e *Engine) confirmPresent(ctx context.Context, t store.Torrent) bool {
 	if !t.TorBoxID.Valid {
 		return false
 	}
 	tb, err := e.torbox.GetTorrent(ctx, int(t.TorBoxID.Int64), true)
 	if err != nil {
+		var apiErr *torbox.APIError
+		if errors.As(err, &apiErr) && apiErr.IsNotFound() {
+			return false
+		}
 		e.log.Warn("vanish confirm lookup failed; deferring", "infohash", t.Infohash, "err", err)
 		return true
 	}

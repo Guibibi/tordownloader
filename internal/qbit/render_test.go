@@ -1,6 +1,7 @@
 package qbit
 
 import (
+	"encoding/json"
 	"testing"
 
 	"github.com/guibibi/tordownloader/internal/store"
@@ -86,5 +87,27 @@ func TestRenderTorrentUnknownETA(t *testing.T) {
 	got := renderTorrent(store.Torrent{State: store.StateQueued, Size: 1000})
 	if got.ETA != etaUnknown {
 		t.Errorf("eta = %d, want %d", got.ETA, etaUnknown)
+	}
+}
+
+// TestRenderTorrentRatioLimit asserts every torrent carries an explicit
+// ratio_limit of 0. Sonarr/Radarr only remove a completed download once it has
+// reached a seed limit; a missing field reads as -2 ("use the global limit"),
+// we report none, and so they would never remove anything.
+func TestRenderTorrentRatioLimit(t *testing.T) {
+	b, err := json.Marshal(renderTorrent(store.Torrent{State: store.StateComplete, Size: 10}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var m map[string]any
+	if err := json.Unmarshal(b, &m); err != nil {
+		t.Fatal(err)
+	}
+	v, ok := m["ratio_limit"]
+	if !ok {
+		t.Fatalf("ratio_limit missing from %s", b)
+	}
+	if v != float64(0) {
+		t.Errorf("ratio_limit = %v, want 0", v)
 	}
 }

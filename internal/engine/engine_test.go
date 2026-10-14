@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 
@@ -364,6 +365,100 @@ func TestSubmitQueuedResultIsCancelledAndRequeued(t *testing.T) {
 	}
 	if n, err := st.CountActiveSlots(context.Background()); err != nil || n != 0 {
 		t.Errorf("CountActiveSlots = %d (err %v), want 0 (nothing adopted)", n, err)
+	}
+}
+
+// TestSubmitQueuedResultPausesSubmissions asserts that after TorBox queues a
+// submission (an untracked torrent holds a slot), the submitter pauses instead
+// of re-submitting every 2s pass — which would burn the hourly createtorrent
+// quota in about a minute.
+func TestSubmitQueuedResultPausesSubmissions(t *testing.T) {
+	st := newStore(t)
+	seedQueued(t, st, 2)
+	qid := 556
+	tb := &fakeTB{
+		fn: func(torbox.CreateTorrentRequest) (*torbox.CreateTorrentResult, error) {
+			return &torbox.CreateTorrentResult{QueuedID: &qid}, nil
+		},
+		ctlq: func(int, torbox.Operation) error { return nil },
+	}
+	e := New(st, tb, Config{MaxSlots: 3}, nil)
+	for i := 0; i < 2; i++ {
+		if err := e.submitPass(context.Background()); err != nil {
+			t.Fatalf("submitPass: %v", err)
+		}
+	}
+	if tb.calls != 1 {
+		t.Errorf("createtorrent calls = %d, want 1 (paused after the queued result)", tb.calls)
+	}
+	if got := countState(t, st, store.StateQueued); got != 2 {
+		t.Errorf("queued = %d, want 2", got)
+	}
+}
+
+// TestSubmitNonReleaseErrorsStayQueued asserts that a createtorrent rejected for
+// a reason that says nothing about the release — an outage, a bad or expired API
+// key, an account limit — leaves the torrent QUEUED (failing it would blocklist
+// it in Sonarr/Radarr) and pauses submissions.
+func TestSubmitNonReleaseErrorsStayQueued(t *testing.T) {
+	cases := map[string]*torbox.APIError{
+		"server error":  {StatusCode: 502, Detail: "bad gateway"},
+		"bad token":     {StatusCode: 403, Code: "BAD_TOKEN", Detail: "invalid api key"},
+		"active limit":  {StatusCode: 400, Code: "ACTIVE_LIMIT", Detail: "too many active"},
+		"monthly limit": {StatusCode: 400, Code: "MONTHLY_LIMIT", Detail: "monthly limit"},
+		"no servers":    {StatusCode: 400, Code: "NO_SERVERS_AVAILABLE_ERROR", Detail: "busy"},
+	}
+	for name, apiErr := range cases {
+		t.Run(name, func(t *testing.T) {
+			st := newStore(t)
+			seedQueued(t, st, 2)
+			tb := &fakeTB{fn: func(torbox.CreateTorrentRequest) (*torbox.CreateTorrentResult, error) {
+				return nil, apiErr
+			}}
+			e := New(st, tb, Config{MaxSlots: 3}, nil)
+			for i := 0; i < 2; i++ {
+				if err := e.submitPass(context.Background()); err != nil {
+					t.Fatalf("submitPass: %v", err)
+				}
+			}
+			if got := countState(t, st, store.StateError); got != 0 {
+				t.Errorf("error = %d, want 0 (not the release's fault)", got)
+			}
+			if got := countState(t, st, store.StateQueued); got != 2 {
+				t.Errorf("queued = %d, want 2", got)
+			}
+			if tb.calls != 1 {
+				t.Errorf("createtorrent calls = %d, want 1 (submissions paused)", tb.calls)
+			}
+		})
+	}
+}
+
+// TestSubmitDuplicateAdoptsExisting asserts that a DUPLICATE_ITEM rejection —
+// the torrent is already on the account, e.g. after a lost create response —
+// adopts the existing TorBox torrent instead of failing the release.
+func TestSubmitDuplicateAdoptsExisting(t *testing.T) {
+	st := newStore(t)
+	seedQueued(t, st, 1)
+	hash := fmt.Sprintf("%040x", 1)
+	tb := &fakeTB{
+		fn: func(torbox.CreateTorrentRequest) (*torbox.CreateTorrentResult, error) {
+			return nil, &torbox.APIError{StatusCode: 400, Code: "DUPLICATE_ITEM", Detail: "already exists"}
+		},
+		list: func() ([]torbox.Torrent, error) {
+			return []torbox.Torrent{{ID: 77, Hash: strings.ToUpper(hash)}}, nil
+		},
+	}
+	e := New(st, tb, Config{MaxSlots: 3}, nil)
+	if err := e.submitPass(context.Background()); err != nil {
+		t.Fatalf("submitPass: %v", err)
+	}
+	tr, _, err := st.GetTorrent(context.Background(), hash)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if tr.State != store.StateTorBoxActive || tr.TorBoxID.Int64 != 77 {
+		t.Errorf("state = %q torbox_id = %d, want TORBOX_ACTIVE on the existing id 77", tr.State, tr.TorBoxID.Int64)
 	}
 }
 

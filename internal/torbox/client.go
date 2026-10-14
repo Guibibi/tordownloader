@@ -185,7 +185,11 @@ func (c *Client) MyList(ctx context.Context, bypassCache bool) ([]Torrent, error
 	return out, nil
 }
 
-// GetTorrent returns a single torrent by its TorBox id.
+// GetTorrent returns a single torrent by its TorBox id. The docs say `id` makes
+// mylist return an object, but TorBox occasionally answers with a one-element
+// array instead, so both shapes are accepted; an empty array (or null data)
+// returns (nil, nil). A missing id is answered with HTTP 404 — see
+// APIError.IsNotFound.
 func (c *Client) GetTorrent(ctx context.Context, id int, bypassCache bool) (*Torrent, error) {
 	q := url.Values{}
 	q.Set("id", strconv.Itoa(id))
@@ -195,6 +199,20 @@ func (c *Client) GetTorrent(ctx context.Context, id int, bypassCache bool) (*Tor
 	env, err := c.do(ctx, http.MethodGet, "torrents/mylist", q, nil, "", true)
 	if err != nil {
 		return nil, err
+	}
+	trimmed := bytes.TrimSpace(env.Data)
+	if len(trimmed) == 0 || string(trimmed) == "null" {
+		return nil, nil
+	}
+	if trimmed[0] == '[' {
+		var list []Torrent
+		if err := unmarshalData(env, &list); err != nil {
+			return nil, err
+		}
+		if len(list) == 0 {
+			return nil, nil
+		}
+		return &list[0], nil
 	}
 	var out Torrent
 	if err := unmarshalData(env, &out); err != nil {

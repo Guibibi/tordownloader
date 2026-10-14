@@ -273,3 +273,91 @@ func TestRetryOn429(t *testing.T) {
 		t.Errorf("server calls = %d, want 2 (1 rate-limited + 1 success)", got)
 	}
 }
+
+func TestGetTorrentShapes(t *testing.T) {
+	cases := map[string]struct {
+		body   string
+		wantID int // 0 = want nil
+	}{
+		"object":         {`{"success":true,"error":false,"data":{"id":7,"hash":"aa"}}`, 7},
+		"one-elem array": {`{"success":true,"error":false,"data":[{"id":7,"hash":"aa"}]}`, 7},
+		"empty array":    {`{"success":true,"error":false,"data":[]}`, 0},
+		"null data":      {`{"success":true,"error":false,"data":null}`, 0},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			c := newClient(t, func(w http.ResponseWriter, r *http.Request) {
+				if got := r.URL.Query().Get("id"); got != "7" {
+					t.Errorf("id = %q, want 7", got)
+				}
+				_, _ = w.Write([]byte(tc.body))
+			})
+			got, err := c.GetTorrent(context.Background(), 7, true)
+			if err != nil {
+				t.Fatalf("GetTorrent: %v", err)
+			}
+			switch {
+			case tc.wantID == 0 && got != nil:
+				t.Errorf("got %+v, want nil", got)
+			case tc.wantID != 0 && (got == nil || got.ID != tc.wantID):
+				t.Errorf("got %+v, want id %d", got, tc.wantID)
+			}
+		})
+	}
+}
+
+func TestGetTorrentMissingIsNotFound(t *testing.T) {
+	c := newClient(t, func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNotFound)
+		_, _ = w.Write([]byte(`{"success":false,"error":"ITEM_NOT_FOUND","detail":"not found","data":null}`))
+	})
+	_, err := c.GetTorrent(context.Background(), 7, true)
+	apiErr, ok := err.(*APIError)
+	if !ok {
+		t.Fatalf("err = %v (%T), want *APIError", err, err)
+	}
+	if !apiErr.IsNotFound() {
+		t.Errorf("IsNotFound() = false for %v", apiErr)
+	}
+}
+
+func TestAPIErrorIsTransient(t *testing.T) {
+	cases := []struct {
+		err  APIError
+		want bool
+	}{
+		{APIError{StatusCode: 429}, true},
+		{APIError{StatusCode: 502}, true},
+		{APIError{StatusCode: 401, Code: "NO_AUTH"}, true},
+		{APIError{StatusCode: 403, Code: "BAD_TOKEN"}, true},
+		{APIError{StatusCode: 400, Code: "ACTIVE_LIMIT"}, true},
+		{APIError{StatusCode: 400, Code: "MONTHLY_LIMIT"}, true},
+		{APIError{StatusCode: 400, Code: "DOWNLOAD_SERVER_ERROR"}, true},
+		{APIError{StatusCode: 400, Code: "DOWNLOAD_TOO_LARGE"}, false},
+		{APIError{StatusCode: 400, Code: "BOZO_TORRENT"}, false},
+		{APIError{StatusCode: 400}, false},
+	}
+	for _, tc := range cases {
+		if got := tc.err.IsTransient(); got != tc.want {
+			t.Errorf("IsTransient(%d %q) = %v, want %v", tc.err.StatusCode, tc.err.Code, got, tc.want)
+		}
+	}
+}
+
+func TestAPIErrorIsNotFound(t *testing.T) {
+	cases := []struct {
+		err  APIError
+		want bool
+	}{
+		{APIError{StatusCode: 404}, true},
+		{APIError{StatusCode: 404, Code: "ITEM_NOT_FOUND"}, true},
+		{APIError{StatusCode: 400, Code: "ITEM_NOT_FOUND"}, true},
+		{APIError{StatusCode: 404, Code: "ENDPOINT_NOT_FOUND"}, false},
+		{APIError{StatusCode: 500}, false},
+	}
+	for _, tc := range cases {
+		if got := tc.err.IsNotFound(); got != tc.want {
+			t.Errorf("IsNotFound(%d %q) = %v, want %v", tc.err.StatusCode, tc.err.Code, got, tc.want)
+		}
+	}
+}

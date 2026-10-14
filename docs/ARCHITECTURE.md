@@ -207,7 +207,7 @@ categories(
 - Bearer token (API key) for `createtorrent`, `mylist`, `checkcached`, `controltorrent`.
 - `requestdl` takes the token as a **query parameter** and returns a time-limited CDN URL
   (valid ~3h). We download that URL directly (not via the bearer-auth client).
-- Respect rate limits: `createtorrent` 60/hour; others 300/min. Centralise backoff in the client.
+- Respect rate limits: `createtorrent` 60/hour (uncached; cached 300/min); others 300/min. Centralise backoff in the client.
 - Evaluate the official `torbox-sdk-go` vs a hand-rolled client during M1; lean hand-rolled for
   control over `requestdl` and rate-limit handling, use the SDK if it's ergonomic.
 
@@ -233,9 +233,12 @@ categories(
 | Exceeds optional absolute `timeout` cap (disabled by default) | → ERROR. |
 | TorBox rejects >200GB | → ERROR immediately. |
 | `createtorrent` rate-limited (429) | Pause submissions for a cooldown (hourly quota), stay QUEUED. |
-| TorBox queues the submission (queued id) | Shouldn't happen — we gate on real occupancy. If it does (e.g. an orphan torrent added outside the app holds a slot), cancel the queued entry via `controlqueued` and leave the torrent in our own QUEUED to retry. We never adopt TorBox's queue. |
+| `createtorrent` fails for a non-release reason (5xx, auth, `ACTIVE_LIMIT`/`MONTHLY_LIMIT`/..., see `APIError.IsTransient`) | Stay QUEUED, pause submissions for a cooldown. Never ERROR — that would blocklist a good release. |
+| `createtorrent` says `DUPLICATE_ITEM` | Adopt the existing TorBox torrent (matched by infohash in `mylist`) as TORBOX_ACTIVE. |
+| Local download or finalize fails (CDN outage, `requestdl` throttling, disk full) | Stay LOCAL_*, retry with backoff (1m doubling to 30m), resuming from disk; ERROR only after 8 failed attempts. Full/read-only disk never spends the budget. |
+| TorBox queues the submission (queued id) | Shouldn't happen — we gate on real occupancy. If it does (e.g. an orphan torrent added outside the app holds a slot), cancel the queued entry via `controlqueued` and leave the torrent in our own QUEUED to retry after a 10m submission pause (so retries don't burn the hourly quota). We never adopt TorBox's queue. |
 | Completed/failed torrent still on TorBox (missed delete: old build, crash, transient error) | Reaper deletes it on the next reconcile pass (hygiene). With seeding disabled a cached torrent is already inactive and holds no slot, so a missed delete clutters `mylist` but does **not** starve the queue. |
 | `requestdl` link expired mid-download | Re-request and resume. |
 | Container restart | Reconcile from SQLite + `mylist`; resume partial files via Range. |
-| Torrent vanished on TorBox | → ERROR, but only after a grace window and a direct id lookup confirms it's really gone (so a lagging/paged mylist doesn't kill a live torrent). |
+| Torrent vanished on TorBox | → ERROR, but only after a grace window and a direct id lookup confirms it's really gone — an empty result or TorBox's 404/`ITEM_NOT_FOUND` (so a lagging/paged mylist doesn't kill a live torrent; other lookup errors defer). |
 | Sonarr deletes mid-download | Cancel, TorBox delete, remove local files. |

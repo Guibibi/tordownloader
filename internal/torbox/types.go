@@ -3,6 +3,7 @@ package torbox
 import (
 	"encoding/json"
 	"fmt"
+	"net/http"
 )
 
 // Envelope is the standard TorBox JSON response wrapper:
@@ -46,6 +47,58 @@ func (e *APIError) Error() string {
 // plan's per-download size cap (200GB on Essential). The exact error code is
 // provisional pending live verification (see docs/API_REFERENCE.md).
 func (e *APIError) IsTooLarge() bool { return e.Code == "DOWNLOAD_TOO_LARGE" }
+
+// IsNotFound reports whether TorBox answered that the requested item does not
+// exist: mylist?id= for a deleted torrent returns HTTP 404 (ITEM_NOT_FOUND). A
+// 404 for the endpoint itself (ENDPOINT_NOT_FOUND, e.g. after an API path
+// change) says nothing about the item and does not count.
+func (e *APIError) IsNotFound() bool {
+	if e.Code == "ENDPOINT_NOT_FOUND" {
+		return false
+	}
+	return e.StatusCode == http.StatusNotFound || e.Code == "ITEM_NOT_FOUND"
+}
+
+// IsDuplicate reports whether TorBox refused a create because the item is
+// already on the account.
+func (e *APIError) IsDuplicate() bool { return e.Code == "DUPLICATE_ITEM" }
+
+// transientCodes are TorBox error codes that describe the account or the
+// service, not the release: auth problems, plan/rate limits, and server-side
+// failures. Retrying later can succeed, so a submission rejected with one of
+// these must not be failed (failing pushes a blocklist to Sonarr/Radarr).
+var transientCodes = map[string]bool{
+	"NO_AUTH":                    true,
+	"BAD_TOKEN":                  true,
+	"AUTH_ERROR":                 true,
+	"ACTIVE_LIMIT":               true,
+	"COOLDOWN_LIMIT":             true,
+	"MONTHLY_LIMIT":              true,
+	"RATE_LIMIT":                 true,
+	"NO_SERVERS_AVAILABLE_ERROR": true,
+	"DOWNLOAD_SERVER_ERROR":      true,
+	"DATABASE_ERROR":             true,
+	"UNKNOWN_ERROR":              true,
+	"ENDPOINT_NOT_FOUND":         true,
+	"VENDOR_DISABLED":            true,
+	"DEPRECATED":                 true,
+}
+
+// IsTransient reports whether the error is about TorBox or the account rather
+// than the request itself — a rate limit (429), an auth failure (401/403), a
+// server error (5xx), or one of transientCodes — so the same request may succeed
+// later. Anything else (e.g. DOWNLOAD_TOO_LARGE, a malformed torrent) is a
+// verdict on the release.
+func (e *APIError) IsTransient() bool {
+	switch {
+	case e.StatusCode == http.StatusTooManyRequests,
+		e.StatusCode == http.StatusUnauthorized,
+		e.StatusCode == http.StatusForbidden,
+		e.StatusCode >= 500:
+		return true
+	}
+	return transientCodes[e.Code]
+}
 
 // Operation is a torrent control operation for /torrents/controltorrent.
 type Operation string

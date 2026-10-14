@@ -76,6 +76,7 @@ Fields Sonarr/Radarr actually read — populate all of these:
 | `completion_on` | unix ts when COMPLETE (else 0) |
 | `added_on` | unix ts when added |
 | `ratio`, `seeding_time` | 0 (no seeding on our side) |
+| `ratio_limit` | always `0` — lets Sonarr/Radarr's "Remove Completed" remove a finished download (it requires a reached seed limit; absent = -2 "use global", and we report no global limit) |
 
 ## 3. State mapping (TorBox + local → qBittorrent `state`)
 
@@ -89,7 +90,7 @@ done/seeding → importable. So COMPLETE must report an "UP" state (`pausedUP`).
 | TORBOX_ACTIVE | TorBox fetching, no seeds | `stalledDL` | downloading |
 | LOCAL_QUEUED / LOCAL_DOWNLOAD | pulling files to disk | `downloading` | downloading |
 | COMPLETE | all files on disk | `pausedUP` | **done → import** |
-| ERROR | stall (no progress) / too slow to finish / TorBox fail / >200GB / dl fail | `error` | warning only — see below |
+| ERROR | stall (no progress) / too slow to finish / TorBox rejects the release (>200GB, malformed) / vanished / local download failing after its retry budget | `error` | warning only — see below |
 
 > **Sonarr never fails a qBittorrent download.** Every qBittorrent state maps to
 > at most a *Warning* in Sonarr — its `error` case is literally commented
@@ -141,7 +142,7 @@ done/seeding → importable. So COMPLETE must report an "UP" state (`pausedUP`).
 ## 4. TorBox API — endpoints we consume
 
 Base `https://api.torbox.app`, version `v1`. Bearer token (API key) unless noted.
-Rate limits: most 300/min; **`createtorrent` 60/hour**.
+Rate limits: most 300/min; **`createtorrent` 60/hour for uncached** releases (cached: 300/min).
 
 | Endpoint | Method | Use |
 |---|---|---|

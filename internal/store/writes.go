@@ -363,8 +363,9 @@ func (s *Store) MarkFileDone(ctx context.Context, fileID int64, size int64) erro
 }
 
 // MarkComplete moves a torrent to COMPLETE once every file is on disk: it pins
-// local_progress to 1, clears the speed, records the final content_path (and
-// size, when known) and the completion time. COMPLETE renders as pausedUP so
+// local_progress to 1, clears the speed and any retry note left by
+// NoteLocalRetry, records the final content_path (and size, when known) and the
+// completion time. COMPLETE renders as pausedUP so
 // Sonarr imports (docs/API_REFERENCE.md §3).
 func (s *Store) MarkComplete(ctx context.Context, id int64, contentPath string, size int64) error {
 	now := time.Now().Unix()
@@ -376,11 +377,27 @@ func (s *Store) MarkComplete(ctx context.Context, id int64, contentPath string, 
 			content_path   = ?,
 			size           = CASE WHEN ? > 0 THEN ? ELSE size END,
 			completed_on   = ?,
+			error          = '',
 			updated_at     = ?
 		WHERE id = ?`,
 		StateComplete, contentPath, size, size, now, now, id)
 	if err != nil {
 		return fmt.Errorf("mark complete %d: %w", id, err)
+	}
+	return nil
+}
+
+// NoteLocalRetry records why a local download attempt failed while the torrent
+// waits to be retried, so the dashboard can show it. The torrent keeps its
+// LOCAL_* state; only those rows are touched, so a late note can't land on a
+// torrent that has since completed, failed, or been deleted.
+func (s *Store) NoteLocalRetry(ctx context.Context, id int64, note string) error {
+	_, err := s.db.ExecContext(ctx, `
+		UPDATE torrents SET error = ?, dlspeed = 0, updated_at = ?
+		WHERE id = ? AND state IN (?, ?)`,
+		note, time.Now().Unix(), id, StateLocalQueued, StateLocalDload)
+	if err != nil {
+		return fmt.Errorf("note local retry %d: %w", id, err)
 	}
 	return nil
 }

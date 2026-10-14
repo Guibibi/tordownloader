@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -534,5 +535,18 @@ func TestDownloadIdleTimeoutHonoursParentCancel(t *testing.T) {
 		Options{IdleTimeout: time.Minute})
 	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("Download err = %v, want context.Canceled", err)
+	}
+}
+
+// TestClassifyKeepsCause asserts a transient transfer error still wraps its
+// cause, so the engine can recognise e.g. a full disk behind an io.Copy failure.
+func TestClassifyKeepsCause(t *testing.T) {
+	_, w := newIdleWatchdog(context.Background(), 0)
+	err := w.classify(context.Background(), &os.PathError{Op: "write", Path: "x", Err: syscall.ENOSPC})
+	if !errors.Is(err, errTransient) {
+		t.Errorf("err = %v, want it to be transient", err)
+	}
+	if !errors.Is(err, syscall.ENOSPC) {
+		t.Errorf("err = %v, want it to still wrap ENOSPC", err)
 	}
 }

@@ -3,11 +3,15 @@ package engine
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
+	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 
@@ -77,7 +81,6 @@ func TestDownloadPassCompletes(t *testing.T) {
 	}
 	e.dlWG.Wait() // downloads run in goroutines; wait before asserting
 
-
 	tr, _, _ := st.GetTorrent(context.Background(), hash)
 	if tr.State != store.StateComplete {
 		t.Fatalf("state = %q, want COMPLETE", tr.State)
@@ -135,7 +138,6 @@ func TestDownloadPassDeletesFromTorBoxOnComplete(t *testing.T) {
 	}
 	e.dlWG.Wait() // downloads run in goroutines; wait before asserting
 
-
 	tr, _, _ := st.GetTorrent(context.Background(), hash)
 	if tr.State != store.StateComplete {
 		t.Fatalf("state = %q, want COMPLETE", tr.State)
@@ -147,26 +149,145 @@ func TestDownloadPassDeletesFromTorBoxOnComplete(t *testing.T) {
 	assertBytes(t, filepath.Join(save, "show", "e01.mkv"), body)
 }
 
-func TestDownloadPassFailsOnLinkError(t *testing.T) {
+// shrinkLocalRetries swaps the local retry schedule for the test's duration.
+func shrinkLocalRetries(t *testing.T, base time.Duration, attempts int) {
+	t.Helper()
+	oldBase, oldMax, oldAttempts := localRetryBase, localRetryMax, maxLocalAttempts
+	localRetryBase, localRetryMax, maxLocalAttempts = base, base, attempts
+	t.Cleanup(func() { localRetryBase, localRetryMax, maxLocalAttempts = oldBase, oldMax, oldAttempts })
+}
+
+// TestDownloadPassRetriesLocalFailureBeforeFailing asserts that a failed local
+// download is not failed outright — TorBox already has the content, so a CDN or
+// disk problem must not make the *arr push-back blocklist a good release. It
+// stays LOCAL_DOWNLOAD with a retry note, is not restarted before its backoff
+// elapses, and is failed only once the attempt budget is spent.
+func TestDownloadPassRetriesLocalFailureBeforeFailing(t *testing.T) {
+	shrinkLocalRetries(t, time.Hour, 2)
+	var hits atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits.Add(1) // a non-retryable status fails the attempt immediately
+		w.WriteHeader(http.StatusTeapot)
+	}))
+	defer srv.Close()
+
 	st := newStore(t)
 	save := filepath.Join(t.TempDir(), "tv")
 	hash := "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
 	seedLocalQueued(t, st, hash, save, []store.FileInput{
 		{TorBoxFileID: 0, RelPath: "show/e01.mkv", Size: 100},
 	})
-
-	tb := &fakeTB{dl: func(torbox.RequestDLParams) (string, error) {
-		return "", &torbox.APIError{StatusCode: 500, Detail: "boom"}
-	}}
+	tb := &fakeTB{dl: func(torbox.RequestDLParams) (string, error) { return srv.URL, nil }}
 	e := New(st, tb, Config{ParallelFiles: 1, IncompleteSubdir: ".incomplete"}, nil)
 
-	if err := e.downloadPass(context.Background()); err != nil {
-		t.Fatalf("downloadPass: %v", err)
+	pass := func() {
+		t.Helper()
+		if err := e.downloadPass(context.Background()); err != nil {
+			t.Fatalf("downloadPass: %v", err)
+		}
+		e.dlWG.Wait()
 	}
-	e.dlWG.Wait() // downloads run in goroutines; wait before asserting
 
-	if tr, _, _ := st.GetTorrent(context.Background(), hash); tr.State != store.StateError {
-		t.Errorf("state = %q, want ERROR", tr.State)
+	pass()
+	tr, _, _ := st.GetTorrent(context.Background(), hash)
+	if tr.State != store.StateLocalDload {
+		t.Fatalf("state after first failure = %q, want LOCAL_DOWNLOAD (retry, not ERROR)", tr.State)
+	}
+	if !strings.Contains(tr.Error, "retrying in") {
+		t.Errorf("error note = %q, want a retry note for the dashboard", tr.Error)
+	}
+
+	pass() // still inside the 1h backoff: must not restart
+	if hits.Load() != 1 {
+		t.Fatalf("CDN hits = %d, want 1 (no attempt before the backoff elapses)", hits.Load())
+	}
+
+	e.mu.Lock()
+	r := e.localRetries[hash]
+	r.next = time.Now().Add(-time.Second) // backoff elapsed
+	e.localRetries[hash] = r
+	e.mu.Unlock()
+
+	pass() // second failed attempt exhausts the budget of 2
+	tr, _, _ = st.GetTorrent(context.Background(), hash)
+	if tr.State != store.StateError {
+		t.Fatalf("state after budget spent = %q, want ERROR", tr.State)
+	}
+	if !strings.Contains(tr.Error, "after 2 attempts") {
+		t.Errorf("error = %q, want it to say how many attempts failed", tr.Error)
+	}
+}
+
+// TestDownloadPassRetrySucceeds asserts that a download which fails once and
+// then works completes normally, with the retry note cleared.
+func TestDownloadPassRetrySucceeds(t *testing.T) {
+	shrinkLocalRetries(t, time.Nanosecond, 3)
+	body := bytes.Repeat([]byte("r"), 300)
+	var hits atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if hits.Add(1) == 1 {
+			w.WriteHeader(http.StatusTeapot)
+			return
+		}
+		http.ServeContent(w, r, "f", time.Time{}, bytes.NewReader(body))
+	}))
+	defer srv.Close()
+
+	st := newStore(t)
+	save := filepath.Join(t.TempDir(), "tv")
+	hash := "dddddddddddddddddddddddddddddddddddddddd"
+	seedLocalQueued(t, st, hash, save, []store.FileInput{
+		{TorBoxFileID: 0, RelPath: "show/e01.mkv", Size: int64(len(body))},
+	})
+	tb := &fakeTB{dl: func(torbox.RequestDLParams) (string, error) { return srv.URL, nil }}
+	e := New(st, tb, Config{ParallelFiles: 1, IncompleteSubdir: ".incomplete"}, nil)
+
+	for i := 0; i < 2; i++ {
+		if err := e.downloadPass(context.Background()); err != nil {
+			t.Fatalf("downloadPass: %v", err)
+		}
+		e.dlWG.Wait()
+	}
+	tr, _, _ := st.GetTorrent(context.Background(), hash)
+	if tr.State != store.StateComplete {
+		t.Fatalf("state = %q, want COMPLETE after a successful retry", tr.State)
+	}
+	if tr.Error != "" {
+		t.Errorf("error = %q, want the retry note cleared on completion", tr.Error)
+	}
+	e.mu.Lock()
+	_, left := e.localRetries[hash]
+	e.mu.Unlock()
+	if left {
+		t.Error("retry bookkeeping not cleared after success")
+	}
+}
+
+// TestLocalFailedDiskErrorDoesNotSpendBudget asserts that a full disk — never
+// the release's fault — is retried without counting toward the attempt budget,
+// so it can never end in a blocklist.
+func TestLocalFailedDiskErrorDoesNotSpendBudget(t *testing.T) {
+	shrinkLocalRetries(t, time.Hour, 1)
+	st := newStore(t)
+	hash := "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+	tr := seedLocalQueued(t, st, hash, filepath.Join(t.TempDir(), "tv"), []store.FileInput{
+		{TorBoxFileID: 0, RelPath: "show/e01.mkv", Size: 100},
+	})
+	e := New(st, &fakeTB{}, Config{}, nil)
+
+	cause := fmt.Errorf("e01.mkv: %w", &os.PathError{Op: "write", Path: "x", Err: syscall.ENOSPC})
+	for i := 0; i < 3; i++ {
+		e.localFailed(context.Background(), tr, "download: disk full", cause)
+	}
+	got, _, _ := st.GetTorrent(context.Background(), hash)
+	if got.State == store.StateError {
+		t.Fatalf("state = ERROR; a full disk must never exhaust the retry budget")
+	}
+	e.mu.Lock()
+	r := e.localRetries[hash]
+	e.mu.Unlock()
+	if r.attempts != 0 || r.next.IsZero() {
+		t.Errorf("retry state = %+v, want 0 counted attempts and a scheduled retry", r)
 	}
 }
 

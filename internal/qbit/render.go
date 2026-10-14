@@ -31,6 +31,13 @@ type torrentInfo struct {
 	CompletionOn int64   `json:"completion_on"`
 	AddedOn      int64   `json:"added_on"`
 	Ratio        float64 `json:"ratio"`
+	// RatioLimit is the per-torrent share-ratio limit. Sonarr/Radarr only remove a
+	// finished download (their "Remove Completed" setting) once it is paused *and*
+	// has reached a seed limit; an absent field reads as -2 ("use the global
+	// limit"), and app/preferences reports no global limit, so without this they
+	// never remove anything and imported content piles up in /downloads. We never
+	// seed, so a limit of 0 is met the moment a torrent completes.
+	RatioLimit   float64 `json:"ratio_limit"`
 	SeedingTime  int64   `json:"seeding_time"`
 	NumSeeds     int     `json:"num_seeds"`
 	NumLeechs    int     `json:"num_leechs"`
