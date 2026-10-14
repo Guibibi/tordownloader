@@ -8,6 +8,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/guibibi/tordownloader/internal/metrics"
 	"github.com/guibibi/tordownloader/internal/store"
 	"github.com/guibibi/tordownloader/internal/torbox"
 )
@@ -130,7 +131,7 @@ func (e *Engine) reconcileOne(ctx context.Context, t store.Torrent, byID map[int
 		if e.confirmPresent(ctx, t) {
 			return
 		}
-		e.fail(ctx, t, "torrent vanished from TorBox")
+		e.fail(ctx, t, failVanished, "torrent vanished from TorBox")
 		return
 	}
 
@@ -210,7 +211,7 @@ func (e *Engine) reconcileOne(ctx context.Context, t store.Torrent, byID map[int
 		stalledFor := now.Sub(time.Unix(stalledSince, 0))
 		hasProgress := t.TorBoxProgress > 0 || tb.Progress > 0
 		if stallAfter := e.stallTimeoutFor(t, hasProgress); stallAfter > 0 && stalledFor > stallAfter {
-			e.fail(ctx, t, fmt.Sprintf("no download progress for %s (progress=%.0f%%, download_state=%q, seeds=%d, peers=%d, cached=%v)",
+			e.fail(ctx, t, failStall, fmt.Sprintf("no download progress for %s (progress=%.0f%%, download_state=%q, seeds=%d, peers=%d, cached=%v)",
 				stallAfter, clamp01(tb.Progress)*100, tb.DownloadState, tb.Seeds, tb.Peers, t.Cached))
 			return
 		}
@@ -229,7 +230,7 @@ func (e *Engine) reconcileOne(ctx context.Context, t store.Torrent, byID map[int
 	// (failure.timeout = 0); set it to bound how long a perpetually-slow torrent
 	// may hold a scarce TorBox slot.
 	if e.failAfter > 0 && now.Sub(time.Unix(t.ActiveSince, 0)) > e.failAfter {
-		e.fail(ctx, t, fmt.Sprintf("not available within %s of becoming active", e.failAfter))
+		e.fail(ctx, t, failTimeout, fmt.Sprintf("not available within %s of becoming active", e.failAfter))
 	}
 }
 
@@ -326,7 +327,7 @@ func (e *Engine) checkSlow(ctx context.Context, t store.Torrent, tb torbox.Torre
 	}
 	avg := int64(float64(gained) / elapsed.Seconds())
 	if avg < e.minSpeed {
-		e.fail(ctx, t, fmt.Sprintf(
+		e.fail(ctx, t, failSlow, fmt.Sprintf(
 			"averaged %s/s over %s, below the %s/s floor (progress=%.0f%%, download_state=%q, seeds=%d, peers=%d)",
 			humanBytes(avg), elapsed.Round(time.Second), humanBytes(e.minSpeed),
 			clamp01(tb.Progress)*100, tb.DownloadState, tb.Seeds, tb.Peers))
@@ -444,6 +445,7 @@ func (e *Engine) arrPass(ctx context.Context) {
 		case handled:
 			// Blocklisted + replacement search triggered; the *arr's follow-up
 			// delete will clear the row.
+			metrics.ArrNotifications.Inc("blocklisted")
 			if err := e.store.MarkArrNotified(ctx, t.ID); err != nil {
 				e.log.Error("mark arr notified", "infohash", t.Infohash, "err", err)
 			}
@@ -451,9 +453,11 @@ func (e *Engine) arrPass(ctx context.Context) {
 		case nerr != nil:
 			// Some instance couldn't be checked; NotifyFailed already logged the
 			// detail. Retry next interval.
+			metrics.ArrNotifications.Inc("error")
 		case now.Sub(at.first) >= arrNotFoundGrace:
 			// Every instance answered and none tracks this hash — not an *arr grab
 			// (or its queue item is already gone). Stop asking.
+			metrics.ArrNotifications.Inc("not_tracked")
 			e.log.Info("failed torrent not tracked by any *arr; leaving as ERROR",
 				"infohash", t.Infohash, "name", t.Name)
 			if err := e.store.MarkArrNotified(ctx, t.ID); err != nil {
@@ -587,7 +591,7 @@ func (e *Engine) toLocalQueued(ctx context.Context, t store.Torrent, tb torbox.T
 		rels = append(rels, rel)
 	}
 	if bad, ok := unsafeRelPath(rels); ok {
-		e.fail(ctx, t, fmt.Sprintf("unsafe file path in torrent: %q", bad))
+		e.fail(ctx, t, failInvalid, fmt.Sprintf("unsafe file path in torrent: %q", bad))
 		return
 	}
 	size := t.Size

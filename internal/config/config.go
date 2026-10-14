@@ -76,6 +76,14 @@ type DownloadConfig struct {
 	// the bytes already on disk, so this is cheap to trip. A non-positive value
 	// disables the watchdog.
 	IdleTimeout Duration `yaml:"idle_timeout"`
+	// MinFreeSpace is how much space must stay free on the download filesystem.
+	// A torrent only starts (or resumes) downloading when the free space covers
+	// what it still has to write, plus what downloads already running still have
+	// to write, plus this reserve; otherwise it waits — without failing — until
+	// space frees up. Keeps a big pack from filling the share Sonarr/Radarr
+	// import into. 0 still checks that the download fits; a negative value
+	// (e.g. -1) disables the check.
+	MinFreeSpace ByteSize `yaml:"min_free_space"`
 }
 
 // DatabaseConfig configures the SQLite state store.
@@ -164,6 +172,7 @@ func Default() *Config {
 			ParallelFiles:    4,
 			ParallelTorrents: 3,
 			IdleTimeout:      Duration(2 * time.Minute),
+			MinFreeSpace:     10 * GiB,
 		},
 		Database: DatabaseConfig{Path: "data/tordownloader.db"},
 		Failure: FailureConfig{
@@ -260,8 +269,8 @@ func (c *Config) applyArrEnv(name, urlEnv, keyEnv string) {
 }
 
 // Validate checks invariants the rest of the app relies on. Note: the TorBox
-// API key is *not* required here — it's only needed once the TorBox client runs
-// (M1+), so M0 can start without it (main warns instead).
+// API key is *not* required here, so the service (dashboard, healthz, --check)
+// can start without it; main warns instead and TorBox calls fail until it's set.
 func (c *Config) Validate() error {
 	if c.Server.ListenAddr == "" {
 		return errors.New("server.listen_addr is required")

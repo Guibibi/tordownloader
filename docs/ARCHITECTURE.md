@@ -27,13 +27,16 @@ internal/config/               Load YAML + env; validation; defaults.
 internal/qbit/                 HTTP handlers emulating the qBittorrent WebUI API v2.
                                Translates qBit requests ↔ engine/store; renders qBit JSON.
 internal/torbox/               Thin TorBox API client (createtorrent, mylist, checkcached,
-                               requestdl, controltorrent). Handles auth, rate-limit backoff.
+                               requestdl, controltorrent, controlqueued, user/me). Handles
+                               auth, rate-limit backoff; startup account check.
 internal/torrentmeta/          Infohash extraction from magnet + .torrent (bencode/SHA1).
 internal/store/                SQLite persistence (torrents, files, categories). Pure-Go driver.
 internal/engine/               Orchestration: submission queue (slot gating), reconciler
                                (polls TorBox), state machine, fail-fast timer, cleanup.
 internal/downloader/           Per-file HTTP downloads with resume (Range), atomic move,
-                               bounded concurrency.
+                               bounded concurrency; free-space measurement.
+internal/arr/                  Sonarr/Radarr API client for failure push-back.
+internal/metrics/              Process-wide counters + Prometheus text rendering.
 docs/                          This documentation.
 ```
 
@@ -117,11 +120,9 @@ from it (see API_REFERENCE.md §3 for the exact mapping).
   account has a free concurrent slot. A torrent occupies a slot only while **`active`**
   (caching/downloading, or seeding); with seeding disabled a **cached** torrent is
   inactive and frees its slot, so library size is unbounded — only concurrent caching is
-  capped (3 on Essential). ⚠️ The implementation currently gates on `CountOnTorBox`
-  (every row still holding a `torbox_id`/`torbox_queued_id`), which **over-counts** cached
-  `LOCAL_*`/un-reaped COMPLETE rows that hold no real slot. Safe but conservative (it can
-  only under-submit), and slated to be relaxed to count active/caching torrents only.
-  Gating below the cap also keeps `createtorrent` out of TorBox's own queue; our QUEUED
+  capped (3 on Essential). The gate counts exactly that: `CountActiveSlots` counts only
+  TORBOX_ACTIVE rows, so cached `LOCAL_*`, COMPLETE and ERROR rows never hold a slot even
+  while they still carry a `torbox_id`. Gating below the cap also keeps `createtorrent` out of TorBox's own queue; our QUEUED
   state is the single queue. On rate-limit, back off and retry (don't fail). On TorBox
   rejection (e.g. `DOWNLOAD_TOO_LARGE`), → ERROR.
 - **Reconciler**: every `poll_interval` (default ~10s), reads TorBox `mylist` once and (a)
@@ -134,7 +135,8 @@ from it (see API_REFERENCE.md §3 for the exact mapping).
   `cached_stall_timeout` for cached-and-still-at-0%), average below `min_speed` over a full
   `slow_window`, or exceed the optional absolute `timeout` cap; stalled fetches get a
   `reannounce` nudge every `reannounce_interval` while they wait.
-- **Downloader**: pulls LOCAL_QUEUED torrents, enumerates files, requests `requestdl` per file,
+- **Downloader**: pulls LOCAL_QUEUED torrents (up to `parallel_torrents` at once, each only once
+  the free-space gate says it fits), enumerates files, requests `requestdl` per file,
   downloads with bounded concurrency into an incomplete dir, atomically moves into the save
   path, then → COMPLETE. Re-requests expired links; resumes partial files via Range on restart.
 - **Cleanup**: on `torrents/delete`, cancels in-flight downloads, calls `controltorrent` delete
@@ -211,20 +213,23 @@ categories(
 - `requestdl` takes the token as a **query parameter** and returns a time-limited CDN URL
   (valid ~3h). We download that URL directly (not via the bearer-auth client).
 - Respect rate limits: `createtorrent` 60/hour (uncached; cached 300/min); others 300/min. Centralise backoff in the client.
-- Evaluate the official `torbox-sdk-go` vs a hand-rolled client during M1; lean hand-rolled for
-  control over `requestdl` and rate-limit handling, use the SDK if it's ergonomic.
+- Hand-rolled rather than the official SDK, for control over `requestdl`, rate-limit pacing
+  (`max_requests_per_min`) and `Retry-After` handling.
+- On startup, `GET user/me` checks the key, plan and subscription and logs any problem
+  (never blocks startup).
 
-## 8. Tech choices (proposed)
+## 8. Tech choices
 
 | Concern | Choice | Why |
 |---|---|---|
 | Language | Go 1.26 | User's stack; TorBox has a Go SDK. |
-| HTTP router | stdlib `net/http` + `http.ServeMux` (or `chi`) | Small surface; few routes. |
+| HTTP router | stdlib `net/http` + `http.ServeMux` | Small surface; few routes. |
 | SQLite | `modernc.org/sqlite` (pure Go) | No cgo → trivial static Docker builds for Unraid. |
 | Bencode/infohash | `github.com/anacrolix/torrent/metainfo` | Battle-tested infohash computation. |
 | Config | env + small YAML loader (`gopkg.in/yaml.v3`) | Headless, simple. |
 | Logging | stdlib `log/slog` | Structured, no deps. |
-| Container | multi-stage → distroless/alpine; PUID/PGID entrypoint | Unraid file-ownership convention. |
+| Metrics | hand-rolled Prometheus text format (`internal/metrics`) | A handful of series; no client library needed. |
+| Container | multi-stage → alpine; PUID/PGID entrypoint (`su-exec`) | Unraid file-ownership convention. |
 
 ## 9. Failure handling summary
 
@@ -238,6 +243,7 @@ categories(
 | `createtorrent` rate-limited (429) | Pause submissions for a cooldown (hourly quota), stay QUEUED. |
 | `createtorrent` fails for a non-release reason (5xx, auth, `ACTIVE_LIMIT`/`MONTHLY_LIMIT`/..., see `APIError.IsTransient`) | Stay QUEUED, pause submissions for a cooldown. Never ERROR — that would blocklist a good release. |
 | `createtorrent` says `DUPLICATE_ITEM` | Adopt the existing TorBox torrent (matched by infohash in `mylist`) as TORBOX_ACTIVE. |
+| Not enough free disk space to start/resume a local download | Wait in LOCAL_* (not failed, no retry budget spent) with a "waiting for disk space" note, re-checked every pass. Needs free ≥ bytes left + bytes running downloads still need + `download.min_free_space` (default 10GB; `-1` disables). |
 | Local download or finalize fails (CDN outage, `requestdl` throttling, disk full) | Stay LOCAL_*, retry with backoff (1m doubling to 30m), resuming from disk; ERROR only after 8 failed attempts. Full/read-only disk never spends the budget. |
 | TorBox queues the submission (queued id) | Shouldn't happen — we gate on real occupancy. If it does (e.g. an orphan torrent added outside the app holds a slot), cancel the queued entry via `controlqueued` and leave the torrent in our own QUEUED to retry after a 10m submission pause (so retries don't burn the hourly quota). We never adopt TorBox's queue. |
 | Completed/failed torrent still on TorBox (missed delete: old build, crash, transient error) | Reaper deletes it on the next reconcile pass (hygiene). With seeding disabled a cached torrent is already inactive and holds no slot, so a missed delete clutters `mylist` but does **not** starve the queue. |

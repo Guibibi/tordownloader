@@ -403,3 +403,100 @@ func TestDownloadRejectsUnsafePathFromOldRow(t *testing.T) {
 		t.Errorf("file written outside the download dir (stat err = %v)", err)
 	}
 }
+
+// TestDiskSpaceGateHoldsDownloadUntilSpaceFrees asserts a torrent that would
+// not fit (remaining bytes + reserve > free) is not started and not failed: it
+// stays LOCAL_QUEUED with a note explaining the wait, and starts once enough
+// space is reported, clearing the note.
+func TestDiskSpaceGateHoldsDownloadUntilSpaceFrees(t *testing.T) {
+	body := bytes.Repeat([]byte("x"), 1000)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.ServeContent(w, r, "f", time.Time{}, bytes.NewReader(body))
+	}))
+	defer srv.Close()
+
+	st := newStore(t)
+	save := filepath.Join(t.TempDir(), "tv")
+	hash := "dddddddddddddddddddddddddddddddddddddddd"
+	seedLocalQueued(t, st, hash, save, []store.FileInput{
+		{TorBoxFileID: 0, RelPath: "show/e01.mkv", ShortName: "e01.mkv", Size: int64(len(body))},
+	})
+	tb := &fakeTB{dl: func(torbox.RequestDLParams) (string, error) { return srv.URL + "/f", nil }}
+	e := New(st, tb, Config{MinFreeSpace: 500}, nil)
+
+	var free atomic.Uint64
+	free.Store(1200) // 1000 to write + 500 reserve doesn't fit
+	var measured atomic.Value
+	e.diskFree = func(p string) (uint64, bool) { measured.Store(p); return free.Load(), true }
+
+	ctx := context.Background()
+	if err := e.downloadPass(ctx); err != nil {
+		t.Fatalf("downloadPass: %v", err)
+	}
+	e.dlWG.Wait()
+	tr, _, _ := st.GetTorrent(ctx, hash)
+	if tr.State != store.StateLocalQueued {
+		t.Fatalf("state = %q, want LOCAL_QUEUED while waiting for space", tr.State)
+	}
+	if !strings.Contains(tr.Error, "waiting for disk space") {
+		t.Errorf("error note = %q, want a disk-space wait note", tr.Error)
+	}
+	if got, _ := measured.Load().(string); got != save {
+		t.Errorf("measured free space at %q, want the save path %q", got, save)
+	}
+
+	free.Store(1500) // now exactly fits
+	if err := e.downloadPass(ctx); err != nil {
+		t.Fatalf("downloadPass: %v", err)
+	}
+	e.dlWG.Wait()
+	tr, _, _ = st.GetTorrent(ctx, hash)
+	if tr.State != store.StateComplete {
+		t.Fatalf("state = %q, want COMPLETE once space frees", tr.State)
+	}
+	if tr.Error != "" {
+		t.Errorf("error note = %q, want it cleared", tr.Error)
+	}
+}
+
+// TestDiskSpaceGateCountsInFlightDownloads asserts the gate reserves room for
+// what running downloads still have to write, so two downloads that each fit
+// alone aren't both started onto a disk that can only hold one.
+func TestDiskSpaceGateCountsInFlightDownloads(t *testing.T) {
+	st := newStore(t)
+	save := filepath.Join(t.TempDir(), "tv")
+	hash := "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+	tr := seedLocalQueued(t, st, hash, save, []store.FileInput{
+		{TorBoxFileID: 0, RelPath: "show/e01.mkv", ShortName: "e01.mkv", Size: 1000},
+	})
+	e := New(st, &fakeTB{}, Config{}, nil)
+	e.diskFree = func(string) (uint64, bool) { return 1500, true }
+
+	ctx := context.Background()
+	if _, ok := e.diskSpaceFor(ctx, tr); !ok {
+		t.Fatal("download should fit with nothing else running")
+	}
+	e.outstanding["ffffffffffffffffffffffffffffffffffffffff"] = 600 // another download still has 600 to write
+	if _, ok := e.diskSpaceFor(ctx, tr); ok {
+		t.Fatal("download should wait: 1000 + 600 in flight > 1500 free")
+	}
+
+	// A partial already on disk counts toward what's written.
+	partial := filepath.Join(save, ".incomplete", hash, "show", "e01.mkv")
+	if err := os.MkdirAll(filepath.Dir(partial), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(partial, make([]byte, 200), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if remaining, ok := e.diskSpaceFor(ctx, tr); !ok || remaining != 800 {
+		t.Fatalf("diskSpaceFor = (%d, %v), want (800, true): 800 left + 600 in flight fits 1500", remaining, ok)
+	}
+
+	// A negative reserve disables the gate entirely.
+	e.minFreeSpace = -1
+	e.diskFree = func(string) (uint64, bool) { return 0, true }
+	if _, ok := e.diskSpaceFor(ctx, tr); !ok {
+		t.Fatal("a disabled gate must never hold a download")
+	}
+}

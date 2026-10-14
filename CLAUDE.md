@@ -48,7 +48,8 @@ headless, download-to-disk. Runs as one Docker container on the user's **Unraid*
   (an orphan torrent we don't track holds a slot), cancel the queued entry via
   `controlqueued` and retry from our own queue. The old "adopt the queued_id, re-match
   by infohash on activation" path was removed — it was a fragile second namespace.
-- Headless: YAML/env config, SQLite state, logs (no Web UI in v1).
+- Headless: YAML/env config, SQLite state, logs. The only UI is the built-in read-only
+  status dashboard at `/` (`internal/qbit/ui.go`); no settings or controls in it.
 - **Two failure detectors, not one (revised 2026-09-01).** The old rule was "fail on
   *stall*, never on slowness". That left a hole: a torrent trickling at a few KB/s is
   never stalled — progress climbs every tick, resetting the clock forever — so it held
@@ -87,6 +88,30 @@ headless, download-to-disk. Runs as one Docker container on the user's **Unraid*
   never pruned.
 - `/healthz` (DB-backed liveness; runs `SELECT 1`) is what the Dockerfile/compose
   healthchecks hit — `app/version` is static and stays green even with a wedged store.
+- **Prometheus `/metrics` (2026-10-14).** Hand-rolled text exposition in `internal/metrics`
+  (no client_golang dependency). Gauges are read at scrape time (`qbit/metrics.go`: torrents
+  by state, slots used/max, TorBox vs local speed, free disk space); counters are
+  package-level and bumped in place: failures by kind (every `Engine.fail` call names one of
+  the `fail*` kinds in `engine.go`), local retries by cause, CDN bytes, completions, TorBox
+  responses by endpoint × status class, *arr push-back results. Keep label values to small
+  fixed sets — never torrent names/hashes.
+- **Free-disk-space gate (2026-10-14).** Before a torrent starts (or resumes) its local
+  download, `Engine.diskSpaceFor` requires free space on the save path's filesystem ≥ bytes it
+  still has to write + what running downloads still have to write (`Engine.outstanding`,
+  updated from progress ticks) + `download.min_free_space` (default 10GB; `-1` disables).
+  If it doesn't fit it **waits** in LOCAL_* with a note in the `error` column — never failed,
+  no retry budget spent — and is re-checked each 2s pass. ENOSPC mid-download is still
+  handled by the local-retry path.
+- **Startup account check (2026-10-14).** `torbox.CheckAccount` calls `GET /v1/api/user/me`
+  once in the background: a rejected key is logged as an error; expired/expiring
+  subscription, Free plan, account cooldown, and `max_active_slots` vs the plan's included
+  slots (Essential 3, Standard 5, Pro 10 — extra slots can be bought, so above-plan is a
+  warning, not an error) are logged. Never blocks or disables anything.
+- **Shutdown order.** `main` cancels the context, drains the HTTP server, and waits for
+  `Engine.Run` (workers + in-flight download goroutines) before the deferred store Close —
+  all within `shutdownTimeout` (8s, under Docker's 10s stop grace).
+- CI: `.github/workflows/test.yml` runs gofmt, `go vet`, and `go test -race` on every push/PR;
+  `docker-publish.yml` only builds (and publishes on `v*` tags).
 - **Parallel local downloads (2026-07-21).** Up to `download.parallel_torrents`
   (default 3) torrents are pulled to disk concurrently, each in its own goroutine
   bounded by `download.parallel_files` — one huge grab no longer blocks cached

@@ -1,8 +1,10 @@
 // Command tordownloader emulates the qBittorrent WebUI API for Sonarr/Radarr,
 // proxies releases to TorBox, and downloads finished files to local disk.
 //
-// M0 scaffold: load config, set up logging, open/migrate the SQLite store, and
-// run until a shutdown signal. Pass --check to validate config + DB and exit.
+// It loads config, opens/migrates the SQLite store, starts the engine (TorBox
+// submitter, reconciler, local downloader) and the HTTP server (qBittorrent
+// API, dashboard, /healthz, /metrics), and runs until a shutdown signal. Pass
+// --check to validate config + DB and exit.
 package main
 
 import (
@@ -28,6 +30,11 @@ import (
 
 // version is overridable at build time via -ldflags "-X main.version=...".
 var version = "dev"
+
+// shutdownTimeout bounds the whole graceful stop — draining HTTP requests and
+// waiting for the engine's workers and in-flight downloads to wind down —
+// staying under Docker's default 10s stop grace period before SIGKILL.
+const shutdownTimeout = 8 * time.Second
 
 func main() {
 	if err := run(); err != nil {
@@ -89,6 +96,15 @@ func run() error {
 	tbClient := torbox.New(cfg.TorBox.APIKey,
 		torbox.WithBaseURL(cfg.TorBox.BaseURL),
 		torbox.WithRateLimit(cfg.TorBox.MaxRequestsPerMin))
+	if cfg.TorBox.APIKey != "" {
+		// Verify the key, plan and subscription in the background so a bad key or
+		// lapsed account is reported right away without delaying startup.
+		go func() {
+			checkCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+			defer cancel()
+			torbox.CheckAccount(checkCtx, tbClient, cfg.TorBox.MaxActiveSlots, slog.Default())
+		}()
+	}
 
 	// Optional Sonarr/Radarr failure push-back: without it a failed download is
 	// never blocklisted or replaced (Sonarr ignores qBittorrent error states for
@@ -125,20 +141,30 @@ func run() error {
 		ParallelFiles:        cfg.Download.ParallelFiles,
 		ParallelTorrents:     cfg.Download.ParallelTorrents,
 		IncompleteSubdir:     cfg.Download.IncompleteSubdir,
+		MinFreeSpace:         cfg.Download.MinFreeSpace.Bytes(),
 		CacheCheck:           cfg.TorBox.CacheCheck,
 		Arr:                  arrNotifier,
 	}, slog.Default())
-	go eng.Run(ctx)
+	// engineDone closes once the engine's workers and in-flight downloads have
+	// all stopped; shutdown waits on it so the store isn't closed under them.
+	engineDone := make(chan struct{})
+	go func() {
+		defer close(engineDone)
+		eng.Run(ctx)
+	}()
+
+	api := qbit.New(st, cfg.Download.Root, qbit.FailurePolicy{
+		StallTimeout:         cfg.Failure.StallTimeout.Std(),
+		ProgressStallTimeout: cfg.Failure.ProgressStallTimeout.Std(),
+		CachedStallTimeout:   cfg.Failure.CachedStallTimeout.Std(),
+		MinSpeed:             cfg.Failure.MinSpeed.Bytes(),
+		SlowWindow:           cfg.Failure.SlowWindow.Std(),
+	}, eng.DeleteTorrent, slog.Default())
+	api.SetMetricsInfo(version, cfg.TorBox.MaxActiveSlots)
 
 	srv := &http.Server{
-		Addr: cfg.Server.ListenAddr,
-		Handler: qbit.New(st, cfg.Download.Root, qbit.FailurePolicy{
-			StallTimeout:         cfg.Failure.StallTimeout.Std(),
-			ProgressStallTimeout: cfg.Failure.ProgressStallTimeout.Std(),
-			CachedStallTimeout:   cfg.Failure.CachedStallTimeout.Std(),
-			MinSpeed:             cfg.Failure.MinSpeed.Bytes(),
-			SlowWindow:           cfg.Failure.SlowWindow.Std(),
-		}, eng.DeleteTorrent, slog.Default()).Routes(),
+		Addr:    cfg.Server.ListenAddr,
+		Handler: api.Routes(),
 		// Bound the header-read phase so a slow/stalled client can't pin a
 		// connection open indefinitely (Slowloris). Handlers themselves are
 		// quick, so no ReadTimeout/WriteTimeout that could truncate a response.
@@ -156,21 +182,33 @@ func run() error {
 	}()
 
 	slog.Info("startup complete; waiting for shutdown signal")
+	var runErr error
 	select {
 	case err := <-serveErr:
 		if err != nil {
-			return fmt.Errorf("http server: %w", err)
+			runErr = fmt.Errorf("http server: %w", err)
 		}
 	case <-ctx.Done():
 		slog.Info("shutdown signal received; stopping")
 	}
 
-	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	// Stop the engine too when we got here because the server failed, then
+	// drain both. The engine must be fully stopped before the deferred store
+	// Close runs: download goroutines finish their last writes (progress, file
+	// done, complete) on the way out, and those must not hit a closed database.
+	stop()
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
 	defer cancel()
 	if err := srv.Shutdown(shutdownCtx); err != nil {
 		slog.Error("http server shutdown", "err", err)
 	}
-	return nil
+	select {
+	case <-engineDone:
+	case <-shutdownCtx.Done():
+		slog.Warn("engine did not stop within the shutdown timeout; closing the store anyway",
+			"timeout", shutdownTimeout)
+	}
+	return runErr
 }
 
 func newLogger(c config.LogConfig) *slog.Logger {

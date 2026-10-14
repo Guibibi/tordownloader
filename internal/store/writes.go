@@ -115,6 +115,33 @@ func (s *Store) CountByState(ctx context.Context, state string) (int, error) {
 	return n, nil
 }
 
+// CountStates returns how many torrents are in each internal state. Every
+// known state is present (zero when empty), so a metrics series doesn't vanish
+// when its count drops to zero.
+func (s *Store) CountStates(ctx context.Context) (map[string]int, error) {
+	counts := map[string]int{
+		StateQueued: 0, StateTorBoxActive: 0, StateLocalQueued: 0,
+		StateLocalDload: 0, StateComplete: 0, StateError: 0,
+	}
+	rows, err := s.db.QueryContext(ctx, `SELECT state, COUNT(*) FROM torrents GROUP BY state`)
+	if err != nil {
+		return nil, fmt.Errorf("count states: %w", err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var state string
+		var n int
+		if err := rows.Scan(&state, &n); err != nil {
+			return nil, fmt.Errorf("count states: %w", err)
+		}
+		counts[state] = n
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("count states: %w", err)
+	}
+	return counts, nil
+}
+
 // ListByState returns torrents in the given state, oldest first (FIFO for the
 // submission queue).
 func (s *Store) ListByState(ctx context.Context, state string) ([]Torrent, error) {
@@ -528,8 +555,8 @@ func (s *Store) MarkArrNotified(ctx context.Context, id int64) error {
 }
 
 // DeleteByHashes removes the torrents with the given infohashes (files cascade)
-// and returns how many rows were deleted. M3 only drops local rows; TorBox-side
-// deletion and local file removal are added in M6.
+// and returns how many rows were deleted. It only drops rows; TorBox-side
+// deletion and local file removal are the engine's job (Engine.DeleteTorrent).
 func (s *Store) DeleteByHashes(ctx context.Context, hashes []string) (int64, error) {
 	if len(hashes) == 0 {
 		return 0, nil

@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/guibibi/tordownloader/internal/downloader"
+	"github.com/guibibi/tordownloader/internal/metrics"
 	"github.com/guibibi/tordownloader/internal/store"
 	"github.com/guibibi/tordownloader/internal/torbox"
 )
@@ -29,13 +30,32 @@ func (e *Engine) downloadPass(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	for _, t := range append(resuming, queued...) {
+	pending := append(resuming, queued...)
+	e.pruneDiskWaits(pending)
+	for _, t := range pending {
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
 		e.maybeStartDownload(ctx, t)
 	}
 	return nil
+}
+
+// pruneDiskWaits forgets disk-wait bookkeeping for torrents no longer waiting
+// to download (deleted, failed, or completed). Download-pass goroutine only.
+func (e *Engine) pruneDiskWaits(pending []store.Torrent) {
+	if len(e.diskWaitNoted) == 0 {
+		return
+	}
+	live := make(map[string]bool, len(pending))
+	for _, t := range pending {
+		live[t.Infohash] = true
+	}
+	for h := range e.diskWaitNoted {
+		if !live[h] {
+			delete(e.diskWaitNoted, h)
+		}
+	}
 }
 
 // maybeStartDownload spawns downloadOne for t unless it is already being
@@ -53,10 +73,22 @@ func (e *Engine) maybeStartDownload(ctx context.Context, t store.Torrent) {
 		e.mu.Unlock()
 		return // backing off after a failed attempt (localFailed)
 	}
+	e.mu.Unlock()
+
+	// Only this (download-pass) goroutine registers downloads, so releasing the
+	// lock for the disk check can't let another start slip in; concurrent
+	// changes (a download finishing, a delete) only free capacity.
+	remaining, ok := e.diskSpaceFor(ctx, t)
+	if !ok {
+		return
+	}
+
 	// Cancellable sub-context so a concurrent delete can abort just this
 	// download without tearing down the rest of the engine.
 	dlCtx, cancel := context.WithCancel(ctx)
+	e.mu.Lock()
 	e.activeDownloads[t.Infohash] = cancel
+	e.outstanding[t.Infohash] = remaining
 	e.mu.Unlock()
 
 	e.dlWG.Add(1)
@@ -66,10 +98,114 @@ func (e *Engine) maybeStartDownload(ctx context.Context, t store.Torrent) {
 			cancel()
 			e.mu.Lock()
 			delete(e.activeDownloads, t.Infohash)
+			delete(e.outstanding, t.Infohash)
 			e.mu.Unlock()
 		}()
 		e.downloadOne(ctx, dlCtx, t)
 	}()
+}
+
+// diskWaitNoteInterval throttles the "waiting for disk space" log line and row
+// note for one torrent: the download pass re-checks every 2s, but the message
+// only needs refreshing occasionally.
+const diskWaitNoteInterval = time.Minute
+
+// diskSpaceFor decides whether t may start downloading now without running the
+// filesystem out of space. It returns how many bytes the download still has to
+// write and whether it fits: the free space on the save path's filesystem must
+// cover those bytes, plus what downloads already running still have to write,
+// plus the configured reserve (download.min_free_space). A torrent that doesn't
+// fit waits in its LOCAL_* state — it is not failed and spends no retry budget —
+// with the reason on its row, and is re-checked every pass, so it starts as soon
+// as space frees up (an import clears a completed download, or a running one
+// finishes). Without this gate a big pack started on a nearly full disk would
+// fill the share Sonarr/Radarr (and everything else) import into.
+//
+// When the check is disabled, or free space can't be measured, or the torrent
+// has nothing left to write, it always fits. Problems that make the torrent
+// undownloadable (no files, unsafe paths) are left for downloadOne to fail.
+func (e *Engine) diskSpaceFor(ctx context.Context, t store.Torrent) (int64, bool) {
+	if e.minFreeSpace < 0 {
+		return 0, true
+	}
+	files, err := e.store.ListFiles(ctx, t.ID)
+	if err != nil || len(files) == 0 {
+		return 0, true
+	}
+	rels := make([]string, 0, len(files))
+	for _, f := range files {
+		rels = append(rels, f.RelPath)
+	}
+	if _, bad := unsafeRelPath(rels); bad {
+		return 0, true
+	}
+	remaining := downloader.RemainingBytes(e.downloadJobs(t, files))
+	if remaining == 0 {
+		return 0, true
+	}
+	free, known := e.diskFree(t.SavePath)
+	if !known {
+		return remaining, true
+	}
+
+	e.mu.Lock()
+	var others int64
+	for h, n := range e.outstanding {
+		if h != t.Infohash {
+			others += n
+		}
+	}
+	e.mu.Unlock()
+
+	need := remaining + others + e.minFreeSpace
+	if int64(free) >= need {
+		if _, waited := e.diskWaitNoted[t.Infohash]; waited {
+			// Clear the "waiting for disk space" note now that it's starting.
+			delete(e.diskWaitNoted, t.Infohash)
+			if err := e.store.NoteLocalRetry(ctx, t.ID, ""); err != nil && ctx.Err() == nil {
+				e.log.Warn("clear disk wait note", "infohash", t.Infohash, "err", err)
+			}
+			e.log.Info("disk space available; starting download", "infohash", t.Infohash, "name", t.Name)
+		}
+		return remaining, true
+	}
+
+	if last, ok := e.diskWaitNoted[t.Infohash]; ok && time.Since(last) < diskWaitNoteInterval {
+		return 0, false
+	}
+	e.diskWaitNoted[t.Infohash] = time.Now()
+	e.log.Warn("not enough free disk space; download waiting",
+		"infohash", t.Infohash, "name", t.Name, "path", t.SavePath,
+		"remaining", humanBytes(remaining), "in_flight", humanBytes(others),
+		"reserve", humanBytes(e.minFreeSpace), "free", humanBytes(int64(free)))
+	note := fmt.Sprintf("waiting for disk space: needs %s (%s for this download, %s for running ones, %s reserve), %s free",
+		humanBytes(need), humanBytes(remaining), humanBytes(others), humanBytes(e.minFreeSpace), humanBytes(int64(free)))
+	if err := e.store.NoteLocalRetry(ctx, t.ID, note); err != nil && ctx.Err() == nil {
+		e.log.Warn("note disk wait", "infohash", t.Infohash, "err", err)
+	}
+	return 0, false
+}
+
+// downloadJobs maps a torrent's file rows onto downloader jobs under its
+// staging tree (<save_path>/<incomplete>/<infohash>/<rel_path>).
+func (e *Engine) downloadJobs(t store.Torrent, files []store.File) []downloader.File {
+	staging := e.stagingDir(t)
+	jobs := make([]downloader.File, 0, len(files))
+	for _, f := range files {
+		jobs = append(jobs, downloader.File{
+			RowID:    f.ID,
+			TorBoxID: int(f.TorBoxFileID.Int64),
+			Dest:     filepath.Join(staging, f.RelPath),
+			Size:     f.Size,
+		})
+	}
+	return jobs
+}
+
+// stagingDir is where t's files are written before Finalize moves them into
+// place.
+func (e *Engine) stagingDir(t store.Torrent) string {
+	return filepath.Join(t.SavePath, e.incomplete, t.Infohash)
 }
 
 // downloadOne fetches all of a torrent's files into a staging tree, atomically
@@ -78,7 +214,7 @@ func (e *Engine) maybeStartDownload(ctx context.Context, t store.Torrent) {
 // (dlCtx cancelled via Engine.DeleteTorrent) leaves it for a later resume.
 func (e *Engine) downloadOne(ctx, dlCtx context.Context, t store.Torrent) {
 	if !t.TorBoxID.Valid {
-		e.fail(ctx, t, "no TorBox id for download")
+		e.fail(ctx, t, failInvalid, "no TorBox id for download")
 		return
 	}
 	files, err := e.store.ListFiles(ctx, t.ID)
@@ -87,7 +223,7 @@ func (e *Engine) downloadOne(ctx, dlCtx context.Context, t store.Torrent) {
 		return
 	}
 	if len(files) == 0 {
-		e.fail(ctx, t, "no files to download")
+		e.fail(ctx, t, failInvalid, "no files to download")
 		return
 	}
 	if t.State == store.StateLocalQueued {
@@ -104,21 +240,15 @@ func (e *Engine) downloadOne(ctx, dlCtx context.Context, t store.Torrent) {
 	// toLocalQueued already rejects these; rows recorded by an older build
 	// weren't checked, so re-check before joining onto the staging path.
 	if bad, ok := unsafeRelPath(rels); ok {
-		e.fail(ctx, t, fmt.Sprintf("unsafe file path in torrent: %q", bad))
+		e.fail(ctx, t, failInvalid, fmt.Sprintf("unsafe file path in torrent: %q", bad))
 		return
 	}
 
-	staging := filepath.Join(t.SavePath, e.incomplete, t.Infohash)
+	staging := e.stagingDir(t)
+	jobs := e.downloadJobs(t, files)
 	var totalSize int64
-	jobs := make([]downloader.File, 0, len(files))
 	for _, f := range files {
 		totalSize += f.Size
-		jobs = append(jobs, downloader.File{
-			RowID:    f.ID,
-			TorBoxID: int(f.TorBoxFileID.Int64),
-			Dest:     filepath.Join(staging, f.RelPath),
-			Size:     f.Size,
-		})
 	}
 	if totalSize == 0 {
 		totalSize = t.Size
@@ -140,6 +270,7 @@ func (e *Engine) downloadOne(ctx, dlCtx context.Context, t store.Torrent) {
 		now := time.Now()
 		var speed int64
 		if !firstSample {
+			metrics.DownloadedBytes.Add(downloaded - prevBytes)
 			if dt := now.Sub(prevTime).Seconds(); dt > 0 {
 				if s := int64(float64(downloaded-prevBytes) / dt); s > 0 {
 					speed = s
@@ -148,6 +279,13 @@ func (e *Engine) downloadOne(ctx, dlCtx context.Context, t store.Torrent) {
 		}
 		firstSample = false
 		prevBytes, prevTime = downloaded, now
+		// Keep this download's claim on free space current, so the disk gate
+		// counts only what running downloads have yet to write.
+		e.mu.Lock()
+		if _, ok := e.outstanding[t.Infohash]; ok {
+			e.outstanding[t.Infohash] = max(totalSize-downloaded, 0)
+		}
+		e.mu.Unlock()
 		var p float64
 		if totalSize > 0 {
 			p = float64(downloaded) / float64(totalSize)
@@ -201,6 +339,7 @@ func (e *Engine) downloadOne(ctx, dlCtx context.Context, t store.Torrent) {
 		e.log.Error("mark complete", "infohash", t.Infohash, "err", err)
 		return
 	}
+	metrics.Completed.Inc()
 	e.log.Info("download complete", "infohash", t.Infohash, "content_path", contentPath)
 
 	// Delete from TorBox now that the content is safely on local disk: we no longer
@@ -255,8 +394,13 @@ func (e *Engine) localFailed(ctx context.Context, t store.Torrent, reason string
 	e.mu.Unlock()
 
 	if giveUp {
-		e.fail(ctx, t, fmt.Sprintf("%s (after %d attempts)", reason, r.attempts))
+		e.fail(ctx, t, failLocal, fmt.Sprintf("%s (after %d attempts)", reason, r.attempts))
 		return
+	}
+	if diskErr {
+		metrics.LocalRetries.Inc("disk")
+	} else {
+		metrics.LocalRetries.Inc("transfer")
 	}
 	e.log.Warn("local download failed; will retry",
 		"infohash", t.Infohash, "attempt", r.attempts, "max_attempts", maxLocalAttempts,

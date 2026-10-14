@@ -207,3 +207,29 @@ func TestRequeueFailed(t *testing.T) {
 		t.Errorf("RequeueFailed on a QUEUED row = %v, %v; want false", ok, err)
 	}
 }
+
+// CountStates reports every known state, including empty ones, so metric
+// series don't disappear when a count drops to zero.
+func TestCountStates(t *testing.T) {
+	ctx := context.Background()
+	st := newWritesStore(t)
+	for _, h := range []string{"aa", "bb"} {
+		if _, _, err := st.AddTorrent(ctx, AddTorrentParams{Infohash: h, Name: "show"}); err != nil {
+			t.Fatalf("add: %v", err)
+		}
+	}
+	tr, _, _ := st.GetTorrent(ctx, "bb")
+	if err := st.MarkError(ctx, tr.ID, "boom"); err != nil {
+		t.Fatalf("mark error: %v", err)
+	}
+	got, err := st.CountStates(ctx)
+	if err != nil {
+		t.Fatalf("CountStates: %v", err)
+	}
+	if got[StateQueued] != 1 || got[StateError] != 1 {
+		t.Errorf("counts = %v, want 1 QUEUED and 1 ERROR", got)
+	}
+	if n, ok := got[StateComplete]; !ok || n != 0 {
+		t.Errorf("COMPLETE = (%d, %v), want present with 0", n, ok)
+	}
+}

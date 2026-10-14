@@ -168,3 +168,30 @@ func TestLoadByteSizeFromYAML(t *testing.T) {
 		t.Errorf("min_speed = %d, want 0 (check disabled)", cfg.Failure.MinSpeed)
 	}
 }
+
+func TestMinFreeSpace(t *testing.T) {
+	cfg, err := Load("")
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.Download.MinFreeSpace != 10*GiB {
+		t.Errorf("default min_free_space = %d, want %d", cfg.Download.MinFreeSpace, 10*GiB)
+	}
+
+	cfg, err = Load(writeConfig(t, "download:\n  min_free_space: \"50GB\"\n"))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.Download.MinFreeSpace != 50*GiB {
+		t.Errorf("min_free_space = %d, want %d", cfg.Download.MinFreeSpace, 50*GiB)
+	}
+
+	// -1 is the documented way to turn the check off; it must not be rejected.
+	cfg, err = Load(writeConfig(t, "download:\n  min_free_space: -1\n"))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.Download.MinFreeSpace >= 0 {
+		t.Errorf("min_free_space = %d, want negative (check disabled)", cfg.Download.MinFreeSpace)
+	}
+}
