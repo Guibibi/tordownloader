@@ -2,9 +2,9 @@
 // tordownloader as a download client. This file wires the routes; the handlers
 // live alongside it. See docs/API_REFERENCE.md §1–§3 for the contract.
 //
-// M2 covers the read/identity surface: auth, app info/preferences, the
-// read-only torrent endpoints, categories, and transfer info. Write endpoints
-// (add/delete/pause/...) arrive in later milestones.
+// Besides the qBittorrent surface (auth, app info/preferences, torrent read and
+// write endpoints, categories, transfer info) the same server hosts the status
+// dashboard, /healthz, and Prometheus /metrics.
 package qbit
 
 import (
@@ -41,6 +41,10 @@ type Handler struct {
 	// local file cleanup, and DB drop. When nil, the handler falls back to
 	// store.DeleteByHashes (DB-only removal, for testing).
 	deleteFn engine.DeleteFunc
+
+	// version and maxSlots are reported by /metrics (see SetMetricsInfo).
+	version  string
+	maxSlots int
 }
 
 // FailurePolicy mirrors the engine's failure.* settings for display purposes.
@@ -129,6 +133,10 @@ func (h *Handler) Routes() http.Handler {
 	// string), this exercises the SQLite store, so a wedged database turns the
 	// container unhealthy.
 	mux.HandleFunc("/healthz", h.healthz)
+
+	// Prometheus metrics: torrent states, slot use, speeds, free disk space,
+	// and failure/retry/API counters.
+	mux.HandleFunc("/metrics", h.metricsHandler)
 
 	// Status dashboard (simple read-only UI). "/" also acts as the catch-all,
 	// so uiIndex 404s anything that isn't exactly "/".

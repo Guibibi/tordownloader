@@ -51,7 +51,14 @@ All under `/api/v2`. Methods accept GET and/or POST as qBittorrent does. No auth
 | Endpoint | Behavior |
 |---|---|
 | `GET /transfer/info` | `connection_status: "connected"`, aggregate `dl_info_speed`, etc. |
-| `GET /sync/maindata` | Optional snapshot (`full_update: true`); Sonarr mainly uses `torrents/info`. |
+| `GET /sync/maindata` | **Not implemented** (404). Sonarr/Radarr poll `torrents/info` instead. |
+
+### Outside `/api/v2` (not qBittorrent)
+| Endpoint | Behavior |
+|---|---|
+| `GET /healthz` | `200 ok` when the SQLite store answers `SELECT 1`, else `503`. Used by the Docker healthcheck. |
+| `GET /metrics` | Prometheus text format: `tordownloader_torrents{state}`, `tordownloader_torbox_slots_used` / `_max`, `tordownloader_download_speed_bytes{stage}`, `tordownloader_disk_free_bytes`, and counters `tordownloader_failures_total{reason}`, `tordownloader_local_retries_total{cause}`, `tordownloader_downloaded_bytes_total`, `tordownloader_completed_total`, `tordownloader_torbox_requests_total{endpoint,result}`, `tordownloader_arr_notifications_total{result}`. |
+| `GET /`, `/ui/torrents`, `/ui/torrents/files` | Read-only status dashboard and its JSON feeds. |
 
 ---
 
@@ -146,13 +153,14 @@ Rate limits: most 300/min; **`createtorrent` 60/hour for uncached** releases (ca
 
 | Endpoint | Method | Use |
 |---|---|---|
-| `/v1/api/torrents/createtorrent` | POST (multipart) | Submit a release. Params: `magnet` **or** `file`, `seed` (1 auto, 2 seed, 3 don't seed — **we always send 3**), `allow_zip`, `name`, `as_queued`. Returns `data.torrent_id` (+ `hash`). ⚠️ Response shape **not yet verified** (read-only M1 run did no writes). |
+| `/v1/api/torrents/createtorrent` | POST (multipart) | Submit a release. Params: `magnet` **or** `file`, `seed` (1 auto, 2 seed, 3 don't seed — **we always send 3**), `allow_zip`, `name`, `as_queued`. Returns `data.torrent_id` + `hash` when it starts right away, or `data.queued_id` when TorBox queues it (account full); a queued answer also carries `active_limit` and `current_active_downloads`. **Field names confirmed 2026-10-14** against TorBox's official SDK (`@torbox/torbox-api` 1.0.9) — we only rely on `torrent_id`/`queued_id`, and `DUPLICATE_ITEM` / transient-code handling has run in production. |
 | `/v1/api/torrents/checkcached` | GET | Cached availability. `hash` (comma list, ~100 max), `format=object`, `list_files`. **Verified 2026-06-14:** `data` is an object keyed by infohash → `{name, size, hash}` (empty array when none cached). |
 | `/v1/api/torrents/mylist` | GET | List/poll torrents. Params: `bypass_cache`, `id`, `offset`, `limit` (default 1000). Returns torrent objects (see §5). **Verified 2026-06-14.** |
 | `/v1/api/torrents/requestdl` | GET | Get a time-limited CDN download URL. Params: `token` (API key, as query param), `torrent_id`, `file_id`, `zip_link`, `user_ip`, `redirect`. Link valid ~3h. **Per-file**: one call per `file_id`. **Verified 2026-06-14:** `data` is a plain string URL like `https://<store>.tb-cdn.io/dld/<uuid>?token=<key>`. |
 | `/v1/api/torrents/controltorrent` | POST | `{torrent_id, operation}` where operation ∈ `reannounce|delete|resume`. We use `delete` for cleanup of **active** torrents. |
 | `/v1/api/queued/controlqueued` | POST | `{queued_id, operation, type}` (`type="torrent"`). We use `delete` only to **cancel** an unexpected queued submission (we gate on real occupancy and don't adopt TorBox's queue) and to clean up legacy queued rows. A queued download is a separate namespace `controltorrent` won't touch. **Verified live 2026-06-15.** |
 | `/v1/api/queued/getqueued` | GET | List queued downloads. Params: `bypass_cache`, `type=torrent`, `limit`. Returns objects with `id` (the `queued_id`), `hash`, `name`, `magnet`, `created_at`. **Verified live 2026-06-15.** ⚠️ The old `/v1/api/torrents/getqueued` is **deprecated** (returns `error: "DEPRECATED"`). |
+| `/v1/api/user/me` | GET | Account details, read once at startup to check the key, plan and subscription. Params: `settings` (we send `false`). We read `plan` (0 Free, 1 Essential, 2 Pro, 3 Standard), `is_subscribed`, `premium_expires_at`, `cooldown_until`. Field names from the official SDK, as above; there is no slot-count field (extra slots can be bought), so a plan's included slots (3/5/10) are a floor. |
 | `/v1/api/torrents/torrentinfo` | GET/POST | Metadata from DHT by `hash`/`magnet`/`file` (no auth). Optional, for name/file list pre-cache. |
 
 ### Standard TorBox response envelope
@@ -160,7 +168,10 @@ Rate limits: most 300/min; **`createtorrent` 60/hour for uncached** releases (ca
 { "success": true, "error": null, "detail": "…", "data": { … } }
 ```
 On **success**, observed `error` is `false` (not `null`); on failure it is a machine code
-string (e.g. `DOWNLOAD_TOO_LARGE` — provisional, unverified). `detail` is human-readable.
+string (e.g. `DUPLICATE_ITEM`, `ITEM_NOT_FOUND`, `BAD_TOKEN`). `detail` is human-readable. We don't
+match on a size-limit code: any `createtorrent` error that isn't transient (see
+`APIError.IsTransient`) or a duplicate fails the release, which covers the >200GB reject
+whatever its exact code.
 HTTP: 200 ok, 400 bad input, 403 auth, 500 server. Our client treats `error` as a union of
 `string|false|null`.
 

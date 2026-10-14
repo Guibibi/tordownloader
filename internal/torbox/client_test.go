@@ -105,8 +105,10 @@ func TestAPIError_TooLarge(t *testing.T) {
 	if !ok {
 		t.Fatalf("error type = %T, want *APIError", err)
 	}
-	if !apiErr.IsTooLarge() {
-		t.Errorf("IsTooLarge() = false, code = %q", apiErr.Code)
+	// A size rejection is a verdict on the release, so the engine must fail it
+	// rather than keep it queued.
+	if apiErr.Code != "DOWNLOAD_TOO_LARGE" || apiErr.IsTransient() || apiErr.IsDuplicate() {
+		t.Errorf("code = %q, transient = %v: want a non-transient release verdict", apiErr.Code, apiErr.IsTransient())
 	}
 	if apiErr.StatusCode != http.StatusBadRequest {
 		t.Errorf("status = %d", apiErr.StatusCode)

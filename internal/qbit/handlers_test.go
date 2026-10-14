@@ -42,7 +42,8 @@ func newTestServer(t *testing.T) (*httptest.Server, *store.Store) {
 	return srv, st
 }
 
-// seedTorrent inserts a torrent row directly (write helpers arrive in M3).
+// seedTorrent inserts a torrent row directly, bypassing the state-machine write
+// helpers so a test can set any combination of fields.
 func seedTorrent(t *testing.T, st *store.Store, tor store.Torrent) int64 {
 	t.Helper()
 	res, err := st.DB().ExecContext(context.Background(),

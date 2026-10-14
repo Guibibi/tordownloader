@@ -112,7 +112,7 @@ func Open(ctx context.Context, path string) (*Store, error) {
 	return s, nil
 }
 
-// DB exposes the underlying *sql.DB for query layers built in later milestones.
+// DB exposes the underlying *sql.DB (tests use it to seed rows directly).
 func (s *Store) DB() *sql.DB { return s.db }
 
 // Close closes the database connection.

@@ -20,6 +20,8 @@ download:
   parallel_torrents: 3             # torrents pulled to disk at once (one huge grab won't block cached episodes behind it)
   idle_timeout: 2m                 # abort a CDN transfer that delivers no bytes for this long, then retry it with a fresh link
                                    # (resumes from disk; the HTTP client has no overall deadline, so silence is what's bounded). <=0 disables
+  min_free_space: 10GB             # keep this much free on the download disk: a torrent waits (not fails) until free space covers
+                                   # what it still has to write + running downloads + this reserve. 0 = just fit; -1 disables
 
 database:
   path: "data/tordownloader.db"    # SQLite state file

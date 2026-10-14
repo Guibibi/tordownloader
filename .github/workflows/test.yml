@@ -1,0 +1,42 @@
+name: Test
+
+# Runs the Go checks on every push and pull request. The Docker workflow only
+# proves the image builds; this is what catches a behavioural regression in the
+# engine/reconcile logic before a release tag publishes it.
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: gofmt
+        run: |
+          unformatted=$(gofmt -l .)
+          if [ -n "$unformatted" ]; then
+            echo "These files need gofmt:"
+            echo "$unformatted"
+            exit 1
+          fi
+
+      - name: go vet
+        run: go vet ./...
+
+      # -race needs cgo; the shipped binary is still built with CGO_ENABLED=0.
+      - name: go test
+        run: go test -race -count=1 ./...

@@ -850,7 +850,7 @@ func TestFailQueuedUsesControlQueued(t *testing.T) {
 	}
 	e := New(st, tb, Config{MaxSlots: 1}, nil)
 
-	e.fail(ctx, tr, "stalled in queue")
+	e.fail(ctx, tr, failStall, "stalled in queue")
 
 	if ctlCalled != 0 {
 		t.Errorf("ControlTorrent called %d times, want 0 (queued, not active)", ctlCalled)

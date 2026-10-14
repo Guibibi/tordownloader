@@ -43,11 +43,6 @@ func (e *APIError) Error() string {
 	return fmt.Sprintf("torbox: %s [http %d]", e.Detail, e.StatusCode)
 }
 
-// IsTooLarge reports whether TorBox rejected the download for exceeding the
-// plan's per-download size cap (200GB on Essential). The exact error code is
-// provisional pending live verification (see docs/API_REFERENCE.md).
-func (e *APIError) IsTooLarge() bool { return e.Code == "DOWNLOAD_TOO_LARGE" }
-
 // IsNotFound reports whether TorBox answered that the requested item does not
 // exist: mylist?id= for a deleted torrent returns HTTP 404 (ITEM_NOT_FOUND). A
 // 404 for the endpoint itself (ENDPOINT_NOT_FOUND, e.g. after an API path
@@ -164,9 +159,9 @@ type CreateTorrentRequest struct {
 	AsQueued bool
 }
 
-// CreateTorrentResult is the data returned by /torrents/createtorrent.
-// PROVISIONAL shape — NOT yet verified against the live API (no write was
-// performed during the read-only M1 verification). Confirm before relying on it.
+// CreateTorrentResult is the data returned by /torrents/createtorrent: a
+// torrent_id when TorBox starts the download, or a queued_id when it queues it
+// instead. Field names match TorBox's official SDK (see docs/API_REFERENCE.md).
 type CreateTorrentResult struct {
 	TorrentID *int   `json:"torrent_id"`
 	QueuedID  *int   `json:"queued_id"`

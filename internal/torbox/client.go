@@ -1,7 +1,7 @@
 // Package torbox is a thin client for the TorBox API: the few endpoints
 // tordownloader needs (createtorrent, mylist, checkcached, requestdl,
-// controltorrent, controlqueued), with bearer auth and rate-limit/backoff
-// handling.
+// controltorrent, controlqueued, user/me), with bearer auth and
+// rate-limit/backoff handling.
 //
 // Rate limits to respect (TorBox): general 300/min, createtorrent 60/hour.
 // This client retries 429/5xx with exponential backoff honoring Retry-After.
@@ -22,6 +22,8 @@ import (
 	"time"
 
 	"golang.org/x/time/rate"
+
+	"github.com/guibibi/tordownloader/internal/metrics"
 )
 
 const (
@@ -353,6 +355,7 @@ func (c *Client) do(ctx context.Context, method, endpoint string, query url.Valu
 
 		resp, err := c.httpClient.Do(req)
 		if err != nil {
+			metrics.TorBoxRequests.Inc(endpoint, "error")
 			if attempt < c.maxRetries && ctx.Err() == nil {
 				if werr := c.wait(ctx, backoff); werr != nil {
 					return nil, werr
@@ -365,6 +368,7 @@ func (c *Client) do(ctx context.Context, method, endpoint string, query url.Valu
 
 		respBody, _ := io.ReadAll(resp.Body)
 		_ = resp.Body.Close()
+		metrics.TorBoxRequests.Inc(endpoint, statusClass(resp.StatusCode))
 
 		if resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode >= 500 {
 			if d, ok := retryAfter(resp.Header, backoff); ok && attempt < c.maxRetries {
@@ -395,6 +399,21 @@ func (c *Client) do(ctx context.Context, method, endpoint string, query url.Valu
 			return &env, &APIError{StatusCode: resp.StatusCode, Code: env.errorCode(), Detail: env.Detail}
 		}
 		return &env, nil
+	}
+}
+
+// statusClass buckets an HTTP status for the request counter: 429 is split out
+// from the other 4xx because rate limiting is what an operator watches for.
+func statusClass(code int) string {
+	switch {
+	case code == http.StatusTooManyRequests:
+		return "429"
+	case code >= 500:
+		return "5xx"
+	case code >= 400:
+		return "4xx"
+	default:
+		return "2xx"
 	}
 }
 

@@ -1,11 +1,14 @@
-// Package engine orchestrates the torrent lifecycle: it submits accepted
-// torrents to TorBox under the plan's slot limit, and (in later milestones)
-// reconciles state and drives local downloads.
+// Package engine orchestrates the torrent lifecycle with three background
+// workers:
 //
-// M3 implements the submission gate: a worker pops QUEUED torrents and calls
-// createtorrent while the number of TORBOX_ACTIVE torrents is below
-// max_active_slots (3 on the Essential plan). Rate limits (429) leave a torrent
-// QUEUED to retry; hard TorBox rejections (e.g. >200GB) move it to ERROR.
+//   - the submitter pops QUEUED torrents and calls createtorrent while the
+//     number of TORBOX_ACTIVE torrents is below max_active_slots. Rate limits and
+//     account/service errors leave a torrent QUEUED; verdicts on the release
+//     itself (e.g. >200GB) move it to ERROR;
+//   - the reconciler polls TorBox, advances torrents whose content is ready,
+//     fails stalled or too-slow fetches, pushes failures back to Sonarr/Radarr,
+//     and reaps/prunes leftovers;
+//   - the downloader pulls ready content from the TorBox CDN to local disk.
 package engine
 
 import (
@@ -19,6 +22,8 @@ import (
 	"sync"
 	"time"
 
+	"github.com/guibibi/tordownloader/internal/downloader"
+	"github.com/guibibi/tordownloader/internal/metrics"
 	"github.com/guibibi/tordownloader/internal/store"
 	"github.com/guibibi/tordownloader/internal/torbox"
 )
@@ -109,6 +114,7 @@ type Config struct {
 	ParallelFiles        int           // concurrent file downloads per torrent (default 4)
 	ParallelTorrents     int           // concurrent torrents pulled to local disk (default 3)
 	IncompleteSubdir     string        // staging dir under the save path (default .incomplete)
+	MinFreeSpace         int64         // bytes to keep free on the download filesystem (0 = just fit; <0 disables the check)
 	CacheCheck           bool          // log TorBox cache status on submit (informational)
 	Arr                  ArrNotifier   // optional: push failures to Sonarr/Radarr (nil = off)
 }
@@ -131,6 +137,7 @@ type Engine struct {
 	parallel           int
 	parallelTorrents   int
 	incomplete         string
+	minFreeSpace       int64
 	cacheCheck         bool
 	arr                ArrNotifier
 	httpClient         *http.Client
@@ -150,6 +157,20 @@ type Engine struct {
 	// the next may start. Guarded by mu. Entries are dropped on success, on
 	// giving up, and on delete.
 	localRetries map[string]localRetry
+
+	// outstanding holds, per running download, how many bytes it still has to
+	// write, so the free-space gate (diskSpaceFor) can reserve room for downloads
+	// already in flight. Updated from progress ticks. Guarded by mu.
+	outstanding map[string]int64
+
+	// diskWaitNoted remembers when each torrent waiting for disk space was last
+	// logged/noted, throttling the message. Touched only by the download-pass
+	// goroutine; no lock needed.
+	diskWaitNoted map[string]time.Time
+
+	// diskFree measures free space at a path (downloader.FreeSpace); tests
+	// substitute a fake.
+	diskFree func(path string) (uint64, bool)
 
 	// slotWaitLogged remembers that we've already logged the current
 	// "all slots busy, work waiting" episode, so the message isn't repeated every
@@ -261,10 +282,14 @@ func New(st *store.Store, tb TorBoxAPI, cfg Config, log *slog.Logger) *Engine {
 		parallel:           cfg.ParallelFiles,
 		parallelTorrents:   cfg.ParallelTorrents,
 		incomplete:         cfg.IncompleteSubdir,
+		minFreeSpace:       cfg.MinFreeSpace,
 		cacheCheck:         cfg.CacheCheck,
 		arr:                cfg.Arr,
 		activeDownloads:    make(map[string]context.CancelFunc),
 		localRetries:       make(map[string]localRetry),
+		outstanding:        make(map[string]int64),
+		diskWaitNoted:      make(map[string]time.Time),
+		diskFree:           downloader.FreeSpace,
 		lastReannounce:     make(map[int64]time.Time),
 		arrAttempts:        make(map[int64]arrAttempt),
 		// No overall client timeout: a legitimate download can run for hours, so a
@@ -290,7 +315,7 @@ func (e *Engine) Run(ctx context.Context) {
 		"min_speed", e.minSpeed, "slow_window", e.slowWindow,
 		"error_retention", e.errorRetention, "fail_timeout", e.failAfter,
 		"parallel_files", e.parallel, "parallel_torrents", e.parallelTorrents,
-		"idle_timeout", e.idleTimeout)
+		"idle_timeout", e.idleTimeout, "min_free_space", e.minFreeSpace)
 
 	// Rebuild in-memory state from SQLite + TorBox: re-sync active torrents
 	// and recover any content already finalized on disk.
@@ -407,7 +432,7 @@ func (e *Engine) submit(ctx context.Context, t store.Torrent) bool {
 		req.File = blob
 		req.FileName = t.Infohash + ".torrent"
 	default:
-		e.fail(ctx, t, "no magnet or torrent file to submit")
+		e.fail(ctx, t, failInvalid, "no magnet or torrent file to submit")
 		return true
 	}
 
@@ -450,7 +475,7 @@ func (e *Engine) submit(ctx context.Context, t store.Torrent) bool {
 			}
 			// A verdict on the release itself (too large, malformed torrent, ...) is
 			// terminal.
-			e.fail(ctx, t, apiErr.Error())
+			e.fail(ctx, t, failRejected, apiErr.Error())
 			return true
 		}
 		// Network/transient error: retry next pass.
@@ -490,7 +515,7 @@ func (e *Engine) submit(ctx context.Context, t store.Torrent) bool {
 			"infohash", t.Infohash, "queued_id", *res.QueuedID, "name", t.Name, "cooldown", createQueuedCooldown)
 		return false
 	default:
-		e.fail(ctx, t, "createtorrent returned no torrent id")
+		e.fail(ctx, t, failRejected, "createtorrent returned no torrent id")
 		return true
 	}
 }
@@ -554,9 +579,25 @@ func (e *Engine) cacheStatus(ctx context.Context, infohash string) bool {
 	return false
 }
 
-// fail moves a torrent to ERROR, logging if the store update itself fails.
-func (e *Engine) fail(ctx context.Context, t store.Torrent, reason string) {
-	e.log.Warn("torrent failed", "infohash", t.Infohash, "reason", reason)
+// Failure kinds: the reason label of the tordownloader_failures_total metric,
+// so an operator can see which detector is firing (and tune it) without
+// grepping logs. Keep the set small and fixed.
+const (
+	failRejected = "rejected" // TorBox refused the release (too large, malformed, ...)
+	failVanished = "vanished" // the torrent disappeared from the TorBox account
+	failStall    = "stall"    // no progress within the stall tier's grace
+	failSlow     = "slow"     // averaged below failure.min_speed over a window
+	failTimeout  = "timeout"  // hit the optional absolute failure.timeout cap
+	failLocal    = "local"    // local CDN download kept failing past its retries
+	failInvalid  = "invalid"  // unusable input: no source, no files, unsafe paths
+)
+
+// fail moves a torrent to ERROR, logging if the store update itself fails. kind
+// is one of the fail* constants and only feeds the failure metric; reason is
+// the human-readable text stored on the row.
+func (e *Engine) fail(ctx context.Context, t store.Torrent, kind, reason string) {
+	e.log.Warn("torrent failed", "infohash", t.Infohash, "kind", kind, "reason", reason)
+	metrics.Failures.Inc(kind)
 
 	// Best-effort: remove the abandoned torrent from TorBox so failed grabs don't
 	// pile up in the library. A pre-submit failure never created anything, and a

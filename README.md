@@ -26,7 +26,10 @@ download-to-disk** (no mount-based streaming).
 - **Never hangs on a dead transfer** — a CDN connection that stays open but stops sending is aborted and retried with a fresh link, resuming from the bytes already on disk.
 - **Failed downloads actually get replaced** — Sonarr/Radarr ignore qBittorrent error states for failed-download handling, so with a configured `arr:` instance tordownloader pushes the failure back through the *arr's own API: the queue item is removed with blocklist on, and the *arr immediately searches for an alternative release.
 - **Clean teardown** — when Sonarr/Radarr remove a download, it's deleted from TorBox and local disk too.
+- **Won't fill your disk** — a download only starts when it fits: free space must cover what it still has to write, what running downloads still need, and a reserve (10 GB by default). Otherwise it waits — it isn't failed — and starts as soon as room frees up.
 - **Status dashboard** — a built-in web page shows live per-torrent and per-file progress.
+- **Prometheus metrics** — `/metrics` exposes torrents by state, slot use, speeds, free disk space, and counters for failures (by reason), retries, bytes downloaded, TorBox API responses and Sonarr/Radarr push-backs.
+- **Account check on startup** — a rejected API key, an expiring or expired subscription, or a slot setting that doesn't match your plan is reported in the log right away.
 - **Headless & light** — YAML/env config, SQLite state, structured logs; a single static binary, no cgo.
 
 ## How it works
@@ -158,8 +161,9 @@ full set of knobs (see [`config.example.yaml`](config.example.yaml), which docum
 
 Each `*arr` pair needs **both** variables; a half-set pair is skipped with a warning in the
 startup log. `GET /healthz` answers `200 ok` while the service and its database are healthy
-(the bundled Docker healthcheck uses it). Failed torrents that are fully handled are pruned
-automatically after `failure.error_retention` (default 7 days, `config.yaml`).
+(the bundled Docker healthcheck uses it), and `GET /metrics` serves Prometheus metrics. Failed
+torrents that are fully handled are pruned automatically after `failure.error_retention`
+(default 7 days, `config.yaml`).
 
 > [!IMPORTANT]
 > Configure the Sonarr/Radarr push-back (env vars above, or the `arr:` section in
@@ -169,8 +173,9 @@ automatically after `failure.error_retention` (default 7 days, `config.yaml`).
 
 > [!TIP]
 > Finer controls — TorBox slot count, stall timeouts, the slow-download speed floor
-> (`failure.min_speed` / `failure.slow_window`), transfer idle timeout, API rate cap, poll
-> interval — live in `config.yaml` only. Mount one and pass `--config /config.yaml`; start
+> (`failure.min_speed` / `failure.slow_window`), the free-space reserve
+> (`download.min_free_space`), transfer idle timeout, API rate cap, poll interval — live in
+> `config.yaml` only. Mount one and pass `--config /config.yaml`; start
 > from [`config.example.yaml`](config.example.yaml).
 
 ## Documentation
