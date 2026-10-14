@@ -159,3 +159,51 @@ func TestUpdateTorBoxIDClearsQueuedID(t *testing.T) {
 		t.Errorf("torbox_queued_id = %v, want NULL after activation", got.TorBoxQueuedID)
 	}
 }
+
+// RequeueFailed resets only ERROR rows, clearing everything the failed attempt
+// left behind and taking the new add's source and category.
+func TestRequeueFailed(t *testing.T) {
+	ctx := context.Background()
+	st := newWritesStore(t)
+
+	failed, _, err := st.AddTorrent(ctx, AddTorrentParams{Infohash: "aa00000000000000000000000000000000000000", Name: "old", Category: "tv"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := st.MarkActive(ctx, failed.ID, 5); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.MarkError(ctx, failed.ID, "no download progress"); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.MarkArrNotified(ctx, failed.ID); err != nil {
+		t.Fatal(err)
+	}
+
+	ok, err := st.RequeueFailed(ctx, AddTorrentParams{
+		Infohash: failed.Infohash, Name: "new", Category: "tv-4k", SavePath: "/downloads/tv-4k", Magnet: "magnet:?xt=urn:btih:x",
+	})
+	if err != nil || !ok {
+		t.Fatalf("RequeueFailed = %v, %v; want true", ok, err)
+	}
+	got, _, _ := st.GetTorrent(ctx, failed.Infohash)
+	switch {
+	case got.State != StateQueued:
+		t.Errorf("state = %q, want QUEUED", got.State)
+	case got.Error != "" || got.ArrNotified:
+		t.Errorf("error = %q arr_notified = %v, want both cleared", got.Error, got.ArrNotified)
+	case got.TorBoxID.Valid || got.ActiveSince != 0:
+		t.Errorf("torbox_id = %v active_since = %d, want cleared", got.TorBoxID, got.ActiveSince)
+	case got.Name != "new" || got.Category != "tv-4k" || got.SavePath != "/downloads/tv-4k":
+		t.Errorf("name/category/save_path = %q/%q/%q, want the new add's", got.Name, got.Category, got.SavePath)
+	}
+	if magnet, _, _ := st.Source(ctx, got.ID); magnet != "magnet:?xt=urn:btih:x" {
+		t.Errorf("magnet = %q, want the new add's", magnet)
+	}
+
+	// A torrent that isn't in ERROR is left alone.
+	ok, err = st.RequeueFailed(ctx, AddTorrentParams{Infohash: failed.Infohash, Name: "again"})
+	if err != nil || ok {
+		t.Errorf("RequeueFailed on a QUEUED row = %v, %v; want false", ok, err)
+	}
+}

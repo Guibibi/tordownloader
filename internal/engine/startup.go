@@ -84,7 +84,11 @@ func (e *Engine) recoverIfComplete(ctx context.Context, t store.Torrent) {
 	}
 
 	// All files are present and correct. Mark COMPLETE so Sonarr can import.
-	cp := contentPathFromFiles(t.SavePath, t.Name, files)
+	rels := make([]string, 0, len(files))
+	for _, f := range files {
+		rels = append(rels, f.RelPath)
+	}
+	cp := contentPath(t.SavePath, rels)
 	var totalSize int64
 	for _, f := range files {
 		totalSize += f.Size
@@ -96,17 +100,4 @@ func (e *Engine) recoverIfComplete(ctx context.Context, t store.Torrent) {
 	}
 	e.log.Info("recovered: content already on disk from prior run, marked complete",
 		"infohash", t.Infohash, "content_path", cp)
-}
-
-// contentPathFromFiles computes the qBittorrent content_path from the stored
-// files list (the same logic as reconcile.go:contentPath but operating on
-// store.File instead of store.FileInput).
-func contentPathFromFiles(savePath, name string, files []store.File) string {
-	if len(files) == 1 {
-		return filepath.Join(savePath, files[0].RelPath)
-	}
-	if name != "" {
-		return filepath.Join(savePath, name)
-	}
-	return savePath
 }

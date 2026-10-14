@@ -511,7 +511,9 @@ func (w *idleWatchdog) classify(parent context.Context, err error) error {
 	if w.expired.Load() {
 		return fmt.Errorf("%w: %w for %s", errTransient, ErrIdle, w.idle)
 	}
-	return fmt.Errorf("%w: %v", errTransient, err)
+	// Wrap (not just format) the cause so callers can still recognise it — e.g.
+	// a full disk surfacing as an io.Copy write error.
+	return fmt.Errorf("%w: %w", errTransient, err)
 }
 
 // idleReader rearms the watchdog around each read, so the deadline measures

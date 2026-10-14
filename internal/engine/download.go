@@ -2,7 +2,10 @@ package engine
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"path/filepath"
+	"syscall"
 	"time"
 
 	"github.com/guibibi/tordownloader/internal/downloader"
@@ -46,6 +49,10 @@ func (e *Engine) maybeStartDownload(ctx context.Context, t store.Torrent) {
 		e.mu.Unlock()
 		return
 	}
+	if r, ok := e.localRetries[t.Infohash]; ok && time.Now().Before(r.next) {
+		e.mu.Unlock()
+		return // backing off after a failed attempt (localFailed)
+	}
 	// Cancellable sub-context so a concurrent delete can abort just this
 	// download without tearing down the rest of the engine.
 	dlCtx, cancel := context.WithCancel(ctx)
@@ -88,6 +95,17 @@ func (e *Engine) downloadOne(ctx, dlCtx context.Context, t store.Torrent) {
 			e.log.Error("mark local downloading", "infohash", t.Infohash, "err", err)
 			return
 		}
+	}
+
+	rels := make([]string, 0, len(files))
+	for _, f := range files {
+		rels = append(rels, f.RelPath)
+	}
+	// toLocalQueued already rejects these; rows recorded by an older build
+	// weren't checked, so re-check before joining onto the staging path.
+	if bad, ok := unsafeRelPath(rels); ok {
+		e.fail(ctx, t, fmt.Sprintf("unsafe file path in torrent: %q", bad))
+		return
 	}
 
 	staging := filepath.Join(t.SavePath, e.incomplete, t.Infohash)
@@ -164,7 +182,7 @@ func (e *Engine) downloadOne(ctx, dlCtx context.Context, t store.Torrent) {
 		if dlCtx.Err() != nil {
 			return // engine shutting down
 		}
-		e.fail(ctx, t, "download: "+err.Error())
+		e.localFailed(ctx, t, "download: "+err.Error(), err)
 		return
 	}
 
@@ -173,9 +191,12 @@ func (e *Engine) downloadOne(ctx, dlCtx context.Context, t store.Torrent) {
 		if ctx.Err() != nil {
 			return
 		}
-		e.fail(ctx, t, "finalize: "+err.Error())
+		e.localFailed(ctx, t, "finalize: "+err.Error(), err)
 		return
 	}
+	e.mu.Lock()
+	delete(e.localRetries, t.Infohash)
+	e.mu.Unlock()
 	if err := e.store.MarkComplete(ctx, t.ID, contentPath, totalSize); err != nil {
 		e.log.Error("mark complete", "infohash", t.Infohash, "err", err)
 		return
@@ -193,4 +214,67 @@ func (e *Engine) downloadOne(ctx, dlCtx context.Context, t store.Torrent) {
 	delCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
 	e.removeFromTorBox(delCtx, t)
 	cancel()
+}
+
+// Local retry schedule: the delay before attempt n+1 after n failures doubles
+// from localRetryBase up to localRetryMax, and the torrent is failed once
+// maxLocalAttempts attempts have failed (about 1.5h with the defaults). Vars so
+// tests can shrink them.
+var (
+	localRetryBase   = time.Minute
+	localRetryMax    = 30 * time.Minute
+	maxLocalAttempts = 8
+)
+
+// localFailed handles a failed local download (or finalize). By this point
+// TorBox has the content cached, so the failure is almost never the release's
+// fault — a CDN outage, requestdl rate limiting, a full disk — and failing the
+// torrent would make the *arr push-back blocklist a good release. So the torrent
+// keeps its LOCAL_* state and is retried with exponential backoff, resuming from
+// the bytes already on disk; only after maxLocalAttempts failed attempts is it
+// failed for real. A full or read-only disk is never the release's fault at all,
+// so those failures retry without consuming the budget. The reason is noted on
+// the row so the dashboard shows why a download is waiting.
+func (e *Engine) localFailed(ctx context.Context, t store.Torrent, reason string, cause error) {
+	diskErr := errors.Is(cause, syscall.ENOSPC) || errors.Is(cause, syscall.EROFS)
+
+	e.mu.Lock()
+	r := e.localRetries[t.Infohash]
+	if !diskErr {
+		r.attempts++
+	}
+	giveUp := r.attempts >= maxLocalAttempts
+	var wait time.Duration
+	if giveUp {
+		delete(e.localRetries, t.Infohash)
+	} else {
+		wait = localBackoff(r.attempts)
+		r.next = time.Now().Add(wait)
+		e.localRetries[t.Infohash] = r
+	}
+	e.mu.Unlock()
+
+	if giveUp {
+		e.fail(ctx, t, fmt.Sprintf("%s (after %d attempts)", reason, r.attempts))
+		return
+	}
+	e.log.Warn("local download failed; will retry",
+		"infohash", t.Infohash, "attempt", r.attempts, "max_attempts", maxLocalAttempts,
+		"retry_in", wait, "disk_error", diskErr, "err", reason)
+	note := fmt.Sprintf("retrying in %s: %s", wait.Round(time.Second), reason)
+	if err := e.store.NoteLocalRetry(ctx, t.ID, note); err != nil && ctx.Err() == nil {
+		e.log.Warn("note local retry", "infohash", t.Infohash, "err", err)
+	}
+}
+
+// localBackoff returns the wait after the given number of failed attempts.
+func localBackoff(attempts int) time.Duration {
+	d := localRetryBase
+	for i := 1; i < attempts && d < localRetryMax; i++ {
+		d *= 2
+	}
+	if d > localRetryMax {
+		d = localRetryMax
+	}
+	return d
 }

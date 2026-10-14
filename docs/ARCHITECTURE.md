@@ -150,7 +150,7 @@ torrents(
   name          TEXT,
   category      TEXT,
   save_path     TEXT,                   -- <root>/<category>
-  content_path  TEXT,                   -- save_path/name (multi-file) or save_path/file
+  content_path  TEXT,                   -- save_path/<top-level entry> (folder or file)
   size          INTEGER,
   magnet        TEXT,                   -- original magnet URI, for (re)submission to TorBox
   source_blob   BLOB,                   -- .torrent bytes when added by file (else NULL)
@@ -195,8 +195,11 @@ categories(
   `short_name` is just the basename). So a season pack lands at `<save_path>/<Show.S01>/<ep>.mkv`.
 - `content_path` is what Sonarr imports: the single top-level entry under `save_path` — the
   torrent's folder for a multi-file release, or the file itself for a single-file release. It is
-  computed from the actual content after download (`downloader.Finalize`), not guessed from the
-  name; the reconciler sets a best-effort value earlier for display.
+  computed from the actual content after download (`downloader.Finalize`); before that (and in
+  crash recovery) the same rule is applied to the files' `rel_path`s (`engine.contentPath`), never
+  to the display name, which can differ from the root folder.
+- A `rel_path` that isn't local (absolute, or escaping with `..`) fails the torrent instead of
+  being joined onto the save path — file names come from the release's metadata.
 - Download into a per-torrent staging tree `<save_path>/<incomplete_subdir>/<infohash>/...` first,
   then atomically rename each top-level entry into `save_path` once every file is complete and
   size-verified, so Sonarr never imports partial content. Staging lives under `save_path` to keep
@@ -207,7 +210,7 @@ categories(
 - Bearer token (API key) for `createtorrent`, `mylist`, `checkcached`, `controltorrent`.
 - `requestdl` takes the token as a **query parameter** and returns a time-limited CDN URL
   (valid ~3h). We download that URL directly (not via the bearer-auth client).
-- Respect rate limits: `createtorrent` 60/hour; others 300/min. Centralise backoff in the client.
+- Respect rate limits: `createtorrent` 60/hour (uncached; cached 300/min); others 300/min. Centralise backoff in the client.
 - Evaluate the official `torbox-sdk-go` vs a hand-rolled client during M1; lean hand-rolled for
   control over `requestdl` and rate-limit handling, use the SDK if it's ergonomic.
 
@@ -233,9 +236,12 @@ categories(
 | Exceeds optional absolute `timeout` cap (disabled by default) | → ERROR. |
 | TorBox rejects >200GB | → ERROR immediately. |
 | `createtorrent` rate-limited (429) | Pause submissions for a cooldown (hourly quota), stay QUEUED. |
-| TorBox queues the submission (queued id) | Shouldn't happen — we gate on real occupancy. If it does (e.g. an orphan torrent added outside the app holds a slot), cancel the queued entry via `controlqueued` and leave the torrent in our own QUEUED to retry. We never adopt TorBox's queue. |
+| `createtorrent` fails for a non-release reason (5xx, auth, `ACTIVE_LIMIT`/`MONTHLY_LIMIT`/..., see `APIError.IsTransient`) | Stay QUEUED, pause submissions for a cooldown. Never ERROR — that would blocklist a good release. |
+| `createtorrent` says `DUPLICATE_ITEM` | Adopt the existing TorBox torrent (matched by infohash in `mylist`) as TORBOX_ACTIVE. |
+| Local download or finalize fails (CDN outage, `requestdl` throttling, disk full) | Stay LOCAL_*, retry with backoff (1m doubling to 30m), resuming from disk; ERROR only after 8 failed attempts. Full/read-only disk never spends the budget. |
+| TorBox queues the submission (queued id) | Shouldn't happen — we gate on real occupancy. If it does (e.g. an orphan torrent added outside the app holds a slot), cancel the queued entry via `controlqueued` and leave the torrent in our own QUEUED to retry after a 10m submission pause (so retries don't burn the hourly quota). We never adopt TorBox's queue. |
 | Completed/failed torrent still on TorBox (missed delete: old build, crash, transient error) | Reaper deletes it on the next reconcile pass (hygiene). With seeding disabled a cached torrent is already inactive and holds no slot, so a missed delete clutters `mylist` but does **not** starve the queue. |
 | `requestdl` link expired mid-download | Re-request and resume. |
 | Container restart | Reconcile from SQLite + `mylist`; resume partial files via Range. |
-| Torrent vanished on TorBox | → ERROR, but only after a grace window and a direct id lookup confirms it's really gone (so a lagging/paged mylist doesn't kill a live torrent). |
+| Torrent vanished on TorBox | → ERROR, but only after a grace window and a direct id lookup confirms it's really gone — an empty result or TorBox's 404/`ITEM_NOT_FOUND` (so a lagging/paged mylist doesn't kill a live torrent; other lookup errors defer). |
 | Sonarr deletes mid-download | Cancel, TorBox delete, remove local files. |

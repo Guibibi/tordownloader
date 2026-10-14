@@ -185,7 +185,11 @@ func (c *Client) MyList(ctx context.Context, bypassCache bool) ([]Torrent, error
 	return out, nil
 }
 
-// GetTorrent returns a single torrent by its TorBox id.
+// GetTorrent returns a single torrent by its TorBox id. The docs say `id` makes
+// mylist return an object, but TorBox occasionally answers with a one-element
+// array instead, so both shapes are accepted; an empty array (or null data)
+// returns (nil, nil). A missing id is answered with HTTP 404 — see
+// APIError.IsNotFound.
 func (c *Client) GetTorrent(ctx context.Context, id int, bypassCache bool) (*Torrent, error) {
 	q := url.Values{}
 	q.Set("id", strconv.Itoa(id))
@@ -195,6 +199,20 @@ func (c *Client) GetTorrent(ctx context.Context, id int, bypassCache bool) (*Tor
 	env, err := c.do(ctx, http.MethodGet, "torrents/mylist", q, nil, "", true)
 	if err != nil {
 		return nil, err
+	}
+	trimmed := bytes.TrimSpace(env.Data)
+	if len(trimmed) == 0 || string(trimmed) == "null" {
+		return nil, nil
+	}
+	if trimmed[0] == '[' {
+		var list []Torrent
+		if err := unmarshalData(env, &list); err != nil {
+			return nil, err
+		}
+		if len(list) == 0 {
+			return nil, nil
+		}
+		return &list[0], nil
 	}
 	var out Torrent
 	if err := unmarshalData(env, &out); err != nil {
@@ -349,8 +367,8 @@ func (c *Client) do(ctx context.Context, method, endpoint string, query url.Valu
 		_ = resp.Body.Close()
 
 		if resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode >= 500 {
-			if attempt < c.maxRetries {
-				if werr := c.wait(ctx, retryAfter(resp.Header, backoff)); werr != nil {
+			if d, ok := retryAfter(resp.Header, backoff); ok && attempt < c.maxRetries {
+				if werr := c.wait(ctx, d); werr != nil {
 					return nil, werr
 				}
 				backoff = nextBackoff(backoff)
@@ -401,13 +419,22 @@ func nextBackoff(d time.Duration) time.Duration {
 	return next + jitter
 }
 
-func retryAfter(h http.Header, fallback time.Duration) time.Duration {
+// retryAfter returns how long to wait before retrying: the server's Retry-After
+// (in seconds) when present, else fallback. ok is false when the server asks
+// for longer than maxBackoff: then the caller should not retry in-line at all.
+// Every caller shares a goroutine with other work — an hourly createtorrent
+// quota can answer "Retry-After: 3600", and sleeping on that inside do() would
+// block the submitter (or reconciler, or a downloader) for hours. Returning the
+// 429 at once lets the caller decide; the submitter, for instance, pauses
+// submissions on its own cooldown.
+func retryAfter(h http.Header, fallback time.Duration) (d time.Duration, ok bool) {
 	if v := strings.TrimSpace(h.Get("Retry-After")); v != "" {
 		if secs, err := strconv.Atoi(v); err == nil && secs >= 0 {
-			return time.Duration(secs) * time.Second
+			d := time.Duration(secs) * time.Second
+			return d, d <= maxBackoff
 		}
 	}
-	return fallback
+	return fallback, true
 }
 
 func unmarshalData(env *Envelope, out any) error {

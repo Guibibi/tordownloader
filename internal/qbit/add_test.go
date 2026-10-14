@@ -254,3 +254,30 @@ func TestDeleteWithEngineDeleteFnAll(t *testing.T) {
 		t.Error("hash 2 not deleted")
 	}
 }
+
+// TestAddRequeuesFailedTorrent asserts re-adding a torrent that ended in ERROR
+// gives it a fresh attempt instead of an idempotent no-op that leaves it
+// failed until retention prunes it.
+func TestAddRequeuesFailedTorrent(t *testing.T) {
+	srv, st := newTestServer(t)
+	magnet := "magnet:?xt=urn:btih:" + testHash + "&dn=My.Show.S01E01"
+	add := func() {
+		t.Helper()
+		if _, body := postForm(t, srv.URL+"/api/v2/torrents/add", url.Values{
+			"urls": {magnet}, "category": {"tv-sonarr"},
+		}); strings.TrimSpace(body) != "Ok." {
+			t.Fatalf("add body = %q, want Ok.", body)
+		}
+	}
+	add()
+	tor, _, _ := st.GetTorrent(context.Background(), testHash)
+	if err := st.MarkError(context.Background(), tor.ID, "no download progress"); err != nil {
+		t.Fatal(err)
+	}
+
+	add()
+	tor, _, _ = st.GetTorrent(context.Background(), testHash)
+	if tor.State != store.StateQueued || tor.Error != "" {
+		t.Errorf("state = %q error = %q, want QUEUED with the error cleared", tor.State, tor.Error)
+	}
+}

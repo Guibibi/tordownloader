@@ -352,3 +352,44 @@ func mustWriteFile(t *testing.T, path string, size int64) {
 		t.Fatalf("write %s: %v", path, err)
 	}
 }
+
+// TestStartupReconcileContentPathFollowsRootFolder asserts crash recovery
+// derives content_path from the files' root folder, not the torrent's display
+// name (the magnet's dn), which can differ — pointing Sonarr at a folder that
+// doesn't exist.
+func TestStartupReconcileContentPathFollowsRootFolder(t *testing.T) {
+	st := newStore(t)
+	savePath := filepath.Join(t.TempDir(), "tv")
+	hash := "c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1"
+	ctx := context.Background()
+	tr, _, err := st.AddTorrent(ctx, store.AddTorrentParams{
+		Infohash: hash, Name: "Show S01 (display name)", SavePath: savePath,
+		Magnet: "magnet:?xt=urn:btih:" + hash,
+	})
+	if err != nil {
+		t.Fatalf("add: %v", err)
+	}
+	if err := st.MarkActive(ctx, tr.ID, 99); err != nil {
+		t.Fatalf("mark active: %v", err)
+	}
+	if err := st.MarkLocalQueued(ctx, tr.ID, "", 0, []store.FileInput{
+		{TorBoxFileID: 0, RelPath: "Show.S01.1080p/e01.mkv", Size: 100},
+		{TorBoxFileID: 1, RelPath: "Show.S01.1080p/e02.mkv", Size: 200},
+	}); err != nil {
+		t.Fatalf("mark local queued: %v", err)
+	}
+	mustWriteFile(t, filepath.Join(savePath, "Show.S01.1080p", "e01.mkv"), 100)
+	mustWriteFile(t, filepath.Join(savePath, "Show.S01.1080p", "e02.mkv"), 200)
+
+	e := New(st, &fakeTB{}, Config{MaxSlots: 3}, nil)
+	if err := e.startupReconcile(ctx); err != nil {
+		t.Fatalf("startupReconcile: %v", err)
+	}
+	got := getTorrent(t, st, hash)
+	if got.State != store.StateComplete {
+		t.Fatalf("state = %q, want COMPLETE", got.State)
+	}
+	if want := filepath.Join(savePath, "Show.S01.1080p"); got.ContentPath != want {
+		t.Errorf("content_path = %q, want %q (the root folder on disk)", got.ContentPath, want)
+	}
+}

@@ -546,6 +546,56 @@ func TestReconcileVanishedErrors(t *testing.T) {
 	}
 }
 
+// TestReconcileVanishConfirmedByNotFound asserts that TorBox's answer for a
+// deleted id — HTTP 404 / ITEM_NOT_FOUND on mylist?id= — confirms the torrent
+// vanished. Treating it as a flaky lookup would keep the torrent TORBOX_ACTIVE
+// forever, holding one of our slots.
+func TestReconcileVanishConfirmedByNotFound(t *testing.T) {
+	cases := map[string]*torbox.APIError{
+		"http 404":       {StatusCode: 404, Detail: "not found"},
+		"ITEM_NOT_FOUND": {StatusCode: 400, Code: "ITEM_NOT_FOUND", Detail: "not found"},
+	}
+	for name, apiErr := range cases {
+		t.Run(name, func(t *testing.T) {
+			st := newStore(t)
+			hash := "f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0"
+			seedActive(t, st, hash, 98, "/downloads/tv", 3*time.Minute)
+			tb := &fakeTB{
+				list: func() ([]torbox.Torrent, error) { return []torbox.Torrent{}, nil },
+				get:  func(int) (*torbox.Torrent, error) { return nil, apiErr },
+			}
+			e := New(st, tb, Config{MaxSlots: 3}, nil)
+			if err := e.reconcilePass(context.Background()); err != nil {
+				t.Fatalf("reconcilePass: %v", err)
+			}
+			if tr := getTorrent(t, st, hash); tr.State != store.StateError {
+				t.Errorf("state = %q, want ERROR (lookup says the id is gone)", tr.State)
+			}
+		})
+	}
+}
+
+// TestReconcileVanishLookupErrorDefers asserts that a lookup failure that is not
+// a "not found" (e.g. a 5xx) still defers, so a flaky call never costs a torrent.
+func TestReconcileVanishLookupErrorDefers(t *testing.T) {
+	st := newStore(t)
+	hash := "f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1"
+	seedActive(t, st, hash, 97, "/downloads/tv", 3*time.Minute)
+	tb := &fakeTB{
+		list: func() ([]torbox.Torrent, error) { return []torbox.Torrent{}, nil },
+		get: func(int) (*torbox.Torrent, error) {
+			return nil, &torbox.APIError{StatusCode: 503, Detail: "unavailable"}
+		},
+	}
+	e := New(st, tb, Config{MaxSlots: 3}, nil)
+	if err := e.reconcilePass(context.Background()); err != nil {
+		t.Fatalf("reconcilePass: %v", err)
+	}
+	if tr := getTorrent(t, st, hash); tr.State != store.StateTorBoxActive {
+		t.Errorf("state = %q, want still TORBOX_ACTIVE (lookup failed, not proven gone)", tr.State)
+	}
+}
+
 func TestReconcileConfirmAvoidsVanish(t *testing.T) {
 	st := newStore(t)
 	hash := "abababababababababababababababababababab"
@@ -911,6 +961,33 @@ func TestReconcileSlowIgnoresTorrentStillAtZero(t *testing.T) {
 	}
 }
 
+// TestReconcileSlowWindowSlidesEveryPassAtZero asserts the speed window keeps
+// sliding while a fetch is still at 0%, not only when a window closes. Otherwise
+// the wait before the first byte counts against the average: a fetch that found
+// peers 12m into its window and then ran at 4x the floor would average under it
+// and be failed.
+func TestReconcileSlowWindowSlidesEveryPassAtZero(t *testing.T) {
+	st := newStore(t)
+	hash := "a6a6a6a6a6a6a6a6a6a6a6a6a6a6a6a6a6a6a6a6"
+	tr := seedActive(t, st, hash, 66, "/downloads/tv", time.Hour)
+	setSpeedWindow(t, st, tr.ID, 14*time.Minute, 0) // mid-window, nothing fetched yet
+
+	tb := &fakeTB{list: func() ([]torbox.Torrent, error) {
+		return []torbox.Torrent{{
+			ID: 66, DownloadState: "metaDL", Active: true, Size: 10 << 30, Progress: 0,
+		}}, nil
+	}}
+	e := New(st, tb, slowConfig(50<<10, 15*time.Minute), nil)
+	if err := e.reconcilePass(context.Background()); err != nil {
+		t.Fatalf("reconcilePass: %v", err)
+	}
+	got := getTorrent(t, st, hash)
+	if time.Since(time.Unix(got.SpeedAt, 0)) > time.Minute {
+		t.Fatalf("speed_at = %d (%s ago), want the window slid to ~now while still at 0%%",
+			got.SpeedAt, time.Since(time.Unix(got.SpeedAt, 0)).Round(time.Second))
+	}
+}
+
 func TestReconcileSlowJudgesBytesNotReportedSpeed(t *testing.T) {
 	st := newStore(t)
 	hash := "a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5"
@@ -991,5 +1068,60 @@ func TestReconcileCachedWithProgressGetsFetchWindow(t *testing.T) {
 	}
 	if got := getTorrent(t, st, hash); got.State != store.StateTorBoxActive {
 		t.Fatalf("state = %q, want TORBOX_ACTIVE (has progress → peer-fetch window)", got.State)
+	}
+}
+
+// TestReconcileRejectsUnsafeFilePaths asserts a torrent whose file names would
+// escape the download folder ("..", absolute) is failed rather than recorded:
+// the names come from the release's own metadata and are joined onto local
+// paths.
+func TestReconcileRejectsUnsafeFilePaths(t *testing.T) {
+	for _, bad := range []string{"../../etc/cron.d/x", "show/../../x.mkv", "/etc/passwd"} {
+		t.Run(bad, func(t *testing.T) {
+			st := newStore(t)
+			hash := "a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7"
+			tr := seedActive(t, st, hash, 71, "/downloads/tv", 0)
+			tb := &fakeTB{list: func() ([]torbox.Torrent, error) {
+				return []torbox.Torrent{{
+					ID: 71, DownloadPresent: true,
+					Files: []torbox.TorrentFile{
+						{ID: 0, Name: "show/e01.mkv", Size: 1},
+						{ID: 1, Name: bad, Size: 1},
+					},
+				}}, nil
+			}}
+			e := New(st, tb, Config{MaxSlots: 3}, nil)
+			if err := e.reconcilePass(context.Background()); err != nil {
+				t.Fatalf("reconcilePass: %v", err)
+			}
+			got := getTorrent(t, st, hash)
+			if got.State != store.StateError || !strings.Contains(got.Error, "unsafe file path") {
+				t.Fatalf("state = %q error = %q, want ERROR for an unsafe path", got.State, got.Error)
+			}
+			if files, _ := st.ListFiles(context.Background(), tr.ID); len(files) != 0 {
+				t.Errorf("files recorded = %d, want 0", len(files))
+			}
+		})
+	}
+}
+
+func TestContentPath(t *testing.T) {
+	save := "/downloads/tv"
+	cases := []struct {
+		name string
+		rels []string
+		want string
+	}{
+		{"single file", []string{"movie.mkv"}, "/downloads/tv/movie.mkv"},
+		{"single file in folder", []string{"Movie/movie.mkv"}, "/downloads/tv/Movie"},
+		{"one root folder", []string{"Show.S01/e01.mkv", "Show.S01/sub/e01.srt"}, "/downloads/tv/Show.S01"},
+		{"no common root", []string{"e01.mkv", "e02.mkv"}, save},
+		{"two roots", []string{"A/e01.mkv", "B/e02.mkv"}, save},
+		{"no files", nil, save},
+	}
+	for _, tc := range cases {
+		if got := contentPath(save, tc.rels); got != tc.want {
+			t.Errorf("%s: contentPath = %q, want %q", tc.name, got, tc.want)
+		}
 	}
 }

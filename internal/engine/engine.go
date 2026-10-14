@@ -15,6 +15,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -49,6 +50,13 @@ const (
 // 429. TorBox's createtorrent quota is hourly, so a short retry loop just spams a
 // quota that won't recover for a while; this backs off without stalling forever.
 const createRateLimitCooldown = 2 * time.Minute
+
+// createQueuedCooldown is how long to pause submissions after TorBox queued one
+// (and we cancelled it). A queued result means a slot we don't track — usually a
+// torrent added outside this app — is occupied, which can last a long time.
+// Without a pause every 2s pass would re-submit, re-queue and re-cancel each
+// waiting torrent, burning the hourly createtorrent quota in about a minute.
+const createQueuedCooldown = 10 * time.Minute
 
 // arrNotifyInterval throttles per-torrent failure notifications to the *arrs:
 // while an instance is unreachable (or hasn't listed the grab yet) the row is
@@ -137,6 +145,12 @@ type Engine struct {
 	activeDownloads map[string]context.CancelFunc
 	dlWG            sync.WaitGroup
 
+	// localRetries holds, per infohash, the retry state of a torrent whose local
+	// download failed (see localFailed): how many attempts have failed and when
+	// the next may start. Guarded by mu. Entries are dropped on success, on
+	// giving up, and on delete.
+	localRetries map[string]localRetry
+
 	// slotWaitLogged remembers that we've already logged the current
 	// "all slots busy, work waiting" episode, so the message isn't repeated every
 	// submit pass. Touched only by the single submit goroutine; no lock needed.
@@ -159,6 +173,12 @@ type Engine struct {
 	// (arrNotFoundGrace). Touched only by the reconcile goroutine; pruned when a
 	// row stops needing notification.
 	arrAttempts map[int64]arrAttempt
+}
+
+// localRetry is the retry bookkeeping for one torrent's failing local download.
+type localRetry struct {
+	attempts int       // failed attempts that count toward maxLocalAttempts
+	next     time.Time // earliest time the next attempt may start
 }
 
 // arrAttempt is the retry bookkeeping for one failed torrent's *arr
@@ -244,6 +264,7 @@ func New(st *store.Store, tb TorBoxAPI, cfg Config, log *slog.Logger) *Engine {
 		cacheCheck:         cfg.CacheCheck,
 		arr:                cfg.Arr,
 		activeDownloads:    make(map[string]context.CancelFunc),
+		localRetries:       make(map[string]localRetry),
 		lastReannounce:     make(map[int64]time.Time),
 		arrAttempts:        make(map[int64]arrAttempt),
 		// No overall client timeout: a legitimate download can run for hours, so a
@@ -373,7 +394,12 @@ func (e *Engine) submit(ctx context.Context, t store.Torrent) bool {
 		return false
 	}
 
-	req := torbox.CreateTorrentRequest{Name: t.Name}
+	// Never seed. The slot model depends on it: a torrent holds one of the
+	// account's few active slots only while caching *or seeding*, so a seeding
+	// torrent would keep its slot after it finishes while our gate (which counts
+	// only TORBOX_ACTIVE rows) thinks it's free. Sent explicitly rather than
+	// trusting the account setting, which can change under us.
+	req := torbox.CreateTorrentRequest{Name: t.Name, Seed: torbox.SeedNever}
 	switch {
 	case magnet != "":
 		req.Magnet = magnet
@@ -398,7 +424,8 @@ func (e *Engine) submit(ctx context.Context, t store.Torrent) bool {
 	if err != nil {
 		var apiErr *torbox.APIError
 		if errors.As(err, &apiErr) {
-			if apiErr.StatusCode == 429 {
+			switch {
+			case apiErr.StatusCode == 429:
 				// Rate limited even after the client's own backoff. The createtorrent
 				// quota is hourly, so pause submissions for a cooldown instead of
 				// hammering it every pass. Stays QUEUED.
@@ -406,8 +433,23 @@ func (e *Engine) submit(ctx context.Context, t store.Torrent) bool {
 				e.log.Warn("createtorrent rate limited; pausing submissions",
 					"infohash", t.Infohash, "cooldown", createRateLimitCooldown)
 				return false
+			case apiErr.IsDuplicate():
+				// Already on the account — typically a create whose response we lost
+				// (network blip after TorBox accepted it). Track the existing torrent
+				// instead of failing a perfectly good release.
+				return e.adoptExisting(ctx, t, cached)
+			case apiErr.IsTransient():
+				// An outage, auth problem or account limit says nothing about this
+				// release. Failing it would push a blocklist to Sonarr/Radarr — for
+				// every queued torrent at once during an outage or with an expired
+				// key — so stay QUEUED and pause submissions instead.
+				e.createCooldownUntil = time.Now().Add(createRateLimitCooldown)
+				e.log.Warn("createtorrent rejected for a non-release reason; staying queued and pausing submissions",
+					"infohash", t.Infohash, "err", apiErr, "cooldown", createRateLimitCooldown)
+				return false
 			}
-			// Any other TorBox rejection (too large, bad magnet, ...) is terminal.
+			// A verdict on the release itself (too large, malformed torrent, ...) is
+			// terminal.
 			e.fail(ctx, t, apiErr.Error())
 			return true
 		}
@@ -441,13 +483,43 @@ func (e *Engine) submit(ctx context.Context, t store.Torrent) bool {
 				"infohash", t.Infohash, "queued_id", *res.QueuedID, "err", err)
 		}
 		cancel()
+		// Pause before trying again: the untracked slot holder won't clear in 2s,
+		// and each retry spends createtorrent quota.
+		e.createCooldownUntil = time.Now().Add(createQueuedCooldown)
 		e.log.Info("TorBox queued the submission (account full); cancelled, will retry from our queue",
-			"infohash", t.Infohash, "queued_id", *res.QueuedID, "name", t.Name)
+			"infohash", t.Infohash, "queued_id", *res.QueuedID, "name", t.Name, "cooldown", createQueuedCooldown)
 		return false
 	default:
 		e.fail(ctx, t, "createtorrent returned no torrent id")
 		return true
 	}
+}
+
+// adoptExisting handles a createtorrent rejected as DUPLICATE_ITEM: the torrent
+// is already on the account, so find it by infohash and track it as active. If
+// it can't be found (or mylist fails) the torrent stays QUEUED behind a short
+// cooldown; it is never failed, since a duplicate says nothing bad about the
+// release. Returns true when the torrent left QUEUED.
+func (e *Engine) adoptExisting(ctx context.Context, t store.Torrent, cached bool) bool {
+	list, err := e.torbox.MyList(ctx, true)
+	if err == nil {
+		for _, tb := range list {
+			if tb.ID != 0 && strings.EqualFold(tb.Hash, t.Infohash) {
+				if err := e.store.MarkActive(ctx, t.ID, tb.ID); err != nil {
+					e.log.Error("mark active", "infohash", t.Infohash, "err", err)
+					return false
+				}
+				e.recordCacheHit(ctx, t, cached)
+				e.log.Info("already on TorBox; adopted existing torrent",
+					"infohash", t.Infohash, "torbox_id", tb.ID, "name", t.Name)
+				return true
+			}
+		}
+	}
+	e.createCooldownUntil = time.Now().Add(createRateLimitCooldown)
+	e.log.Warn("TorBox reports a duplicate but it isn't in mylist; staying queued",
+		"infohash", t.Infohash, "err", err, "cooldown", createRateLimitCooldown)
+	return false
 }
 
 // recordCacheHit persists whether TorBox already had the content at submit time,
@@ -545,6 +617,7 @@ func (e *Engine) DeleteTorrent(ctx context.Context, infohash string, deleteFiles
 	if cancel, ok := e.activeDownloads[infohash]; ok {
 		cancel()
 	}
+	delete(e.localRetries, infohash)
 	e.mu.Unlock()
 
 	// Detach the cleanup from the caller's request context. Once Sonarr asks to

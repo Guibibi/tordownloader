@@ -34,7 +34,7 @@ All under `/api/v2`. Methods accept GET and/or POST as qBittorrent does. No auth
 ### Torrents — write
 | Endpoint | Params | Behavior |
 |---|---|---|
-| `POST /torrents/add` | `urls` (newline-separated magnet/http), multipart `torrents` file(s), `category`, `paused` | Create torrents; return `Ok.` Extract infohash, persist, enqueue. Idempotent on infohash. |
+| `POST /torrents/add` | `urls` (newline-separated magnet/http), multipart `torrents` file(s), `category`, `paused` | Create torrents; return `Ok.` Extract infohash, persist, enqueue. Idempotent on infohash, except that re-adding a torrent in ERROR re-queues it for a fresh attempt. |
 | `POST /torrents/delete` | `hashes` (pipe-separated or `all`), `deleteFiles` | Cancel, TorBox-delete, remove local files, drop DB rows. |
 | `POST /torrents/pause` / `resume` / `setForceStart` / `topPrio` | `hashes` | Mostly stubs returning 200 (no real pause concept on debrid). `topPrio` may bump queue order. |
 | `POST /torrents/setShareLimits` | — | Stub 200. |
@@ -76,6 +76,7 @@ Fields Sonarr/Radarr actually read — populate all of these:
 | `completion_on` | unix ts when COMPLETE (else 0) |
 | `added_on` | unix ts when added |
 | `ratio`, `seeding_time` | 0 (no seeding on our side) |
+| `ratio_limit` | always `0` — lets Sonarr/Radarr's "Remove Completed" remove a finished download (it requires a reached seed limit; absent = -2 "use global", and we report no global limit) |
 
 ## 3. State mapping (TorBox + local → qBittorrent `state`)
 
@@ -89,7 +90,7 @@ done/seeding → importable. So COMPLETE must report an "UP" state (`pausedUP`).
 | TORBOX_ACTIVE | TorBox fetching, no seeds | `stalledDL` | downloading |
 | LOCAL_QUEUED / LOCAL_DOWNLOAD | pulling files to disk | `downloading` | downloading |
 | COMPLETE | all files on disk | `pausedUP` | **done → import** |
-| ERROR | stall (no progress) / too slow to finish / TorBox fail / >200GB / dl fail | `error` | warning only — see below |
+| ERROR | stall (no progress) / too slow to finish / TorBox rejects the release (>200GB, malformed) / vanished / local download failing after its retry budget | `error` | warning only — see below |
 
 > **Sonarr never fails a qBittorrent download.** Every qBittorrent state maps to
 > at most a *Warning* in Sonarr — its `error` case is literally commented
@@ -141,11 +142,11 @@ done/seeding → importable. So COMPLETE must report an "UP" state (`pausedUP`).
 ## 4. TorBox API — endpoints we consume
 
 Base `https://api.torbox.app`, version `v1`. Bearer token (API key) unless noted.
-Rate limits: most 300/min; **`createtorrent` 60/hour**.
+Rate limits: most 300/min; **`createtorrent` 60/hour for uncached** releases (cached: 300/min).
 
 | Endpoint | Method | Use |
 |---|---|---|
-| `/v1/api/torrents/createtorrent` | POST (multipart) | Submit a release. Params: `magnet` **or** `file`, `seed`, `allow_zip`, `name`, `as_queued`. Returns `data.torrent_id` (+ `hash`). ⚠️ Response shape **not yet verified** (read-only M1 run did no writes). |
+| `/v1/api/torrents/createtorrent` | POST (multipart) | Submit a release. Params: `magnet` **or** `file`, `seed` (1 auto, 2 seed, 3 don't seed — **we always send 3**), `allow_zip`, `name`, `as_queued`. Returns `data.torrent_id` (+ `hash`). ⚠️ Response shape **not yet verified** (read-only M1 run did no writes). |
 | `/v1/api/torrents/checkcached` | GET | Cached availability. `hash` (comma list, ~100 max), `format=object`, `list_files`. **Verified 2026-06-14:** `data` is an object keyed by infohash → `{name, size, hash}` (empty array when none cached). |
 | `/v1/api/torrents/mylist` | GET | List/poll torrents. Params: `bypass_cache`, `id`, `offset`, `limit` (default 1000). Returns torrent objects (see §5). **Verified 2026-06-14.** |
 | `/v1/api/torrents/requestdl` | GET | Get a time-limited CDN download URL. Params: `token` (API key, as query param), `torrent_id`, `file_id`, `zip_link`, `user_ip`, `redirect`. Link valid ~3h. **Per-file**: one call per `file_id`. **Verified 2026-06-14:** `data` is a plain string URL like `https://<store>.tb-cdn.io/dld/<uuid>?token=<key>`. |
