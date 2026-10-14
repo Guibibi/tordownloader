@@ -367,8 +367,8 @@ func (c *Client) do(ctx context.Context, method, endpoint string, query url.Valu
 		_ = resp.Body.Close()
 
 		if resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode >= 500 {
-			if attempt < c.maxRetries {
-				if werr := c.wait(ctx, retryAfter(resp.Header, backoff)); werr != nil {
+			if d, ok := retryAfter(resp.Header, backoff); ok && attempt < c.maxRetries {
+				if werr := c.wait(ctx, d); werr != nil {
 					return nil, werr
 				}
 				backoff = nextBackoff(backoff)
@@ -419,13 +419,22 @@ func nextBackoff(d time.Duration) time.Duration {
 	return next + jitter
 }
 
-func retryAfter(h http.Header, fallback time.Duration) time.Duration {
+// retryAfter returns how long to wait before retrying: the server's Retry-After
+// (in seconds) when present, else fallback. ok is false when the server asks
+// for longer than maxBackoff: then the caller should not retry in-line at all.
+// Every caller shares a goroutine with other work — an hourly createtorrent
+// quota can answer "Retry-After: 3600", and sleeping on that inside do() would
+// block the submitter (or reconciler, or a downloader) for hours. Returning the
+// 429 at once lets the caller decide; the submitter, for instance, pauses
+// submissions on its own cooldown.
+func retryAfter(h http.Header, fallback time.Duration) (d time.Duration, ok bool) {
 	if v := strings.TrimSpace(h.Get("Retry-After")); v != "" {
 		if secs, err := strconv.Atoi(v); err == nil && secs >= 0 {
-			return time.Duration(secs) * time.Second
+			d := time.Duration(secs) * time.Second
+			return d, d <= maxBackoff
 		}
 	}
-	return fallback
+	return fallback, true
 }
 
 func unmarshalData(env *Envelope, out any) error {

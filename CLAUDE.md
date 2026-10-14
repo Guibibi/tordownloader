@@ -27,8 +27,8 @@ headless, download-to-disk. Runs as one Docker container on the user's **Unraid*
   account's concurrent slots **only while `active`** — downloading/caching, or
   *seeding*. A **cached** torrent that isn't seeding is **inactive** and holds **no
   slot** (`mylist` says so directly: `active: bool`, `download_state: "cached"`). We
-  run with **seeding disabled** (TorBox account setting; `createtorrent` sends no
-  `seed`, so the account default applies), so a torrent goes inactive the instant it
+  run with **seeding disabled** — `createtorrent` sends `seed=3` ("don't seed") explicitly
+  rather than trusting the account setting — so a torrent goes inactive the instant it
   finishes caching and **frees its slot automatically**. It does *not* "seed forever"
   or pin a slot until deleted — earlier docs claimed that and were wrong.
 - Still delete from TorBox on COMPLETE, and still run the **reaper** (reconcile loop +
@@ -160,6 +160,18 @@ headless, download-to-disk. Runs as one Docker container on the user's **Unraid*
   restart resets the budget). Full/read-only disk
   (`ENOSPC`/`EROFS`) retries without spending the budget. The retry reason shows in the `error`
   column (dashboard) and is cleared on COMPLETE.
+- File paths come from the release's own metadata and are joined onto local paths, so any
+  that isn't `filepath.IsLocal` (absolute, or escaping with `..`) fails the torrent — checked
+  when files are recorded and again before downloading (rows from older builds).
+- `content_path` is always derived from the files' top-level entries, mirroring
+  `downloader.Finalize` (one entry → that entry; otherwise the save path) — never from the
+  torrent's display name, which can differ from its root folder.
+- Re-adding an infohash that is in ERROR re-queues it (`store.RequeueFailed`: refs, progress,
+  clocks, error and `arr_notified` reset; new source/category taken). Any other re-add is an
+  idempotent no-op.
+- The TorBox client retries 429/5xx in-line only for waits up to 30s. A longer `Retry-After`
+  (e.g. 3600 from the hourly createtorrent quota) returns the 429 immediately so the caller's
+  own cooldown applies — sleeping on it blocked a whole worker goroutine for hours.
 - Every torrent reports `ratio_limit: 0`. Sonarr/Radarr's "Remove Completed" only removes a
   download that is paused **and** has hit a seed limit; without the field (→ -2, "use global")
   and with no global limit in `app/preferences`, they never remove anything and `/downloads`

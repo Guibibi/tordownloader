@@ -366,3 +366,40 @@ func TestDownloadPassParallelTorrents(t *testing.T) {
 		t.Fatalf("complete after second wave = %d, want 4", n)
 	}
 }
+
+// TestDownloadRejectsUnsafePathFromOldRow asserts the downloader re-checks file
+// paths before joining them onto the staging dir: rows recorded by an older
+// build were never validated, and "../" would write outside it.
+func TestDownloadRejectsUnsafePathFromOldRow(t *testing.T) {
+	var hits atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits.Add(1)
+		_, _ = w.Write([]byte("x"))
+	}))
+	defer srv.Close()
+
+	st := newStore(t)
+	root := t.TempDir()
+	save := filepath.Join(root, "tv")
+	hash := "c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2"
+	seedLocalQueued(t, st, hash, save, []store.FileInput{
+		{TorBoxFileID: 0, RelPath: "../../../escaped.mkv", Size: 1},
+	})
+	tb := &fakeTB{dl: func(torbox.RequestDLParams) (string, error) { return srv.URL, nil }}
+	e := New(st, tb, Config{ParallelFiles: 1, IncompleteSubdir: ".incomplete"}, nil)
+	if err := e.downloadPass(context.Background()); err != nil {
+		t.Fatalf("downloadPass: %v", err)
+	}
+	e.dlWG.Wait()
+
+	tr, _, _ := st.GetTorrent(context.Background(), hash)
+	if tr.State != store.StateError || !strings.Contains(tr.Error, "unsafe file path") {
+		t.Fatalf("state = %q error = %q, want ERROR for an unsafe path", tr.State, tr.Error)
+	}
+	if hits.Load() != 0 {
+		t.Errorf("CDN hits = %d, want 0 (nothing fetched)", hits.Load())
+	}
+	if _, err := os.Stat(filepath.Join(root, "escaped.mkv")); !os.IsNotExist(err) {
+		t.Errorf("file written outside the download dir (stat err = %v)", err)
+	}
+}

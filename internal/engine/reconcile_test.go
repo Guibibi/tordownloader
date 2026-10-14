@@ -1070,3 +1070,58 @@ func TestReconcileCachedWithProgressGetsFetchWindow(t *testing.T) {
 		t.Fatalf("state = %q, want TORBOX_ACTIVE (has progress → peer-fetch window)", got.State)
 	}
 }
+
+// TestReconcileRejectsUnsafeFilePaths asserts a torrent whose file names would
+// escape the download folder ("..", absolute) is failed rather than recorded:
+// the names come from the release's own metadata and are joined onto local
+// paths.
+func TestReconcileRejectsUnsafeFilePaths(t *testing.T) {
+	for _, bad := range []string{"../../etc/cron.d/x", "show/../../x.mkv", "/etc/passwd"} {
+		t.Run(bad, func(t *testing.T) {
+			st := newStore(t)
+			hash := "a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7"
+			tr := seedActive(t, st, hash, 71, "/downloads/tv", 0)
+			tb := &fakeTB{list: func() ([]torbox.Torrent, error) {
+				return []torbox.Torrent{{
+					ID: 71, DownloadPresent: true,
+					Files: []torbox.TorrentFile{
+						{ID: 0, Name: "show/e01.mkv", Size: 1},
+						{ID: 1, Name: bad, Size: 1},
+					},
+				}}, nil
+			}}
+			e := New(st, tb, Config{MaxSlots: 3}, nil)
+			if err := e.reconcilePass(context.Background()); err != nil {
+				t.Fatalf("reconcilePass: %v", err)
+			}
+			got := getTorrent(t, st, hash)
+			if got.State != store.StateError || !strings.Contains(got.Error, "unsafe file path") {
+				t.Fatalf("state = %q error = %q, want ERROR for an unsafe path", got.State, got.Error)
+			}
+			if files, _ := st.ListFiles(context.Background(), tr.ID); len(files) != 0 {
+				t.Errorf("files recorded = %d, want 0", len(files))
+			}
+		})
+	}
+}
+
+func TestContentPath(t *testing.T) {
+	save := "/downloads/tv"
+	cases := []struct {
+		name string
+		rels []string
+		want string
+	}{
+		{"single file", []string{"movie.mkv"}, "/downloads/tv/movie.mkv"},
+		{"single file in folder", []string{"Movie/movie.mkv"}, "/downloads/tv/Movie"},
+		{"one root folder", []string{"Show.S01/e01.mkv", "Show.S01/sub/e01.srt"}, "/downloads/tv/Show.S01"},
+		{"no common root", []string{"e01.mkv", "e02.mkv"}, save},
+		{"two roots", []string{"A/e01.mkv", "B/e02.mkv"}, save},
+		{"no files", nil, save},
+	}
+	for _, tc := range cases {
+		if got := contentPath(save, tc.rels); got != tc.want {
+			t.Errorf("%s: contentPath = %q, want %q", tc.name, got, tc.want)
+		}
+	}
+}

@@ -394,7 +394,12 @@ func (e *Engine) submit(ctx context.Context, t store.Torrent) bool {
 		return false
 	}
 
-	req := torbox.CreateTorrentRequest{Name: t.Name}
+	// Never seed. The slot model depends on it: a torrent holds one of the
+	// account's few active slots only while caching *or seeding*, so a seeding
+	// torrent would keep its slot after it finishes while our gate (which counts
+	// only TORBOX_ACTIVE rows) thinks it's free. Sent explicitly rather than
+	// trusting the account setting, which can change under us.
+	req := torbox.CreateTorrentRequest{Name: t.Name, Seed: torbox.SeedNever}
 	switch {
 	case magnet != "":
 		req.Magnet = magnet

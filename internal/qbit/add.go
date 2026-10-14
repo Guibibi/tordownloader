@@ -114,19 +114,34 @@ func (h *Handler) metaFromURL(ctx context.Context, u string) (torrentmeta.Meta, 
 }
 
 // persist writes a QUEUED torrent row. Returns true on success or when the
-// torrent is already tracked (idempotent re-grab).
+// torrent is already tracked (idempotent re-grab). Re-adding a torrent that
+// failed re-queues it, so a deliberate re-grab gets a fresh attempt instead of
+// silently staying in ERROR.
 func (h *Handler) persist(ctx context.Context, meta torrentmeta.Meta, src source, category, savePath string) bool {
-	t, created, err := h.store.AddTorrent(ctx, store.AddTorrentParams{
+	params := store.AddTorrentParams{
 		Infohash:   meta.InfoHash,
 		Name:       meta.Name,
 		Category:   category,
 		SavePath:   savePath,
 		Magnet:     src.magnet,
 		SourceBlob: src.blob,
-	})
+	}
+	t, created, err := h.store.AddTorrent(ctx, params)
 	if err != nil {
 		h.log.Error("add: persist", "infohash", meta.InfoHash, "err", err)
 		return false
+	}
+	if !created && t.State == store.StateError {
+		requeued, err := h.store.RequeueFailed(ctx, params)
+		if err != nil {
+			h.log.Error("add: requeue failed torrent", "infohash", t.Infohash, "err", err)
+			return false
+		}
+		if requeued {
+			h.log.Info("failed torrent added again; re-queued", "infohash", t.Infohash,
+				"name", t.Name, "previous_error", t.Error)
+			return true
+		}
 	}
 	if created {
 		h.log.Info("torrent accepted", "infohash", t.Infohash, "name", t.Name, "category", category)

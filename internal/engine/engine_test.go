@@ -527,6 +527,26 @@ func TestSubmitPassesMagnet(t *testing.T) {
 	}
 }
 
+// TestSubmitDisablesSeeding asserts createtorrent always asks TorBox not to
+// seed: a seeding torrent keeps its slot after it finishes, which our slot gate
+// (counting only TORBOX_ACTIVE rows) would not see.
+func TestSubmitDisablesSeeding(t *testing.T) {
+	st := newStore(t)
+	seedQueued(t, st, 1)
+	var gotSeed int
+	tb := &fakeTB{fn: func(r torbox.CreateTorrentRequest) (*torbox.CreateTorrentResult, error) {
+		gotSeed = r.Seed
+		return okResult(1)
+	}}
+	e := New(st, tb, Config{MaxSlots: 3}, nil)
+	if err := e.submitPass(context.Background()); err != nil {
+		t.Fatalf("submitPass: %v", err)
+	}
+	if gotSeed != torbox.SeedNever {
+		t.Errorf("seed = %d, want %d (never seed)", gotSeed, torbox.SeedNever)
+	}
+}
+
 func TestSubmitCacheCheckIsInformationalOnly(t *testing.T) {
 	// With cache_check enabled and the release reported as NOT cached, submission
 	// must still proceed — the cache check only logs, it never gates.

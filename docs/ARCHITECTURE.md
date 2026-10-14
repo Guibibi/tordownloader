@@ -150,7 +150,7 @@ torrents(
   name          TEXT,
   category      TEXT,
   save_path     TEXT,                   -- <root>/<category>
-  content_path  TEXT,                   -- save_path/name (multi-file) or save_path/file
+  content_path  TEXT,                   -- save_path/<top-level entry> (folder or file)
   size          INTEGER,
   magnet        TEXT,                   -- original magnet URI, for (re)submission to TorBox
   source_blob   BLOB,                   -- .torrent bytes when added by file (else NULL)
@@ -195,8 +195,11 @@ categories(
   `short_name` is just the basename). So a season pack lands at `<save_path>/<Show.S01>/<ep>.mkv`.
 - `content_path` is what Sonarr imports: the single top-level entry under `save_path` — the
   torrent's folder for a multi-file release, or the file itself for a single-file release. It is
-  computed from the actual content after download (`downloader.Finalize`), not guessed from the
-  name; the reconciler sets a best-effort value earlier for display.
+  computed from the actual content after download (`downloader.Finalize`); before that (and in
+  crash recovery) the same rule is applied to the files' `rel_path`s (`engine.contentPath`), never
+  to the display name, which can differ from the root folder.
+- A `rel_path` that isn't local (absolute, or escaping with `..`) fails the torrent instead of
+  being joined onto the save path — file names come from the release's metadata.
 - Download into a per-torrent staging tree `<save_path>/<incomplete_subdir>/<infohash>/...` first,
   then atomically rename each top-level entry into `save_path` once every file is complete and
   size-verified, so Sonarr never imports partial content. Staging lives under `save_path` to keep

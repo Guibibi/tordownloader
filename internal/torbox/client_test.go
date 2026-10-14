@@ -361,3 +361,45 @@ func TestAPIErrorIsNotFound(t *testing.T) {
 		}
 	}
 }
+
+// TestLongRetryAfterIsNotSleptOn asserts a Retry-After beyond maxBackoff (an
+// hourly quota answering "3600") returns the 429 at once instead of blocking
+// the calling goroutine for hours across retries.
+func TestLongRetryAfterIsNotSleptOn(t *testing.T) {
+	var calls atomic.Int32
+	c := newClient(t, func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		w.Header().Set("Retry-After", "3600")
+		w.WriteHeader(http.StatusTooManyRequests)
+		_, _ = w.Write([]byte(`{"success":false,"error":"RATE_LIMIT","detail":"hourly limit"}`))
+	})
+	start := time.Now()
+	_, err := c.MyList(context.Background(), false)
+	if elapsed := time.Since(start); elapsed > 5*time.Second {
+		t.Fatalf("took %v, want an immediate return", elapsed)
+	}
+	apiErr, ok := err.(*APIError)
+	if !ok || apiErr.StatusCode != http.StatusTooManyRequests {
+		t.Fatalf("err = %v, want a 429 APIError", err)
+	}
+	if got := calls.Load(); got != 1 {
+		t.Errorf("server calls = %d, want 1 (no in-line retry)", got)
+	}
+}
+
+func TestCreateTorrentSendsSeed(t *testing.T) {
+	c := newClient(t, func(w http.ResponseWriter, r *http.Request) {
+		if err := r.ParseMultipartForm(1 << 20); err != nil {
+			t.Fatalf("parse multipart: %v", err)
+		}
+		if got := r.FormValue("seed"); got != "3" {
+			t.Errorf("seed = %q, want 3 (don't seed)", got)
+		}
+		_, _ = w.Write([]byte(`{"success":true,"error":false,"data":{"torrent_id":1}}`))
+	})
+	if _, err := c.CreateTorrent(context.Background(), CreateTorrentRequest{
+		Magnet: "magnet:?xt=urn:btih:abc", Seed: SeedNever,
+	}); err != nil {
+		t.Fatalf("CreateTorrent: %v", err)
+	}
+}

@@ -97,6 +97,17 @@ func (e *Engine) downloadOne(ctx, dlCtx context.Context, t store.Torrent) {
 		}
 	}
 
+	rels := make([]string, 0, len(files))
+	for _, f := range files {
+		rels = append(rels, f.RelPath)
+	}
+	// toLocalQueued already rejects these; rows recorded by an older build
+	// weren't checked, so re-check before joining onto the staging path.
+	if bad, ok := unsafeRelPath(rels); ok {
+		e.fail(ctx, t, fmt.Sprintf("unsafe file path in torrent: %q", bad))
+		return
+	}
+
 	staging := filepath.Join(t.SavePath, e.incomplete, t.Infohash)
 	var totalSize int64
 	jobs := make([]downloader.File, 0, len(files))

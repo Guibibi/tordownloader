@@ -569,23 +569,32 @@ func (e *Engine) confirmPresent(ctx context.Context, t store.Torrent) bool {
 }
 
 // toLocalQueued records the TorBox file list and moves the torrent to
-// LOCAL_QUEUED for the downloader to pick up.
+// LOCAL_QUEUED for the downloader to pick up. A torrent with a file path that
+// would escape its folder (absolute, or climbing out with "..") is failed
+// instead: file names come from the torrent's own metadata, i.e. from whoever
+// made the release, and are joined onto local paths.
 func (e *Engine) toLocalQueued(ctx context.Context, t store.Torrent, tb torbox.Torrent) {
 	files := make([]store.FileInput, 0, len(tb.Files))
+	rels := make([]string, 0, len(tb.Files))
 	for _, f := range tb.Files {
+		rel := firstNonEmpty(f.Name, f.ShortName)
 		files = append(files, store.FileInput{
 			TorBoxFileID: f.ID,
-			RelPath:      firstNonEmpty(f.Name, f.ShortName),
+			RelPath:      rel,
 			ShortName:    f.ShortName,
 			Size:         f.Size,
 		})
+		rels = append(rels, rel)
 	}
-	name := firstNonEmpty(t.Name, tb.Name)
+	if bad, ok := unsafeRelPath(rels); ok {
+		e.fail(ctx, t, fmt.Sprintf("unsafe file path in torrent: %q", bad))
+		return
+	}
 	size := t.Size
 	if size == 0 {
 		size = tb.Size
 	}
-	cp := contentPath(t.SavePath, name, files)
+	cp := contentPath(t.SavePath, rels)
 	if err := e.store.MarkLocalQueued(ctx, t.ID, cp, size, files); err != nil {
 		e.log.Error("mark local queued", "infohash", t.Infohash, "err", err)
 		return
@@ -594,17 +603,39 @@ func (e *Engine) toLocalQueued(ctx context.Context, t store.Torrent, tb torbox.T
 		"infohash", t.Infohash, "torbox_id", tb.ID, "files", len(files))
 }
 
-// contentPath computes the qBittorrent content_path: the file itself for a
-// single-file torrent, otherwise the torrent's folder under the save path
-// (docs/ARCHITECTURE.md §6).
-func contentPath(savePath, name string, files []store.FileInput) string {
-	if len(files) == 1 {
-		return filepath.Join(savePath, files[0].RelPath)
+// unsafeRelPath returns the first path that is not a plain relative path inside
+// its parent — empty, absolute, or escaping with ".." — so it can never be
+// joined onto the staging or save path and land outside it.
+func unsafeRelPath(rels []string) (string, bool) {
+	for _, r := range rels {
+		if !filepath.IsLocal(r) {
+			return r, true
+		}
 	}
-	if name != "" {
-		return filepath.Join(savePath, name)
+	return "", false
+}
+
+// contentPath computes the qBittorrent content_path the way downloader.Finalize
+// lays the content out: every top-level entry of the torrent is moved into the
+// save path, so a torrent with a single top-level entry — one file, or one root
+// folder — has that entry as its content path, and anything else is the save
+// path itself. It is derived from the file paths, never from the torrent's
+// display name, which can differ from its root folder (docs/ARCHITECTURE.md §6).
+func contentPath(savePath string, rels []string) string {
+	top := ""
+	for _, r := range rels {
+		first, _, _ := strings.Cut(filepath.ToSlash(filepath.Clean(r)), "/")
+		switch {
+		case top == "":
+			top = first
+		case first != top:
+			return savePath
+		}
 	}
-	return savePath
+	if top == "" {
+		return savePath
+	}
+	return filepath.Join(savePath, top)
 }
 
 func firstNonEmpty(a, b string) string {

@@ -48,6 +48,53 @@ func (s *Store) AddTorrent(ctx context.Context, p AddTorrentParams) (Torrent, bo
 	return t, affected > 0, nil
 }
 
+// RequeueFailed resets an ERROR torrent to QUEUED when the same infohash is
+// added again — a deliberate re-grab, e.g. from an *arr's interactive search
+// after the failure was never pushed back, or after the cause was fixed.
+// Without it the add is an idempotent no-op and the release stays failed until
+// retention prunes it. The row takes the new add's source, category, save path
+// and (when given) name; TorBox refs, progress, clocks, the error, the *arr
+// notification flag and the file list are all cleared, so it goes through
+// submission as if new (partial files under the staging dir are kept and
+// resumed). Only ERROR rows are touched; the bool reports whether one was.
+func (s *Store) RequeueFailed(ctx context.Context, p AddTorrentParams) (bool, error) {
+	infohash := strings.ToLower(p.Infohash)
+	now := time.Now().Unix()
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return false, fmt.Errorf("requeue %s: begin: %w", infohash, err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	res, err := tx.ExecContext(ctx, `
+		UPDATE torrents SET
+			state = ?, error = '', arr_notified = 0,
+			torbox_id = NULL, torbox_queued_id = NULL,
+			name = CASE WHEN ? <> '' THEN ? ELSE name END,
+			category = ?, save_path = ?, magnet = ?, source_blob = ?,
+			content_path = '', torbox_state = '', torbox_progress = 0, local_progress = 0,
+			dlspeed = 0, seeds = 0, peers = 0, eta = 0, cached = 0,
+			active_since = 0, progress_at = 0, speed_at = 0, speed_bytes = 0, completed_on = 0,
+			added_on = ?, updated_at = ?
+		WHERE infohash = ? AND state = ?`,
+		StateQueued, p.Name, p.Name, p.Category, p.SavePath, p.Magnet, blobOrNil(p.SourceBlob),
+		now, now, infohash, StateError)
+	if err != nil {
+		return false, fmt.Errorf("requeue %s: %w", infohash, err)
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return false, nil
+	}
+	if _, err := tx.ExecContext(ctx,
+		`DELETE FROM files WHERE torrent_id = (SELECT id FROM torrents WHERE infohash = ?)`, infohash); err != nil {
+		return false, fmt.Errorf("requeue %s: clear files: %w", infohash, err)
+	}
+	if err := tx.Commit(); err != nil {
+		return false, fmt.Errorf("requeue %s: commit: %w", infohash, err)
+	}
+	return true, nil
+}
+
 // Source returns the submission source for a torrent: its magnet (preferred) and
 // the .torrent bytes, if any. Used by the engine submitter.
 func (s *Store) Source(ctx context.Context, id int64) (magnet string, blob []byte, err error) {

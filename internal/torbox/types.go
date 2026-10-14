@@ -100,6 +100,13 @@ func (e *APIError) IsTransient() bool {
 	return transientCodes[e.Code]
 }
 
+// Seeding preferences for CreateTorrentRequest.Seed (TorBox's `seed` field).
+const (
+	SeedAuto   = 1 // follow the account setting
+	SeedAlways = 2
+	SeedNever  = 3
+)
+
 // Operation is a torrent control operation for /torrents/controltorrent.
 type Operation string
 
@@ -152,7 +159,7 @@ type CreateTorrentRequest struct {
 	File     []byte
 	FileName string
 	Name     string
-	Seed     int   // seeding preference; 0 = omit (use TorBox default)
+	Seed     int   // SeedAuto/SeedAlways/SeedNever; 0 = omit (account default)
 	AllowZip *bool // nil = omit
 	AsQueued bool
 }
