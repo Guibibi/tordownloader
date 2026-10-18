@@ -1,0 +1,58 @@
+name: Release
+
+# Creates (or updates) the GitHub Release for a version tag. The body is
+# docs/releases/<tag>.md when that file exists, otherwise the tag's section of
+# CHANGELOG.md. Docker images are published separately by docker-publish.yml.
+#
+# Run it by hand (Actions → Release → Run workflow) to publish a release for a
+# tag that already exists.
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Existing tag to publish a release for (e.g. v0.14.0)'
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    env:
+      TAG: ${{ inputs.tag || github.ref_name }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      # The triggering ref: the tag itself on a tag push, the chosen branch
+      # (usually main) on a manual run, so notes added after an older tag was
+      # cut are still found.
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Build release notes
+        run: |
+          if [ -f "docs/releases/${TAG}.md" ]; then
+            cp "docs/releases/${TAG}.md" notes.md
+          else
+            # The "## [x.y.z]" section of CHANGELOG.md, up to the next "## [".
+            version="${TAG#v}"
+            awk -v v="$version" '
+              index($0, "## [" v "]") == 1 { on = 1; next }
+              on && /^## \[/ { exit }
+              on { print }
+            ' CHANGELOG.md > notes.md
+          fi
+          if [ ! -s notes.md ]; then
+            echo "No release notes for ${TAG}: add docs/releases/${TAG}.md or a CHANGELOG.md section." >&2
+            exit 1
+          fi
+
+      - name: Create or update the release
+        run: |
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release edit "$TAG" --title "$TAG" --notes-file notes.md
+          else
+            gh release create "$TAG" --title "$TAG" --notes-file notes.md --verify-tag
+          fi

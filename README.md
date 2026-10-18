@@ -191,6 +191,7 @@ poll interval) are only available in the config file. See
 - [Architecture](docs/ARCHITECTURE.md): components, state machine, data model
 - [API reference](docs/API_REFERENCE.md): emulated qBittorrent endpoints, TorBox endpoints used,
   state mapping
+- [Changelog](CHANGELOG.md): what changed in each version
 
 ## License
 
