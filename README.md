@@ -1,13 +1,10 @@
 <p align="center">
-  <img src="docs/img/mascot.svg" width="260" alt="A happy cardboard box licking its lips while video files drop into it">
+  <img src="docs/img/logo.svg" width="96" alt="tordownloader logo">
 </p>
 
 <h1 align="center">tordownloader</h1>
 
-<p align="center">
-  <b>Your TorBox account, wearing a qBittorrent costume.</b><br>
-  Sonarr and Radarr send it torrents. You get real files on your disk. No mounts, no rclone, no fuss.
-</p>
+<p align="center">TorBox as a download client for Sonarr and Radarr.</p>
 
 <p align="center">
   <a href="https://github.com/Guibibi/tordownloader/tags"><img src="https://img.shields.io/github/v/tag/Guibibi/tordownloader?sort=semver&label=version" alt="Version"></a>
@@ -16,49 +13,33 @@
   <a href="https://github.com/Guibibi/tordownloader/pkgs/container/tordownloader"><img src="https://img.shields.io/badge/ghcr.io-guibibi%2Ftordownloader-2496ED?logo=docker&logoColor=white" alt="Container"></a>
 </p>
 
----
+tordownloader implements the qBittorrent WebUI API, so Sonarr and Radarr can use it as a regular
+qBittorrent download client. Torrents it receives are sent to [TorBox](https://torbox.app), and
+once TorBox has them, the files are downloaded to a local folder for Sonarr/Radarr to import. There
+is no mount involved; the files end up on your disk like with any other download client.
 
-## Why you'd want this
+It's similar to [rdt-client](https://github.com/rogerfar/rdt-client) and
+[decypharr](https://github.com/sirrobot01/decypharr), but only supports TorBox, has no settings UI,
+and always downloads to disk.
 
-You pay for [TorBox](https://torbox.app). It already has half the internet cached and pulls
-everything else at silly speeds. But Sonarr and Radarr don't know how to talk to it, and the usual
-fix is a FUSE mount that streams files over the network and falls over when you look at it funny.
+![Dashboard](docs/img/dashboard.png)
+<sub>The status page at `http://<host>:6500/` (demo data).</sub>
 
-tordownloader is the boring fix. It answers on the qBittorrent API, so you add it in Sonarr exactly
-like you'd add qBittorrent. Behind the scenes it hands the torrent to TorBox, waits for it, then
-downloads the finished files into `/downloads` like any other client would. Sonarr imports them,
-hardlinks work, and your library is made of real files.
+## Features
 
-Grab an episode, and a few minutes later it's sitting in Plex. That's the whole pitch.
+- Works with Sonarr, Radarr and other qBittorrent clients such as nzb360, without plugins.
+- Keeps the torrent's folder structure. Files are written to a staging folder and moved into place
+  when complete, so partial files are never imported.
+- Fails torrents that stall or download too slowly to finish, and (if configured) tells
+  Sonarr/Radarr to blocklist the release and search for another one.
+- Respects the TorBox plan's concurrent download limit and API rate limits, queuing the rest.
+- Removing a download in Sonarr/Radarr also removes it from TorBox and from disk.
+- Checks free disk space before starting a download.
+- Retries interrupted transfers, resuming from the data already on disk.
+- Read-only status page, `/healthz` endpoint, and Prometheus metrics at `/metrics`.
+- Single Go binary, SQLite for state, configured through environment variables or YAML.
 
-<p align="center">
-  <img src="docs/img/dashboard.png" alt="The tordownloader dashboard showing torrents caching on TorBox, one season pack downloading to disk with its per-file list, and one queued" width="900">
-  <br><sub>The built-in dashboard at <code>http://your-server:6500/</code> (demo data)</sub>
-</p>
-
-## What you get
-
-- **It's just qBittorrent, as far as Sonarr knows.** No plugins, no forks, no scripts. Works with
-  Sonarr, Radarr, and remote apps like **nzb360** too.
-- **Real files on disk.** Folder structure is kept as-is, so season packs land as season packs.
-- **No half-imported episodes.** Files download into a staging folder and only move into place once
-  they're complete.
-- **Bad releases get swapped out automatically.** If a torrent stalls, or crawls along too slowly to
-  ever finish, tordownloader gives up on it and tells Sonarr/Radarr to blocklist it and grab
-  something else. You wake up to the episode, not to a stuck queue.
-- **Patient with the good ones.** Something stuck at 0% gets dropped after about 20 minutes. Something
-  that's actually making progress gets hours, because thin swarms often recover.
-- **Plays nice with your plan.** It knows how many TorBox slots you have (3 on Essential), keeps
-  its own queue for the rest, and stays under the API rate limits.
-- **Cleans up after itself.** Remove a download in Sonarr and it's gone from TorBox and from disk.
-- **Won't fill your drive.** A download only starts if it actually fits, with a 10 GB cushion left
-  over. Otherwise it waits its turn.
-- **Hard to wedge.** Dead CDN connections get retried with a fresh link, and the download picks up
-  from what's already on disk.
-- **Light.** One small Go binary in a Docker image, SQLite for state, no database server, no cgo.
-  Prometheus metrics at `/metrics` if you're into graphs.
-
-## How it fits together
+## How it works
 
 ```
 Prowlarr ──> Sonarr/Radarr ──(qBittorrent API)──> tordownloader ──(TorBox API)──> TorBox
@@ -67,25 +48,25 @@ Prowlarr ──> Sonarr/Radarr ──(qBittorrent API)──> tordownloader ─�
                           shared /downloads folder
 ```
 
-1. Sonarr grabs a release and sends it to "qBittorrent" (that's us).
-2. We pass it to TorBox and keep an eye on it.
-3. Once TorBox has it, we download the files to `/downloads/<category>/<name>/`.
-4. Sonarr sees it finished and imports it into your library.
-5. When Sonarr removes the download, we clean up TorBox and the local copy.
+1. Sonarr/Radarr send a torrent to tordownloader.
+2. tordownloader adds it to TorBox and tracks its progress.
+3. When TorBox is done, the files are downloaded to `/downloads/<category>/<name>/`.
+4. Sonarr/Radarr see the download as complete and import it.
+5. When Sonarr/Radarr remove the download, it is deleted from TorBox and from disk.
 
-## Get it running in 5 minutes
+## Requirements
 
-You'll need:
+- A TorBox account and API key. Tested on the Essential plan.
+- Sonarr and/or Radarr.
+- A downloads folder mounted at the same path in tordownloader and in Sonarr/Radarr (see below).
+- Docker.
 
-- A **TorBox** account and its API key (you'll find it in your TorBox account settings).
-- **Sonarr and/or Radarr** already running.
-- A **`/downloads` folder that Sonarr/Radarr can see at the same path**. This is the one thing
-  people trip on, more on it below.
+## Installation
 
 ### Docker Compose
 
-Grab [`docker-compose.yml`](docker-compose.yml), point the `/downloads` volume at the same folder
-Sonarr uses, then:
+Download [`docker-compose.yml`](docker-compose.yml), set the `/downloads` volume to the folder
+Sonarr/Radarr use, and run:
 
 ```bash
 TORBOX_API_KEY=your-key docker compose up -d
@@ -93,7 +74,7 @@ TORBOX_API_KEY=your-key docker compose up -d
 
 ### Unraid
 
-**Docker → Add Container:**
+Docker → Add Container:
 
 | Field | Value |
 |---|---|
@@ -104,10 +85,7 @@ TORBOX_API_KEY=your-key docker compose up -d
 | Variable `TORBOX_API_KEY` | your TorBox API key |
 | Variable `PUID` / `PGID` | `99` / `100` |
 
-Hit **Apply** and you're done.
-
-<details>
-<summary><b>Plain <code>docker run</code></b></summary>
+### docker run
 
 ```bash
 docker run -d \
@@ -120,47 +98,42 @@ docker run -d \
   --restart unless-stopped \
   ghcr.io/guibibi/tordownloader:latest
 ```
-</details>
 
-<details>
-<summary><b>Build it yourself</b></summary>
+Images are published for amd64 and arm64. Use `:latest` or a version tag such as `:v0.14.0`.
 
-Needs Go 1.26+.
+### From source
+
+Requires Go 1.26+.
 
 ```bash
 go build ./cmd/tordownloader
-# or the Docker image:
 docker build --build-arg VERSION=v0.14.0 -t tordownloader:v0.14.0 .
 ```
-</details>
 
-Images are multi-arch (amd64 and arm64). Use `:latest`, or pin a release like `:v0.14.0`.
+## Connecting Sonarr and Radarr
 
-## Hook up Sonarr and Radarr
-
-**Settings → Download Clients → + → qBittorrent**
+Settings → Download Clients → + → qBittorrent:
 
 | Field | Value |
 |---|---|
-| Host | your server's IP, e.g. `192.168.1.50` |
+| Host | IP of the host running tordownloader |
 | Port | `6500` |
-| Username / Password | anything you like, it doesn't check |
-| Category | `tv-sonarr` for Sonarr, `radarr` for Radarr |
+| Username / Password | any value (authentication is not checked) |
+| Category | `tv-sonarr` (Sonarr) or `radarr` (Radarr) |
 
-Hit **Test**, then **Save**. Same deal in **nzb360**: add a qBittorrent server with that host and
-port and your downloads show up there too.
+The same host and port work for other qBittorrent clients, such as nzb360.
 
 > [!IMPORTANT]
-> **Map `/downloads` to the same path everywhere.** tordownloader, Sonarr and Radarr all need to see
-> the files at the exact same path, or imports fail (or crawl along as copies instead of instant
-> hardlinks). LinuxServer images use `/downloads` already. On binhex or hotio images, set
-> `TD_DOWNLOAD_ROOT` to whatever path they use.
+> The downloads folder must be mounted at the same path in tordownloader, Sonarr and Radarr.
+> Otherwise imports fail, or fall back to copying instead of hardlinking. LinuxServer images use
+> `/downloads`, which is the default here. For other images, set `TD_DOWNLOAD_ROOT` to their path.
 
-### Let it replace failed downloads (do this one)
+### Failed downloads
 
-Here's a fun Sonarr fact: it ignores qBittorrent's error state completely. So when a release dies,
-Sonarr just leaves it sitting in the queue forever. Give tordownloader your Sonarr/Radarr API keys
-and it'll tell them directly: blocklist this release, go find another one.
+Sonarr and Radarr don't act on qBittorrent's error state, so a failed torrent would otherwise stay
+in their queue until removed by hand. If you provide their URLs and API keys, tordownloader removes
+failed items through their API with blocklisting enabled, which triggers a search for another
+release:
 
 ```bash
 TD_SONARR_URL=http://192.168.1.50:8989
@@ -169,47 +142,39 @@ TD_RADARR_URL=http://192.168.1.50:7878
 TD_RADARR_API_KEY=your-radarr-api-key
 ```
 
-Both the URL and the key are needed for each one. If only half is set, it's skipped and you'll see a
-warning in the log.
+Each URL needs its matching key. If only one of the pair is set, it is ignored and a warning is
+logged.
 
-## Settings
+## Configuration
 
-The defaults are fine for most people. Everything can be set with environment variables:
-
-| Variable | Default | What it does |
+| Variable | Default | Description |
 |---|---|---|
-| `TORBOX_API_KEY` | *(required)* | Your TorBox API key |
-| `PUID` / `PGID` | `99` / `100` | Who owns the downloaded files |
-| `TD_LISTEN_ADDR` | `0.0.0.0:6500` | Where the API and dashboard listen |
-| `TD_DOWNLOAD_ROOT` | `/downloads` | Where files are saved |
-| `TD_DB_PATH` | `/data/tordownloader.db` | The SQLite state file |
-| `TD_LOG_LEVEL` | `info` | `debug`, `info`, `warn` or `error` |
+| `TORBOX_API_KEY` | required | TorBox API key |
+| `PUID` / `PGID` | `99` / `100` | Owner of downloaded files |
+| `TD_LISTEN_ADDR` | `0.0.0.0:6500` | Listen address for the API and status page |
+| `TD_DOWNLOAD_ROOT` | `/downloads` | Download folder |
+| `TD_DB_PATH` | `/data/tordownloader.db` | SQLite database |
+| `TD_LOG_LEVEL` | `info` | `debug`, `info`, `warn`, `error` |
 | `TD_LOG_FORMAT` | `text` | `text` or `json` |
-| `TD_SONARR_URL` / `TD_SONARR_API_KEY` | *(unset)* | Sonarr, for replacing failed downloads |
-| `TD_RADARR_URL` / `TD_RADARR_API_KEY` | *(unset)* | Same, for Radarr |
+| `TD_SONARR_URL` / `TD_SONARR_API_KEY` | unset | Sonarr, for failed-download handling |
+| `TD_RADARR_URL` / `TD_RADARR_API_KEY` | unset | Radarr, for failed-download handling |
 
-Want to tweak the slot count, how long to wait on slow or stuck torrents, the speed floor, the
-free-space cushion, or the poll interval? Those live in a config file. Copy
-[`config.example.yaml`](config.example.yaml) (every option has a comment), mount it, and start with
+Other settings (slot count, stall and slow-download timeouts, minimum speed, free-space reserve,
+poll interval) are only available in the config file. See
+[`config.example.yaml`](config.example.yaml) for all options, then mount your copy and pass
 `--config /config.yaml`.
 
-## Good to know
+## Notes
 
-- **Big packs.** TorBox's Essential plan caps a single download at 200 GB. A full-series pack bigger
-  than that gets rejected, and Sonarr falls back to individual seasons. That's expected.
-- **On startup** it checks your TorBox account and logs a heads-up if your key is wrong, your
-  subscription is about to expire, or your slot setting doesn't match your plan.
-- **Health and metrics.** `/healthz` returns `ok` while things are healthy (the Docker healthcheck
-  uses it), and `/metrics` is Prometheus-ready.
-- **Failed torrents tidy themselves up** after 7 days once they've been dealt with.
-- **No auth.** It's meant to live on your LAN next to Sonarr. Don't put it on the open internet.
+- TorBox's Essential plan limits a single download to 200 GB. Larger packs are rejected and
+  reported as failed, and Sonarr will try a smaller release.
+- At startup the TorBox account is checked, and problems (invalid key, expiring subscription, slot
+  count above the plan's) are logged.
+- Failed torrents are removed after 7 days once they've been handled (`failure.error_retention`).
+- There is no authentication. Run it on a trusted network only.
 
-## Under the hood
+## Documentation
 
-If you want the details: [Architecture](docs/ARCHITECTURE.md) covers the moving parts and the state
-machine, and the [API reference](docs/API_REFERENCE.md) lists every qBittorrent endpoint we fake and
-every TorBox endpoint we call.
-
-Inspired by [rdt-client](https://github.com/rogerfar/rdt-client) and
-[decypharr](https://github.com/sirrobot01/decypharr). This one is TorBox-only, written in Go,
-headless, and downloads to disk instead of mounting.
+- [Architecture](docs/ARCHITECTURE.md): components, state machine, data model
+- [API reference](docs/API_REFERENCE.md): emulated qBittorrent endpoints, TorBox endpoints used,
+  state mapping
