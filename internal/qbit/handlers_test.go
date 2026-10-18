@@ -250,3 +250,54 @@ func TestHealthz(t *testing.T) {
 		t.Errorf("body = %q, want ok", body)
 	}
 }
+
+// TestSyncMainData covers the endpoint nzb360 and other remote-control apps
+// build their torrent list from: a full snapshot keyed by hash.
+func TestSyncMainData(t *testing.T) {
+	srv, st := newTestServer(t)
+	seedTorrent(t, st, store.Torrent{Infohash: "aaa", Name: "A", Size: 100,
+		State: store.StateLocalDload, LocalProgress: 0.5, TorBoxProgress: 1, DLSpeed: 7})
+
+	resp, body := get(t, srv, "/api/v2/sync/maindata?rid=0")
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, body %q", resp.StatusCode, body)
+	}
+	var md struct {
+		RID         int64                     `json:"rid"`
+		FullUpdate  bool                      `json:"full_update"`
+		Torrents    map[string]map[string]any `json:"torrents"`
+		Categories  map[string]any            `json:"categories"`
+		ServerState map[string]any            `json:"server_state"`
+	}
+	if err := json.Unmarshal([]byte(body), &md); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if !md.FullUpdate || md.RID == 0 {
+		t.Errorf("rid=%d full_update=%v, want nonzero rid and a full update", md.RID, md.FullUpdate)
+	}
+	a, ok := md.Torrents["aaa"]
+	if !ok || a["name"] != "A" || a["state"] != "downloading" {
+		t.Fatalf("torrents = %v", md.Torrents)
+	}
+	if md.Categories == nil {
+		t.Error("categories is null, want {}")
+	}
+	if md.ServerState["connection_status"] != "connected" || md.ServerState["dl_info_speed"] != float64(7) {
+		t.Errorf("server_state = %v", md.ServerState)
+	}
+
+	_, body2 := get(t, srv, "/api/v2/sync/maindata?rid=1")
+	var md2 struct {
+		RID int64 `json:"rid"`
+	}
+	_ = json.Unmarshal([]byte(body2), &md2)
+	if md2.RID <= md.RID {
+		t.Errorf("rid did not advance: %d then %d", md.RID, md2.RID)
+	}
+
+	for _, p := range []string{"/api/v2/torrents/trackers?hash=aaa", "/api/v2/torrents/tags"} {
+		if resp, body := get(t, srv, p); resp.StatusCode != http.StatusOK || strings.TrimSpace(body) != "[]" {
+			t.Errorf("%s = %d %q, want 200 []", p, resp.StatusCode, body)
+		}
+	}
+}
