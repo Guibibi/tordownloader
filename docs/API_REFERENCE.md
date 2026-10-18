@@ -51,7 +51,10 @@ All under `/api/v2`. Methods accept GET and/or POST as qBittorrent does. No auth
 | Endpoint | Behavior |
 |---|---|
 | `GET /transfer/info` | `connection_status: "connected"`, aggregate `dl_info_speed`, etc. |
-| `GET /sync/maindata` | **Not implemented** (404). Sonarr/Radarr poll `torrents/info` instead. |
+| `GET /transfer/speedLimitsMode` / `toggleSpeedLimitsMode` | `0` (alt limits off) / stub 200. |
+| `GET /sync/maindata` | Always a full snapshot (`full_update: true`, increasing `rid`): `torrents` keyed by hash (same objects as `torrents/info`), `categories`, `server_state` (transfer/info fields + `free_space_on_disk`). Sonarr/Radarr don't use it — remote-control apps (nzb360, the qBittorrent WebUI) build their list from it. |
+| `GET /sync/torrentPeers` | Always empty peers (TorBox does the swarm work). |
+| `GET /torrents/trackers` / `webseeds` / `pieceStates` / `tags` | `[]`, so app detail views render instead of 404ing. `torrents/start`/`stop` (qBit 5 names) are 200 stubs like pause/resume. |
 
 ### Outside `/api/v2` (not qBittorrent)
 | Endpoint | Behavior |

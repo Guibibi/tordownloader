@@ -3,7 +3,7 @@
 // live alongside it. See docs/API_REFERENCE.md §1–§3 for the contract.
 //
 // Besides the qBittorrent surface (auth, app info/preferences, torrent read and
-// write endpoints, categories, transfer info) the same server hosts the status
+// write endpoints, categories, transfer info, sync/maindata) the same server hosts the status
 // dashboard, /healthz, and Prometheus /metrics.
 package qbit
 
@@ -107,6 +107,10 @@ func (h *Handler) Routes() http.Handler {
 	mux.HandleFunc("/api/v2/torrents/info", h.torrentsInfo)
 	mux.HandleFunc("/api/v2/torrents/properties", h.torrentsProperties)
 	mux.HandleFunc("/api/v2/torrents/files", h.torrentsFiles)
+	mux.HandleFunc("/api/v2/torrents/trackers", h.emptyArray)
+	mux.HandleFunc("/api/v2/torrents/webseeds", h.emptyArray)
+	mux.HandleFunc("/api/v2/torrents/pieceStates", h.emptyArray)
+	mux.HandleFunc("/api/v2/torrents/tags", h.emptyArray)
 
 	// Torrents — write.
 	mux.HandleFunc("/api/v2/torrents/add", h.torrentsAdd)
@@ -114,6 +118,8 @@ func (h *Handler) Routes() http.Handler {
 	// No real pause concept on debrid; accept and 200 so Sonarr stays happy.
 	mux.HandleFunc("/api/v2/torrents/pause", h.ok200)
 	mux.HandleFunc("/api/v2/torrents/resume", h.ok200)
+	mux.HandleFunc("/api/v2/torrents/stop", h.ok200)  // qBittorrent 5 names for
+	mux.HandleFunc("/api/v2/torrents/start", h.ok200) // pause/resume
 	mux.HandleFunc("/api/v2/torrents/setForceStart", h.ok200)
 	mux.HandleFunc("/api/v2/torrents/topPrio", h.ok200)
 	mux.HandleFunc("/api/v2/torrents/setShareLimits", h.ok200)
@@ -128,6 +134,13 @@ func (h *Handler) Routes() http.Handler {
 
 	// Transfer.
 	mux.HandleFunc("/api/v2/transfer/info", h.transferInfo)
+	mux.HandleFunc("/api/v2/transfer/speedLimitsMode", h.speedLimitsMode)
+	mux.HandleFunc("/api/v2/transfer/toggleSpeedLimitsMode", h.ok200)
+
+	// Sync — what remote-control apps (nzb360, the qBittorrent WebUI) poll for
+	// their torrent list. See sync.go.
+	mux.HandleFunc("/api/v2/sync/maindata", h.syncMainData)
+	mux.HandleFunc("/api/v2/sync/torrentPeers", h.syncTorrentPeers)
 
 	// Liveness for Docker/Unraid healthchecks. Unlike app/version (a static
 	// string), this exercises the SQLite store, so a wedged database turns the
