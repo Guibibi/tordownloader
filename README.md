@@ -11,6 +11,7 @@
   <a href="https://github.com/Guibibi/tordownloader/actions/workflows/docker-publish.yml"><img src="https://github.com/Guibibi/tordownloader/actions/workflows/docker-publish.yml/badge.svg" alt="Build"></a>
   <a href="go.mod"><img src="https://img.shields.io/github/go-mod/go-version/Guibibi/tordownloader" alt="Go"></a>
   <a href="https://github.com/Guibibi/tordownloader/pkgs/container/tordownloader"><img src="https://img.shields.io/badge/ghcr.io-guibibi%2Ftordownloader-2496ED?logo=docker&logoColor=white" alt="Container"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/github/license/Guibibi/tordownloader" alt="License: MIT"></a>
 </p>
 
 tordownloader implements the qBittorrent WebUI API, so Sonarr and Radarr can use it as a regular
@@ -74,7 +75,19 @@ TORBOX_API_KEY=your-key docker compose up -d
 
 ### Unraid
 
-Docker → Add Container:
+A template is included at [`unraid/tordownloader.xml`](unraid/tordownloader.xml). On the Unraid
+server, download it into the user templates folder:
+
+```bash
+wget -O /boot/config/plugins/dockerMan/templates-user/my-tordownloader.xml \
+  https://raw.githubusercontent.com/Guibibi/tordownloader/main/unraid/tordownloader.xml
+```
+
+Then go to Docker → Add Container, pick **tordownloader** from the Template list, and fill in the
+TorBox API key and (recommended) the Sonarr/Radarr URL and API key. A `config.yaml` placed in
+`/mnt/user/appdata/tordownloader/` is picked up on restart.
+
+To set it up by hand instead, use Docker → Add Container with:
 
 | Field | Value |
 |---|---|
@@ -178,3 +191,7 @@ poll interval) are only available in the config file. See
 - [Architecture](docs/ARCHITECTURE.md): components, state machine, data model
 - [API reference](docs/API_REFERENCE.md): emulated qBittorrent endpoints, TorBox endpoints used,
   state mapping
+
+## License
+
+[MIT](LICENSE)

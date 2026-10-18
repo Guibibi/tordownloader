@@ -1,0 +1,36 @@
+<?xml version="1.0"?>
+<Container version="2">
+  <Name>tordownloader</Name>
+  <Repository>ghcr.io/guibibi/tordownloader:latest</Repository>
+  <Registry>https://github.com/Guibibi/tordownloader/pkgs/container/tordownloader</Registry>
+  <Network>bridge</Network>
+  <MyIP/>
+  <Shell>sh</Shell>
+  <Privileged>false</Privileged>
+  <Support>https://github.com/Guibibi/tordownloader/issues</Support>
+  <Project>https://github.com/Guibibi/tordownloader</Project>
+  <Overview>TorBox as a download client for Sonarr and Radarr. tordownloader implements the qBittorrent WebUI API, sends the torrents it receives to TorBox, and downloads the finished files to your downloads share for Sonarr/Radarr to import. No mount: real files on disk.[br][br]After starting, add it in Sonarr/Radarr as a qBittorrent download client (host: this server's IP, port 6500, no username/password). Map /downloads to the same host folder Sonarr/Radarr use, at the same container path, so imports can hardlink. Set the Sonarr/Radarr URL and API key so failed downloads are blocklisted and replaced. Status page: the WebUI link.</Overview>
+  <Category>Downloaders: MediaApp:Video</Category>
+  <WebUI>http://[IP]:[PORT:6500]/</WebUI>
+  <TemplateURL>https://raw.githubusercontent.com/Guibibi/tordownloader/main/unraid/tordownloader.xml</TemplateURL>
+  <Icon>https://raw.githubusercontent.com/Guibibi/tordownloader/main/docs/img/logo.png</Icon>
+  <ExtraParams/>
+  <PostArgs>tordownloader --config /data/config.yaml</PostArgs>
+  <CPUset/>
+  <DonateText/>
+  <DonateLink/>
+  <Requires>A TorBox account and API key (torbox.app). A /downloads share mapped identically in Sonarr/Radarr.</Requires>
+  <Config Name="WebUI / API port" Target="6500" Default="6500" Mode="tcp" Description="qBittorrent API used by Sonarr/Radarr, plus the status page, /healthz and /metrics." Type="Port" Display="always" Required="true" Mask="false">6500</Config>
+  <Config Name="Downloads" Target="/downloads" Default="/mnt/user/downloads/" Mode="rw" Description="Where finished files are written (category subfolders inside). Must be the same host folder Sonarr/Radarr see as /downloads." Type="Path" Display="always" Required="true" Mask="false">/mnt/user/downloads/</Config>
+  <Config Name="AppData" Target="/data" Default="/mnt/user/appdata/tordownloader/" Mode="rw" Description="State database (tordownloader.db). Optional: put a config.yaml here (copy config.example.yaml from the repo) for settings not exposed below, such as slot count, timeouts and the free-space reserve. Restart the container after editing it." Type="Path" Display="always" Required="true" Mask="false">/mnt/user/appdata/tordownloader/</Config>
+  <Config Name="TorBox API key" Target="TORBOX_API_KEY" Default="" Mode="" Description="Your TorBox API key (torbox.app → Settings). Checked at startup; problems are logged." Type="Variable" Display="always" Required="true" Mask="true"/>
+  <Config Name="Sonarr URL" Target="TD_SONARR_URL" Default="" Mode="" Description="e.g. http://192.168.1.10:8989. With the API key, failed downloads are blocklisted in Sonarr and a replacement is searched. Strongly recommended." Type="Variable" Display="always" Required="false" Mask="false"/>
+  <Config Name="Sonarr API key" Target="TD_SONARR_API_KEY" Default="" Mode="" Description="Sonarr → Settings → General → API Key." Type="Variable" Display="always" Required="false" Mask="true"/>
+  <Config Name="Radarr URL" Target="TD_RADARR_URL" Default="" Mode="" Description="e.g. http://192.168.1.10:7878. Same failed-download handling for Radarr." Type="Variable" Display="always" Required="false" Mask="false"/>
+  <Config Name="Radarr API key" Target="TD_RADARR_API_KEY" Default="" Mode="" Description="Radarr → Settings → General → API Key." Type="Variable" Display="always" Required="false" Mask="true"/>
+  <Config Name="PUID" Target="PUID" Default="99" Mode="" Description="User ID that owns downloaded files (99 = nobody)." Type="Variable" Display="advanced" Required="true" Mask="false">99</Config>
+  <Config Name="PGID" Target="PGID" Default="100" Mode="" Description="Group ID that owns downloaded files (100 = users)." Type="Variable" Display="advanced" Required="true" Mask="false">100</Config>
+  <Config Name="Database path" Target="TD_DB_PATH" Default="/data/tordownloader.db" Mode="" Description="SQLite state file inside the container. Keep it under /data." Type="Variable" Display="advanced" Required="false" Mask="false">/data/tordownloader.db</Config>
+  <Config Name="Log level" Target="TD_LOG_LEVEL" Default="info" Mode="" Description="debug, info, warn or error." Type="Variable" Display="advanced" Required="false" Mask="false">info</Config>
+  <Config Name="Log format" Target="TD_LOG_FORMAT" Default="text" Mode="" Description="text or json." Type="Variable" Display="advanced" Required="false" Mask="false">text</Config>
+</Container>
